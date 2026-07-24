@@ -217,9 +217,9 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
 fn command_candidates(shell: &Shell) -> Vec<String> {
     let mut commands = BTreeSet::from(
         [
-            "alias", "cd", "command", "echo", "eval", "exec", "exit", "export", "false", "jobs",
-            "printf", "pwd", "read", "set", "source", "test", "trap", "true", "type", "unalias",
-            "unset", "wait",
+            "alias", "builtin", "cd", "command", "dirs", "echo", "eval", "exec", "exit", "export",
+            "false", "help", "jobs", "let", "popd", "printf", "pushd", "pwd", "read", "set",
+            "source", "test", "trap", "true", "type", "unalias", "unset", "wait",
         ]
         .map(str::to_string),
     );

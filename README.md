@@ -32,6 +32,7 @@ WindowsバイナリはWindows標準システムDLLを利用します。macOSで�
 - `.iskrc`による起動設定
 - 添字配列・連想配列、`[[ ... ]]`、プロセス置換などの主要Bash拡張
 - `source`、`declare`、`typeset`、`local`、`shopt`、`type`、`mapfile`、`readarray`
+- `builtin`、`help`、`let`、`pushd`、`popd`、`dirs`、`cd -`、`read -r/-a`、`printf -v`
 
 完全なジョブ制御とUnixシグナル処理は未対応です。`grep`、`sed`、`awk`などの外部ユーティリティは内包せず、実行環境の`PATH`から呼び出します。
 

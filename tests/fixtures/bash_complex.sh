@@ -31,6 +31,10 @@ for value in "${numbers[@]}"; do
     sum=$((sum + value))
 done
 printf 'sum=%d count=%d\n' "$sum" "${#numbers[@]}"
+let 'sum+=1'
+let 'sum-=1'
+printf -v formatted '%s:%d' "$title" "$sum"
+builtin printf 'formatted=%s\n' "$formatted"
 
 printf 'items='
 separator=
@@ -47,6 +51,11 @@ printf 'sorted=%s\n' "$joined"
 cat <<EOF
 heredoc=${title}:$((sum * 2))
 EOF
+
+read -r escaped <<'EOF'
+a\b
+EOF
+printf 'raw=%s\n' "$escaped"
 
 mapfile -t rows < <(printf 'alpha\nbeta\ngamma\n')
 case ${rows[1]} in
