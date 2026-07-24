@@ -6,7 +6,7 @@ on:
       - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: release-${{ github.ref }}
@@ -66,11 +66,38 @@ jobs:
         shell: pwsh
         run: ./scripts/windows-smoke.ps1
 
-  publish:
-    name: Publish GitHub Release
+  publish-crate:
+    name: Publish crate
     needs: [build, windows-smoke]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build development container
+        run: docker compose build dev
+
+      - name: Authenticate to crates.io
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish package
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+        run: docker compose run --rm -e CARGO_REGISTRY_TOKEN dev mise exec -- cargo publish --locked
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build, windows-smoke, publish-crate]
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v8

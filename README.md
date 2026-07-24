@@ -2,6 +2,16 @@
 
 [![CI](https://github.com/isksss/isksh/actions/workflows/ci.yml/badge.svg)](https://github.com/isksss/isksh/actions/workflows/ci.yml)
 
+## インストール
+
+Rust/Cargoが利用できる環境ではcrates.ioからインストールできます。
+
+```console
+cargo install isksh --locked
+```
+
+追加ランタイムを必要としない静的バイナリは[GitHub Releases](https://github.com/isksss/isksh/releases)から取得できます。ソースからのクロスプラットフォームビルドと検証には、リポジトリのDocker開発環境を使用してください。
+
 `isksh`はRust製のクロスプラットフォームシェルです。Windows、macOS、Linuxで動作する単体バイナリを提供し、POSIX.1-2024 Shell Command Languageとの互換性を目標にしています。
 
 現在はMVP開発段階です。POSIXおよびBashとの完全互換を保証するものではありません。詳細は[POSIX対応表](POSIX-COMPATIBILITY.md)を参照してください。
@@ -205,7 +215,7 @@ Windowsホストでの実行確認：
 .\scripts\windows-smoke.ps1
 ```
 
-`vX.Y.Z`形式のタグをpushするとGitHub Actionsが全検査とWindowsスモークテストを実行し、成功後にバイナリとSHA-256チェックサムをGitHub Releaseへ公開します。タグのバージョンは`Cargo.toml`のpackage versionと一致している必要があります。
+`vX.Y.Z`形式のタグをpushするとGitHub Actionsが全検査とWindowsスモークテストを実行します。成功後、Trusted Publishingでcrates.ioへ公開し、その後にバイナリとSHA-256チェックサムをGitHub Releaseへ公開します。タグのバージョンは`Cargo.toml`のpackage versionと一致している必要があります。
 
 ## コントリビューション
 

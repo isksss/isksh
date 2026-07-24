@@ -6,6 +6,22 @@ rust-version = "1.97.1"
 description = "A portable POSIX-oriented shell written in Rust"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/isksss/isksh"
+homepage = "https://github.com/isksss/isksh"
+documentation = "https://docs.rs/isksh"
+readme = "README.md"
+keywords = ["shell", "posix", "command-line", "cross-platform"]
+categories = ["command-line-utilities"]
+publish = ["crates-io"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/README.md",
+    "/LICENSE-MIT",
+    "/LICENSE-APACHE",
+    "/POSIX-COMPATIBILITY.md",
+]
 
 [dependencies]
 glob = "0.3.3"
