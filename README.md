@@ -205,6 +205,8 @@ Windowsホストでの実行確認：
 .\scripts\windows-smoke.ps1
 ```
 
+`vX.Y.Z`形式のタグをpushするとGitHub Actionsが全検査とWindowsスモークテストを実行し、成功後にバイナリとSHA-256チェックサムをGitHub Releaseへ公開します。タグのバージョンは`Cargo.toml`のpackage versionと一致している必要があります。
+
 ## コントリビューション
 
 [CONTRIBUTING.md](CONTRIBUTING.md)を確認し、変更を提出する前に次を実行してください。

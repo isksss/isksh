@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and build release artifacts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Verify tag matches package version
+        shell: bash
+        run: |
+          package_version=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p}' Cargo.toml)
+          test "$GITHUB_REF_NAME" = "v$package_version"
+
+      - name: Build development container
+        run: docker compose build dev
+
+      - name: Run all checks and build artifacts
+        run: docker compose run --rm dev mise run check-all
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ github.ref_name }}
+          path: |
+            dist/isksh-linux-x86_64
+            dist/isksh-linux-x86_64.sha256
+            dist/isksh-linux-aarch64
+            dist/isksh-linux-aarch64.sha256
+            dist/isksh-windows-x86_64.exe
+            dist/isksh-windows-x86_64.exe.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-smoke:
+    name: Windows host smoke test
+    needs: build
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist
+
+      - name: Run Windows smoke tests
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1
+
+  publish:
+    name: Publish GitHub Release
+    needs: [build, windows-smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist
+
+      - name: Verify checksums
+        shell: bash
+        run: sha256sum --check dist/*.sha256
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --generate-notes \
+            --title "isksh $GITHUB_REF_NAME"

@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.97.1"
 description = "A portable POSIX-oriented shell written in Rust"
 license = "MIT OR Apache-2.0"
-repository = ""
+repository = "https://github.com/isksss/isksh"
 
 [dependencies]
 glob = "0.3.3"
