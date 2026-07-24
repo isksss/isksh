@@ -2078,6 +2078,25 @@ impl Shell {
         {
             return Ok(self.positional.clone());
         }
+        if let [
+            WordPart::Parameter {
+                expression,
+                quoted: true,
+            },
+        ] = word.parts.as_slice()
+        {
+            if let Some(reference) = expression.strip_prefix('!')
+                && let Some((name, subscript)) = parse_array_reference(reference)
+                && subscript == "@"
+            {
+                return Ok(self.array_keys(name));
+            }
+            if let Some((name, subscript)) = parse_array_reference(expression)
+                && subscript == "@"
+            {
+                return Ok(self.array_values(name));
+            }
+        }
         let mut value = String::new();
         let mut split = false;
         let mut globbable = false;
@@ -2247,10 +2266,12 @@ impl Shell {
         }
         for operator in [":-", ":=", ":+", ":?", "-", "=", "+", "?"] {
             if let Some((name, word)) = expression.split_once(operator) {
-                if !valid_variable_name(name) {
+                if !valid_assignment_name(name)
+                    && !(name.len() == 1 && name.as_bytes()[0].is_ascii_digit())
+                {
                     break;
                 }
-                let current = self.value_of(name);
+                let current = self.parameter_value(name);
                 let colon = operator.starts_with(':');
                 let missing = current.is_none() || colon && current.as_deref() == Some("");
                 let operation = operator.trim_start_matches(':');
@@ -2269,7 +2290,11 @@ impl Shell {
                     })
                 } else if operation == "=" {
                     if missing {
-                        self.set_variable(name, expanded_word.clone(), None, false)?;
+                        if parse_array_reference(name).is_some() {
+                            self.set_assignment(name, expanded_word.clone(), None)?;
+                        } else {
+                            self.set_variable(name, expanded_word.clone(), None, false)?;
+                        }
                         Ok(expanded_word)
                     } else {
                         Ok(current.unwrap_or_default())
@@ -2609,6 +2634,21 @@ impl Shell {
             .map(|variable| variable.value.clone())
     }
 
+    fn parameter_value(&self, name: &str) -> Option<String> {
+        if let Some((array, subscript)) = parse_array_reference(name) {
+            return self.array_value(array, subscript);
+        }
+        if name.len() == 1 && name.as_bytes()[0].is_ascii_digit() {
+            let index = name.parse::<usize>().ok()?;
+            return if index == 0 {
+                Some(self.name.clone())
+            } else {
+                self.positional.get(index - 1).cloned()
+            };
+        }
+        self.value_of(name)
+    }
+
     fn set_variable(
         &mut self,
         name: &str,
@@ -2652,9 +2692,9 @@ impl Shell {
                 values.insert(subscript.to_string(), value);
                 return Ok(());
             }
-            let index = subscript
-                .parse::<usize>()
-                .map_err(|_| format!("isksh: {target}: invalid indexed-array subscript"))?;
+            let index = self
+                .array_index(subscript)
+                .ok_or_else(|| format!("isksh: {target}: invalid indexed-array subscript"))?;
             self.indexed_arrays
                 .entry(name.to_string())
                 .or_default()
@@ -2667,14 +2707,23 @@ impl Shell {
 
     fn array_value(&self, name: &str, subscript: &str) -> Option<String> {
         if let Some(values) = self.associative_arrays.get(name) {
-            values.get(subscript).cloned()
+            let key = subscript
+                .strip_prefix('$')
+                .and_then(|name| self.parameter_value(name))
+                .unwrap_or_else(|| subscript.to_string());
+            values.get(&key).cloned()
         } else {
-            let index = subscript.parse::<usize>().ok()?;
+            let index = self.array_index(subscript)?;
             self.indexed_arrays
                 .get(name)
                 .and_then(|values| values.get(&index))
                 .cloned()
         }
+    }
+
+    fn array_index(&self, subscript: &str) -> Option<usize> {
+        let value = self.evaluate_arithmetic(subscript).ok()?;
+        usize::try_from(value).ok()
     }
 
     fn array_values(&self, name: &str) -> Vec<String> {
@@ -4242,13 +4291,24 @@ mod tests {
     fn supports_bash_arrays_and_conditionals() {
         let mut shell = Shell::default();
         let result = shell.run(
-            "a=(zero 'one value' two); a[4]=four; printf '%s|%s|%s|%s\\n' \"${a[1]}\" \"${#a[@]}\" \"${!a[@]}\" \"${a[@]}\"; [[ foobar == foo* && 4 -gt 2 ]]; echo $?",
+            "a=(zero 'one value' two); a[4]=four; printf '%s|%s|%s|%s\\n' \"${a[1]}\" \"${#a[@]}\" \"${!a[*]}\" \"${a[*]}\"; [[ foobar == foo* && 4 -gt 2 ]]; echo $?",
             &[],
         );
         assert_eq!(result.status, 0);
         assert_eq!(
             result.stdout,
             b"one value|4|0 1 2 4|zero one value two four\n0\n"
+        );
+
+        shell.set_positional(vec!["argument".into()]);
+        assert_eq!(
+            shell
+                .run(
+                    "idx=3; a[idx]=three; declare -A labels; labels[three]=odd; key=three; printf '%s|%s|%s|%s|%s|' \"${0:-missing}\" \"${1:-missing}\" \"${2:-missing}\" \"${labels[$key]:-unknown}\" \"${a[6]:=six}\"; for value in \"${a[@]}\"; do printf '<%s>' \"$value\"; done; printf '|'; for key in \"${!a[@]}\"; do printf '<%s>' \"$key\"; done",
+                    &[],
+                )
+                .stdout,
+            b"isksh|argument|missing|odd|six|<zero><one value><two><three><four><six>|<0><1><2><3><4><6>"
         );
 
         assert_eq!(
@@ -4393,7 +4453,7 @@ mod tests {
             assert_ne!(shell.run(source, &[]).status, 0, "{source}");
         }
         assert_eq!(shell.run("[[ value ]]", &[]).status, 0);
-        assert_ne!(shell.run("indexed[bad]=x", &[]).status, 0);
+        assert_ne!(shell.run("indexed[1/0]=x", &[]).status, 0);
     }
 
     #[test]
@@ -4504,7 +4564,7 @@ mod tests {
         assert_eq!(result.stdout, b"y\n");
         assert_eq!(
             shell.run("printf '%s' \"${PIPESTATUS[@]}\"", &[]).stdout,
-            b"141 0"
+            b"1410"
         );
         assert_eq!(
             shell

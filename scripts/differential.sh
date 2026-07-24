@@ -26,3 +26,13 @@ for index in "${!cases[@]}"; do
   test "$dash_status" = "$isksh_status"
   cmp "$temporary/dash-$index.out" "$temporary/isksh-$index.out"
 done
+
+fixture=tests/fixtures/bash_complex.sh
+bash "$fixture" 'Bash compatibility' > "$temporary/bash-complex.out" 2> "$temporary/bash-complex.err"
+bash_status=$?
+"$isksh" "$fixture" 'Bash compatibility' > "$temporary/isksh-complex.out" 2> "$temporary/isksh-complex.err"
+isksh_status=$?
+
+test "$bash_status" = "$isksh_status"
+cmp "$temporary/bash-complex.out" "$temporary/isksh-complex.out"
+cmp "$temporary/bash-complex.err" "$temporary/isksh-complex.err"
