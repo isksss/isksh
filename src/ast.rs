@@ -69,7 +69,7 @@ pub struct SimpleCommand {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Redirection {
-    pub fd: Option<u8>,
+    pub fd: Option<u32>,
     pub kind: RedirectionKind,
     pub target: Word,
     pub here_document: Option<HereDocument>,

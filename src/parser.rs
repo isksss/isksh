@@ -52,13 +52,18 @@ impl Parser {
             if self.consume_operator(Operator::Background) {
                 and_or.background = true;
             }
+            let background = and_or.background;
             lists.push(and_or);
-            if !self.skip_separators()
+            if !background
+                && !self.skip_separators()
                 && self.peek().is_some()
                 && !self.at_any_word(stop_words)
                 && !self.at_any_operator(stop_operators)
             {
                 return self.error("コマンドの区切りが必要です");
+            }
+            if background {
+                self.skip_separators();
             }
         }
         Ok(Script { lists })
@@ -295,7 +300,7 @@ impl Parser {
         }
     }
 
-    fn peek_redirection(&self) -> Option<(usize, Option<u8>, RedirectionKind)> {
+    fn peek_redirection(&self) -> Option<(usize, Option<u32>, RedirectionKind)> {
         let (offset, fd) = match self.peek() {
             Some(Token {
                 kind: TokenKind::Word(word),

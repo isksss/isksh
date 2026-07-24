@@ -65,3 +65,22 @@ fn here_documents_expand_unless_delimiter_is_quoted() {
     assert_script("value=ok\ncat <<EOF\n$value:$((1 + 2))\nEOF\n", "ok:3\n", 0);
     assert_script("value=ignored\ncat <<'EOF'\n$value\nEOF\n", "$value\n", 0);
 }
+
+#[test]
+fn pattern_removal_and_non_whitespace_ifs_match_posix() {
+    assert_script(
+        "value=abcabc; printf '%s|%s|%s|%s' \"${value%c*}\" \"${value%%c*}\" \"${value#a*}\" \"${value##a*}\"",
+        "abcab|ab|bcabc|",
+        0,
+    );
+    assert_script(
+        "IFS=:; value='a::b:'; for field in $value; do printf '<%s>' \"$field\"; done",
+        "<a><><b>",
+        0,
+    );
+}
+
+#[test]
+fn external_pipeline_is_concurrent() {
+    assert_script("yes | head -n 1", "y\n", 0);
+}

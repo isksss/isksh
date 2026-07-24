@@ -14,7 +14,7 @@ done
 pe=target/x86_64-pc-windows-gnu/release/isksh.exe
 file "$pe" | grep -q 'PE32+'
 imports=$(llvm-objdump -p "$pe" | awk '/DLL Name:/ {print toupper($3)}')
-allowed='^(KERNEL32\.DLL|NTDLL\.DLL|USERENV\.DLL|WS2_32\.DLL|ADVAPI32\.DLL|BCRYPT\.DLL|BCRYPTPRIMITIVES\.DLL|MSVCRT\.DLL|API-MS-WIN-.*\.DLL)$'
+allowed='^(KERNEL32\.DLL|NTDLL\.DLL|USER32\.DLL|USERENV\.DLL|SHELL32\.DLL|COMBASE\.DLL|WS2_32\.DLL|ADVAPI32\.DLL|BCRYPT\.DLL|BCRYPTPRIMITIVES\.DLL|MSVCRT\.DLL|API-MS-WIN-.*\.DLL)$'
 while IFS= read -r dll; do
   if [[ -n "$dll" ]] && ! [[ "$dll" =~ $allowed ]]; then
     echo "Unexpected Windows DLL dependency: $dll" >&2

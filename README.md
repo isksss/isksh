@@ -20,16 +20,18 @@ WindowsバイナリはWindows標準システムDLLを利用します。macOSで�
 - 単一引用、二重引用、エスケープ
 - パラメータ展開、コマンド置換、算術展開、フィールド分割、パス名展開
 - リダイレクト、here-document、パイプライン、リスト、`&&`、`||`
+- 外部コマンド間の並列OSパイプ、`PIPESTATUS`、`set -o pipefail`
+- 非同期バックグラウンドジョブ、`$!`、`jobs`、`wait`
 - `if`、`case`、`for`、`while`、`until`、グループ、サブシェル、関数
 - POSIX系built-inと、対話モードに必要なシェル状態管理
-- `PS1`、`PS2`、複数行入力、`exit`、EOFを扱う対話シェル
+- `PS1`、`PS2`、複数行入力、履歴、補完、履歴検索、`exit`、EOFを扱う対話シェル
 - 対話中の外部コマンドへ端末を直接引き渡すTTY実行
 - Bash形式のプロンプトエスケープ、プロンプト内の変数・コマンド・算術展開、`PROMPT_COMMAND`
 - `.iskrc`による起動設定
 - 添字配列・連想配列、`[[ ... ]]`、プロセス置換などの主要Bash拡張
 - `source`、`declare`、`typeset`、`local`、`shopt`、`type`、`mapfile`、`readarray`
 
-履歴、補完、ジョブ制御、完全なUnixシグナル処理は未対応です。`grep`、`sed`、`awk`などの外部ユーティリティは内包せず、実行環境の`PATH`から呼び出します。
+完全なジョブ制御とUnixシグナル処理は未対応です。`grep`、`sed`、`awk`などの外部ユーティリティは内包せず、実行環境の`PATH`から呼び出します。
 
 ## 使用方法
 
@@ -101,7 +103,33 @@ PS2='$(starship prompt --continuation)'
 
 `PS1`と`PS2`では、Bash形式の`\u`、`\h`、`\H`、`\w`、`\W`、`\s`、`\v`、`\V`、`\j`、`\n`、`\r`、`\e`、`\$`、`\nnn`、`\[`、`\]`を解釈した後、変数・コマンド・算術展開を行います。`PROMPT_COMMAND`もプライマリプロンプトの直前に実行します。
 
-Starship公式の`eval "$(starship init bash)"`が生成するスクリプトは、BashのDEBUG trap、ジョブ管理、`PIPESTATUS`などに依存するため、現時点では完全対応していません。上記の直接設定を使用してください。コマンド実行時間や右プロンプトなど、Bashフックに依存する一部機能は対象外です。
+Starship公式のBash初期化形式も利用できます。
+
+```sh
+eval "$(starship init bash)"
+```
+
+生成されたBashスクリプトを検出した場合、isksh向けの`PS1`・`PS2`設定へ変換します。コマンド実行時間、右プロンプト、DEBUG trapを利用するpreexec処理など、Bash固有フックに依存する一部機能は対象外です。
+
+## 対話履歴と補完
+
+対話端末ではカーソル移動、編集、Tabによるコマンド・パス補完、上下キーによる履歴、`Ctrl+R`による逆方向履歴検索を利用できます。履歴は次の優先順で保存します。
+
+1. `ISKSH_HISTORY`
+2. `$XDG_STATE_HOME/isksh/history`
+3. `$HOME/.local/state/isksh/history`
+4. Windowsでは`$LOCALAPPDATA/isksh/history`
+
+Unixではフォアグラウンドの外部コマンド・パイプラインへ端末のプロセスグループを移し、`Ctrl+C`後もシェルを継続します。Windowsではコンソール制御ハンドラーにより、フォアグラウンド子プロセス実行中の`Ctrl+C`でシェル自身が終了しないようにします。
+
+## ジョブ、パイプ、ディスクリプタ
+
+- 外部コマンドだけで構成されたパイプラインはOSパイプで並列実行します。
+- built-inや関数を含むパイプラインは、現時点では内部バッファを経由します。
+- `&`は非同期実行し、`$!`にはiskshのジョブIDを設定します。これはOSのPIDとは限りません。
+- `jobs`で状態を表示し、`wait`または`wait %ID`で完了を待機できます。
+- `exec 3>file`、`exec 4<file`、`>&3`、`<&4`などの永続ディスクリプタを利用できます。
+- `trap`は`EXIT`、`INT`、`TERM`、`DEBUG`の登録・表示・解除に対応します。OSシグナルから任意のtrapを非同期実行する機能は段階実装です。
 
 ## Windows固有の動作
 

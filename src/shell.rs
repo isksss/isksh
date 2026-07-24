@@ -4,12 +4,18 @@ use glob::{MatchOptions, Pattern, glob_with};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(windows)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 static PROCESS_SUBSTITUTION_ID: AtomicU64 = AtomicU64::new(0);
+static BACKGROUND_JOB_ID: AtomicU32 = AtomicU32::new(1);
+#[cfg(windows)]
+static WINDOWS_CHILD_FOREGROUND: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 struct Variable {
@@ -48,6 +54,14 @@ struct PendingProcessSubstitution {
     path: PathBuf,
     source: Option<String>,
 }
+
+struct PreparedExternal {
+    name: String,
+    arguments: Vec<String>,
+    assignments: Vec<(String, String)>,
+}
+
+type BackgroundJobs = Arc<Mutex<BTreeMap<u32, std::thread::JoinHandle<ExecResult>>>>;
 
 #[derive(Debug, Clone, Default)]
 struct LocalScope {
@@ -119,6 +133,14 @@ pub struct Shell {
     getopts_offset: usize,
     exit_status: Option<i32>,
     terminal_io: bool,
+    background_jobs: BackgroundJobs,
+    last_background_job: Option<u32>,
+    open_descriptors: HashMap<u32, OutputSink>,
+    traps: HashMap<String, String>,
+    trap_depth: usize,
+    prompt_number: u64,
+    command_hash: HashMap<String, String>,
+    creation_mask: u32,
 }
 
 impl Default for Shell {
@@ -169,6 +191,14 @@ impl Shell {
             getopts_offset: 1,
             exit_status: None,
             terminal_io: false,
+            background_jobs: Arc::new(Mutex::new(BTreeMap::new())),
+            last_background_job: None,
+            open_descriptors: HashMap::new(),
+            traps: HashMap::new(),
+            trap_depth: 0,
+            prompt_number: 0,
+            command_hash: HashMap::new(),
+            creation_mask: 0o022,
         }
     }
 
@@ -179,6 +209,9 @@ impl Shell {
     /// Controls whether foreground external commands may use the shell's terminal directly.
     pub fn set_interactive(&mut self, interactive: bool) {
         self.terminal_io = interactive;
+        if interactive {
+            install_console_control_handler();
+        }
     }
 
     pub fn check_input(source: &str) -> InputState {
@@ -199,6 +232,9 @@ impl Shell {
             }
         };
         let saved_status = self.last_status;
+        if !continuation {
+            self.prompt_number += 1;
+        }
         let mut prefix = String::new();
         if !continuation
             && let Some(command) = self.value_of("PROMPT_COMMAND")
@@ -234,9 +270,12 @@ impl Shell {
                 };
             }
         };
-        let result = self.execute_script(&script, input);
+        let mut result = self.execute_script(&script, input);
         let status = match result.flow {
             Flow::Exit(status) => {
+                let mut trap = self.run_trap("EXIT");
+                result.stdout.append(&mut trap.stdout);
+                result.stderr.append(&mut trap.stderr);
                 self.exit_status = Some(status);
                 status
             }
@@ -267,11 +306,17 @@ impl Shell {
         let mut result = if list.background {
             let mut child = self.clone();
             child.terminal_io = false;
-            let mut result = child.execute_pipeline(&list.first, input);
-            result
-                .stderr
-                .extend_from_slice(b"isksh: background execution is synchronous in this release\n");
-            result
+            child.background_jobs = Arc::new(Mutex::new(BTreeMap::new()));
+            let pipeline = list.first.clone();
+            let input = input.to_vec();
+            let job_id = BACKGROUND_JOB_ID.fetch_add(1, Ordering::Relaxed);
+            let handle = std::thread::spawn(move || child.execute_pipeline(&pipeline, &input));
+            self.background_jobs
+                .lock()
+                .expect("background jobs lock")
+                .insert(job_id, handle);
+            self.last_background_job = Some(job_id);
+            ExecResult::status(0)
         } else {
             self.execute_pipeline(&list.first, input)
         };
@@ -292,9 +337,18 @@ impl Shell {
     }
 
     fn execute_pipeline(&mut self, pipeline: &Pipeline, input: &[u8]) -> ExecResult {
+        if pipeline.commands.len() > 1
+            && let Some(prepared) = self.prepare_external_pipeline(pipeline)
+        {
+            return match prepared {
+                Ok(commands) => self.execute_external_pipeline(commands, input, pipeline.negated),
+                Err(message) => ExecResult::error(1, message),
+            };
+        }
         let mut pipe_input = input.to_vec();
         let mut all_stderr = Vec::new();
         let mut last = ExecResult::status(0);
+        let mut statuses = Vec::new();
         for (index, command) in pipeline.commands.iter().enumerate() {
             let is_last = index + 1 == pipeline.commands.len();
             let mut result = if pipeline.commands.len() == 1 {
@@ -304,6 +358,7 @@ impl Shell {
                 child.terminal_io = false;
                 child.execute_command(command, &pipe_input)
             };
+            statuses.push(result.status);
             all_stderr.append(&mut result.stderr);
             if is_last {
                 last = result;
@@ -312,15 +367,207 @@ impl Shell {
             }
         }
         last.stderr.splice(0..0, all_stderr);
+        self.set_pipeline_statuses(&statuses);
+        if self.shell_options.contains("pipefail")
+            && let Some(status) = statuses.iter().rev().find(|status| **status != 0)
+        {
+            last.status = *status;
+        }
         if pipeline.negated {
             last.status = i32::from(last.status == 0);
         }
         last
     }
 
+    fn prepare_external_pipeline(
+        &mut self,
+        pipeline: &Pipeline,
+    ) -> Option<Result<Vec<PreparedExternal>, String>> {
+        let mut simple_commands = Vec::new();
+        for command in &pipeline.commands {
+            let Command::Simple(command) = command else {
+                return None;
+            };
+            if !command.redirections.is_empty()
+                || !command.array_assignments.is_empty()
+                || command.words.is_empty()
+            {
+                return None;
+            }
+            simple_commands.push(command);
+            let name = command.words[0].as_plain_literal()?;
+            if is_builtin(name)
+                || self.functions.contains_key(name)
+                || self.aliases.contains_key(name)
+            {
+                return None;
+            }
+        }
+        Some(
+            simple_commands
+                .iter()
+                .map(|command| {
+                    let mut assignments = Vec::new();
+                    for (name, word) in &command.assignments {
+                        assignments.push((name.clone(), self.expand_scalar(word)?));
+                    }
+                    let mut words = Vec::new();
+                    for word in &command.words {
+                        words.extend(self.expand_word(word)?);
+                    }
+                    Ok(PreparedExternal {
+                        name: words.remove(0),
+                        arguments: words,
+                        assignments,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    fn execute_external_pipeline(
+        &mut self,
+        commands: Vec<PreparedExternal>,
+        input: &[u8],
+        negated: bool,
+    ) -> ExecResult {
+        let interactive = self.terminal_io;
+        let mut children: Vec<std::process::Child> = Vec::new();
+        let mut previous_stdout = None;
+        let mut stderr_readers = Vec::new();
+        for (index, prepared) in commands.iter().enumerate() {
+            let last = index + 1 == commands.len();
+            let resolved_name = self.resolve_external_name(&prepared.name);
+            let mut process = platform_command(&resolved_name, &prepared.arguments);
+            configure_process_group(&mut process, children.first().map(std::process::Child::id));
+            process.current_dir(&self.cwd).env_clear();
+            for (name, variable) in &self.variables {
+                if variable.exported {
+                    process.env(name, &variable.value);
+                }
+            }
+            process.envs(prepared.assignments.iter().cloned());
+            if index == 0 {
+                process.stdin(if interactive && input.is_empty() {
+                    Stdio::inherit()
+                } else {
+                    Stdio::piped()
+                });
+            } else {
+                process.stdin(Stdio::from(
+                    previous_stdout
+                        .take()
+                        .expect("previous pipeline command has stdout"),
+                ));
+            }
+            process.stdout(if last && interactive {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            });
+            process.stderr(if interactive {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            });
+            let mut child = match process.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    for mut child in children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    let status = if error.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    };
+                    return ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                }
+            };
+            previous_stdout = child.stdout.take();
+            if let Some(mut stderr) = child.stderr.take() {
+                stderr_readers.push(std::thread::spawn(move || {
+                    let mut output = Vec::new();
+                    let _ = stderr.read_to_end(&mut output);
+                    output
+                }));
+            }
+            children.push(child);
+        }
+        let foreground_group = children.first().map(std::process::Child::id);
+        if interactive && let Some(group) = foreground_group {
+            set_foreground_process_group(group);
+        }
+        let stdin_writer = children
+            .first_mut()
+            .and_then(|child| child.stdin.take())
+            .map(|mut stdin| {
+                let input = input.to_vec();
+                std::thread::spawn(move || stdin.write_all(&input))
+            });
+        let stdout_reader = previous_stdout.map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut output = Vec::new();
+                let _ = stdout.read_to_end(&mut output);
+                output
+            })
+        });
+        let mut statuses = Vec::new();
+        for mut child in children {
+            statuses.push(pipeline_wait_status(child.wait()));
+        }
+        if interactive && foreground_group.is_some() {
+            restore_shell_process_group();
+        }
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
+        let stdout = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let mut stderr = Vec::new();
+        for reader in stderr_readers {
+            if let Ok(mut output) = reader.join() {
+                stderr.append(&mut output);
+            }
+        }
+        self.set_pipeline_statuses(&statuses);
+        let mut status = statuses.last().copied().unwrap_or_default();
+        if self.shell_options.contains("pipefail")
+            && let Some(failed) = statuses.iter().rev().find(|status| **status != 0)
+        {
+            status = *failed;
+        }
+        if negated {
+            status = i32::from(status == 0);
+        }
+        ExecResult {
+            status,
+            stdout,
+            stderr,
+            flow: Flow::None,
+        }
+    }
+
+    fn set_pipeline_statuses(&mut self, statuses: &[i32]) {
+        self.indexed_arrays.insert(
+            "PIPESTATUS".into(),
+            statuses
+                .iter()
+                .enumerate()
+                .map(|(index, status)| (index, status.to_string()))
+                .collect(),
+        );
+    }
+
     fn execute_command(&mut self, command: &Command, input: &[u8]) -> ExecResult {
         match command {
-            Command::Simple(command) => self.execute_simple(command, input),
+            Command::Simple(command) => {
+                let mut result = self.run_trap("DEBUG");
+                result.append(self.execute_simple(command, input));
+                result
+            }
             Command::If {
                 branches,
                 else_body,
@@ -542,7 +789,8 @@ impl Shell {
             } else if matches!(
                 redirection.kind,
                 RedirectionKind::Input | RedirectionKind::ReadWrite
-            ) {
+            ) && redirection.fd.unwrap_or(0) == 0
+            {
                 let path = match self.redirection_path(&redirection.target) {
                     Ok(path) => path,
                     Err(message) => return ExecResult::error(1, message),
@@ -560,6 +808,34 @@ impl Shell {
                 match fs::read(path) {
                     Ok(bytes) => command_input = bytes,
                     Err(error) => return ExecResult::error(1, format!("isksh: {error}")),
+                }
+            } else if redirection.kind == RedirectionKind::DuplicateInput
+                && redirection.fd.unwrap_or(0) == 0
+            {
+                let target = match self.expand_scalar(&redirection.target) {
+                    Ok(target) => target,
+                    Err(message) => return ExecResult::error(1, message),
+                };
+                if target == "-" {
+                    command_input.clear();
+                    continue;
+                }
+                let target_fd = match target.parse::<u32>() {
+                    Ok(fd) => fd,
+                    Err(_) => return ExecResult::error(1, "isksh: invalid input descriptor"),
+                };
+                match self.open_descriptors.get(&target_fd) {
+                    Some(OutputSink::File(path)) => match fs::read(path) {
+                        Ok(bytes) => command_input = bytes,
+                        Err(error) => return ExecResult::error(1, format!("isksh: {error}")),
+                    },
+                    Some(OutputSink::Closed) => command_input.clear(),
+                    _ => {
+                        return ExecResult::error(
+                            1,
+                            format!("isksh: {target_fd}: bad input descriptor"),
+                        );
+                    }
                 }
             }
         }
@@ -635,8 +911,9 @@ impl Shell {
         _input: &[u8],
         mut result: ExecResult,
     ) -> ExecResult {
-        let mut stdout_sink = OutputSink::Stdout;
-        let mut stderr_sink = OutputSink::Stderr;
+        let mut descriptors = self.open_descriptors.clone();
+        descriptors.entry(1).or_insert(OutputSink::Stdout);
+        descriptors.entry(2).or_insert(OutputSink::Stderr);
         for redirection in &command.redirections {
             let fd = redirection.fd.unwrap_or(match redirection.kind {
                 RedirectionKind::Input
@@ -651,9 +928,6 @@ impl Shell {
                 | RedirectionKind::ReadWrite => {
                     if redirection.kind == RedirectionKind::ReadWrite && fd == 0 {
                         continue;
-                    }
-                    if !matches!(fd, 1 | 2) {
-                        return ExecResult::error(1, "isksh: unsupported output file descriptor");
                     }
                     let path = match self.redirection_path(&redirection.target) {
                         Ok(path) => path,
@@ -673,50 +947,61 @@ impl Shell {
                     if let Err(error) = options.open(&path) {
                         return ExecResult::error(1, format!("isksh: {error}"));
                     }
-                    let sink = OutputSink::File(path);
-                    if fd == 2 {
-                        stderr_sink = sink;
-                    } else {
-                        stdout_sink = sink;
-                    }
+                    descriptors.insert(fd, OutputSink::File(path));
                 }
                 RedirectionKind::DuplicateOutput | RedirectionKind::DuplicateInput => {
                     let target = match self.expand_scalar(&redirection.target) {
                         Ok(target) => target,
                         Err(message) => return ExecResult::error(1, message),
                     };
-                    if matches!(fd, 1 | 2) {
-                        let sink = match target.as_str() {
-                            "1" => stdout_sink.clone(),
-                            "2" => stderr_sink.clone(),
-                            "-" => OutputSink::Closed,
-                            _ => {
+                    let sink = if target == "-" {
+                        OutputSink::Closed
+                    } else {
+                        let target_fd = match target.parse::<u32>() {
+                            Ok(target_fd) => target_fd,
+                            Err(_) => {
                                 return ExecResult::error(
                                     1,
-                                    "isksh: unsupported file descriptor duplication",
+                                    "isksh: invalid file descriptor duplication",
                                 );
                             }
                         };
-                        if fd == 2 {
-                            stderr_sink = sink;
-                        } else {
-                            stdout_sink = sink;
+                        match descriptors.get(&target_fd).cloned() {
+                            Some(sink) => sink,
+                            None => {
+                                return ExecResult::error(
+                                    1,
+                                    format!("isksh: {target_fd}: bad file descriptor"),
+                                );
+                            }
                         }
-                    } else if fd != 0 || target != "-" {
-                        return ExecResult::error(
-                            1,
-                            "isksh: unsupported file descriptor duplication",
-                        );
-                    }
+                    };
+                    descriptors.insert(fd, sink);
                 }
                 RedirectionKind::HereDocument | RedirectionKind::HereDocumentStrip => {}
-                RedirectionKind::Input => {}
+                RedirectionKind::Input => {
+                    if fd != 0 {
+                        let path = match self.redirection_path(&redirection.target) {
+                            Ok(path) => path,
+                            Err(message) => return ExecResult::error(1, message),
+                        };
+                        if let Err(error) = OpenOptions::new().read(true).open(&path) {
+                            return ExecResult::error(1, format!("isksh: {error}"));
+                        }
+                        descriptors.insert(fd, OutputSink::File(path));
+                    }
+                }
             }
+        }
+        if command.words.first().and_then(Word::as_plain_literal) == Some("exec")
+            && command.words.len() == 1
+        {
+            self.open_descriptors = descriptors.clone();
         }
         let stdout = std::mem::take(&mut result.stdout);
         let stderr = std::mem::take(&mut result.stderr);
         if let Err(error) = write_output_sink(
-            &stdout_sink,
+            descriptors.get(&1).unwrap_or(&OutputSink::Stdout),
             &stdout,
             &mut result.stdout,
             &mut result.stderr,
@@ -724,7 +1009,7 @@ impl Shell {
             return ExecResult::error(1, format!("isksh: {error}"));
         }
         if let Err(error) = write_output_sink(
-            &stderr_sink,
+            descriptors.get(&2).unwrap_or(&OutputSink::Stderr),
             &stderr,
             &mut result.stdout,
             &mut result.stderr,
@@ -777,13 +1062,18 @@ impl Shell {
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit());
-            return match process.status() {
-                Ok(status) => ExecResult::status(exit_status(&status)),
+            configure_process_group(&mut process, None);
+            let mut child = match process.spawn() {
+                Ok(child) => child,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    ExecResult::error(127, format!("isksh: {name}: command not found"))
+                    return ExecResult::error(127, format!("isksh: {name}: command not found"));
                 }
-                Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
+                Err(error) => return ExecResult::error(126, format!("isksh: {name}: {error}")),
             };
+            set_foreground_process_group(child.id());
+            let status = child.wait();
+            restore_shell_process_group();
+            return finish_external_status(name, status);
         }
         process
             .stdin(Stdio::piped())
@@ -809,7 +1099,7 @@ impl Shell {
 
     fn execute_builtin(&mut self, name: &str, args: &[String], input: &[u8]) -> ExecResult {
         match name {
-            ":" | "true" | "wait" => ExecResult::status(0),
+            ":" | "true" => ExecResult::status(0),
             "false" => ExecResult::status(1),
             "echo" => {
                 let newline = args.first().map(String::as_str) != Some("-n");
@@ -888,14 +1178,15 @@ impl Shell {
             "alias" => self.builtin_alias(args),
             "unalias" => self.builtin_unalias(args),
             "getopts" => self.builtin_getopts(args),
+            "jobs" => self.builtin_jobs(),
+            "wait" => self.builtin_wait(args),
             "times" => ExecResult {
                 stdout: b"0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n".to_vec(),
                 ..ExecResult::status(0)
             },
-            "hash" => ExecResult::status(0),
-            "trap" | "umask" => {
-                ExecResult::error(2, format!("isksh: {name}: not supported on this release"))
-            }
+            "hash" => self.builtin_hash(args),
+            "trap" => self.builtin_trap(args),
+            "umask" => self.builtin_umask(args),
             _ => ExecResult::error(127, format!("isksh: {name}: unsupported builtin")),
         }
     }
@@ -919,6 +1210,170 @@ impl Shell {
             Ok(_) => ExecResult::error(1, format!("isksh: cd: {target}: not a directory")),
             Err(error) => ExecResult::error(1, format!("isksh: cd: {target}: {error}")),
         }
+    }
+
+    fn builtin_trap(&mut self, args: &[String]) -> ExecResult {
+        if args.is_empty() || args.first().map(String::as_str) == Some("-p") {
+            let requested = if args.first().map(String::as_str) == Some("-p") {
+                &args[1..]
+            } else {
+                &[]
+            };
+            let mut traps = self.traps.iter().collect::<Vec<_>>();
+            traps.sort_by_key(|(signal, _)| *signal);
+            let output = traps
+                .into_iter()
+                .filter(|(signal, _)| requested.is_empty() || requested.contains(signal))
+                .map(|(signal, action)| format!("trap -- {} {signal}\n", shell_quote(action)))
+                .collect::<String>();
+            return ExecResult {
+                stdout: output.into_bytes(),
+                ..ExecResult::status(0)
+            };
+        }
+        if args.len() < 2 {
+            return ExecResult::error(2, "isksh: trap: action and signal are required");
+        }
+        let action = &args[0];
+        for signal in &args[1..] {
+            let signal = normalize_signal(signal);
+            if !matches!(signal.as_str(), "EXIT" | "INT" | "TERM" | "DEBUG") {
+                return ExecResult::error(2, format!("isksh: trap: {signal}: invalid signal"));
+            }
+            if action == "-" {
+                self.traps.remove(&signal);
+            } else {
+                self.traps.insert(signal, action.clone());
+            }
+        }
+        ExecResult::status(0)
+    }
+
+    fn run_trap(&mut self, signal: &str) -> ExecResult {
+        if self.trap_depth != 0 {
+            return ExecResult::status(0);
+        }
+        let Some(action) = self.traps.get(signal).cloned() else {
+            return ExecResult::status(0);
+        };
+        self.trap_depth += 1;
+        let result = self.execute_eval(&[action], &[]);
+        self.trap_depth -= 1;
+        result
+    }
+
+    fn builtin_jobs(&self) -> ExecResult {
+        let jobs = self.background_jobs.lock().expect("background jobs lock");
+        let mut output = String::new();
+        for (id, handle) in jobs.iter() {
+            let state = if handle.is_finished() {
+                "Done"
+            } else {
+                "Running"
+            };
+            output.push_str(&format!("[{id}] {state}\n"));
+        }
+        ExecResult {
+            stdout: output.into_bytes(),
+            ..ExecResult::status(0)
+        }
+    }
+
+    fn builtin_hash(&mut self, args: &[String]) -> ExecResult {
+        if args == ["-r"] {
+            self.command_hash.clear();
+            return ExecResult::status(0);
+        }
+        if args.is_empty() {
+            let mut entries = self.command_hash.iter().collect::<Vec<_>>();
+            entries.sort_by_key(|(name, _)| *name);
+            let output = entries
+                .into_iter()
+                .map(|(name, path)| format!("{name}={path}\n"))
+                .collect::<String>();
+            return ExecResult {
+                stdout: output.into_bytes(),
+                ..ExecResult::status(0)
+            };
+        }
+        for name in args {
+            let path = self.resolve_command_file(name);
+            if !path.is_file() {
+                return ExecResult::error(1, format!("isksh: hash: {name}: not found"));
+            }
+            self.command_hash
+                .insert(name.clone(), path.to_string_lossy().into_owned());
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_umask(&mut self, args: &[String]) -> ExecResult {
+        if args.is_empty() || args == ["-S"] {
+            let output = if args == ["-S"] {
+                symbolic_umask(self.creation_mask)
+            } else {
+                format!("{:04o}\n", self.creation_mask)
+            };
+            return ExecResult {
+                stdout: output.into_bytes(),
+                ..ExecResult::status(0)
+            };
+        }
+        if args.len() != 1 {
+            return ExecResult::error(2, "isksh: umask: too many arguments");
+        }
+        let digits = args[0].trim_start_matches('0');
+        let digits = if digits.is_empty() { "0" } else { digits };
+        let mask = match u32::from_str_radix(digits, 8) {
+            Ok(mask) if mask <= 0o777 => mask,
+            _ => return ExecResult::error(2, format!("isksh: umask: {}: invalid mask", args[0])),
+        };
+        self.creation_mask = mask;
+        set_process_umask(mask);
+        ExecResult::status(0)
+    }
+
+    fn builtin_wait(&mut self, args: &[String]) -> ExecResult {
+        let ids = if args.is_empty() {
+            self.background_jobs
+                .lock()
+                .expect("background jobs lock")
+                .keys()
+                .copied()
+                .collect::<Vec<_>>()
+        } else {
+            let mut ids = Vec::new();
+            for argument in args {
+                match argument.trim_start_matches('%').parse::<u32>() {
+                    Ok(id) => ids.push(id),
+                    Err(_) => {
+                        return ExecResult::error(
+                            127,
+                            format!("isksh: wait: {argument}: invalid job"),
+                        );
+                    }
+                }
+            }
+            ids
+        };
+        let mut combined = ExecResult::status(0);
+        for id in ids {
+            let handle = self
+                .background_jobs
+                .lock()
+                .expect("background jobs lock")
+                .remove(&id);
+            let Some(handle) = handle else {
+                return ExecResult::error(127, format!("isksh: wait: {id}: no such job"));
+            };
+            match handle.join() {
+                Ok(result) => combined.append(result),
+                Err(_) => {
+                    combined.append(ExecResult::error(1, "isksh: wait: background job panicked"))
+                }
+            }
+        }
+        combined
     }
 
     fn builtin_declare(&mut self, command: &str, args: &[String]) -> ExecResult {
@@ -1285,8 +1740,31 @@ impl Shell {
             self.getopts_offset = 1;
             let _ = self.set_variable("OPTIND", "1".into(), None, false);
             ExecResult::status(0)
+        } else if matches!(args, [flag, option] if matches!(flag.as_str(), "-o" | "+o")) {
+            if args[1] != "pipefail" {
+                return ExecResult::error(2, format!("isksh: set: {}: invalid option", args[1]));
+            }
+            if args[0] == "-o" {
+                self.shell_options.insert("pipefail".into());
+            } else {
+                self.shell_options.remove("pipefail");
+            }
+            ExecResult::status(0)
+        } else if matches!(args, [flag] if matches!(flag.as_str(), "-o" | "+o")) {
+            let enabled = self.shell_options.contains("pipefail");
+            let text = if args[0] == "-o" {
+                format!("pipefail\t{}\n", if enabled { "on" } else { "off" })
+            } else if enabled {
+                "set -o pipefail\n".into()
+            } else {
+                "set +o pipefail\n".into()
+            };
+            ExecResult {
+                stdout: text.into_bytes(),
+                ..ExecResult::status(0)
+            }
         } else {
-            ExecResult::error(2, "isksh: set: shell options are not implemented")
+            ExecResult::error(2, "isksh: set: unsupported option")
         }
     }
 
@@ -1321,7 +1799,19 @@ impl Shell {
     }
 
     fn execute_eval(&mut self, args: &[String], input: &[u8]) -> ExecResult {
-        match parse(&args.join(" ")) {
+        let source = args.join(" ");
+        if source.contains("starship_precmd()") && source.contains("STARSHIP_SHELL=\"bash\"") {
+            let _ = self.set_variable("PS1", "$(starship prompt --status=$?)".into(), None, false);
+            let _ = self.set_variable(
+                "PS2",
+                "$(starship prompt --continuation)".into(),
+                None,
+                false,
+            );
+            let _ = self.set_variable("STARSHIP_SHELL", "bash".into(), Some(true), false);
+            return ExecResult::status(0);
+        }
+        match parse(&source) {
             Ok(script) => self.execute_script(&script, input),
             Err(error) => ExecResult::error(2, format!("isksh: {error}")),
         }
@@ -1579,11 +2069,7 @@ impl Shell {
         }
         let fields = if allow_split && split {
             let ifs = self.value_of("IFS").unwrap_or_else(|| " \t\n".into());
-            value
-                .split(|ch| ifs.contains(ch))
-                .filter(|field| !field.is_empty())
-                .map(ToOwned::to_owned)
-                .collect::<Vec<_>>()
+            split_fields(&value, &ifs)
         } else {
             vec![value]
         };
@@ -1600,7 +2086,7 @@ impl Shell {
             let options = MatchOptions {
                 case_sensitive: !cfg!(windows),
                 require_literal_separator: true,
-                require_literal_leading_dot: true,
+                require_literal_leading_dot: !self.shell_options.contains("dotglob"),
             };
             let mut matches = glob_with(&absolute_pattern, options)
                 .map_err(|error| error.to_string())?
@@ -1614,7 +2100,9 @@ impl Shell {
                 .collect::<Vec<_>>();
             matches.sort();
             if matches.is_empty() {
-                expanded.push(field);
+                if !self.shell_options.contains("nullglob") {
+                    expanded.push(field);
+                }
             } else {
                 expanded.extend(matches);
             }
@@ -1664,6 +2152,18 @@ impl Shell {
                 .count()
                 .to_string());
         }
+        if let Some(values) = self.indexed_arrays.get(expression) {
+            return Ok(values.get(&0).cloned().unwrap_or_default());
+        }
+        for operator in ["%%", "##", "%", "#"] {
+            if let Some((name, pattern)) = expression.split_once(operator)
+                && valid_variable_name(name)
+            {
+                let value = self.value_of(name).unwrap_or_default();
+                let pattern = self.expand_here_document(pattern)?;
+                return Ok(remove_parameter_pattern(&value, &pattern, operator));
+            }
+        }
         for operator in [":-", ":=", ":+", ":?", "-", "=", "+", "?"] {
             if let Some((name, word)) = expression.split_once(operator) {
                 if !valid_variable_name(name) {
@@ -1673,9 +2173,10 @@ impl Shell {
                 let colon = operator.starts_with(':');
                 let missing = current.is_none() || colon && current.as_deref() == Some("");
                 let operation = operator.trim_start_matches(':');
+                let expanded_word = self.expand_here_document(word)?;
                 return if operation == "-" {
                     Ok(if missing {
-                        word.to_string()
+                        expanded_word
                     } else {
                         current.unwrap_or_default()
                     })
@@ -1683,20 +2184,20 @@ impl Shell {
                     Ok(if missing {
                         String::new()
                     } else {
-                        word.to_string()
+                        expanded_word
                     })
                 } else if operation == "=" {
                     if missing {
-                        self.set_variable(name, word.to_string(), None, false)?;
-                        Ok(word.to_string())
+                        self.set_variable(name, expanded_word.clone(), None, false)?;
+                        Ok(expanded_word)
                     } else {
                         Ok(current.unwrap_or_default())
                     }
                 } else if missing {
-                    Err(if word.is_empty() {
+                    Err(if expanded_word.is_empty() {
                         format!("{name}: parameter is unset or null")
                     } else {
-                        word.to_string()
+                        expanded_word
                     })
                 } else {
                     Ok(current.unwrap_or_default())
@@ -1707,6 +2208,17 @@ impl Shell {
             "?" => self.last_status.to_string(),
             "#" => self.positional.len().to_string(),
             "$" => std::process::id().to_string(),
+            "!" => self
+                .last_background_job
+                .map(|id| id.to_string())
+                .unwrap_or_default(),
+            "-" => {
+                let mut options = String::new();
+                if self.shell_options.contains("pipefail") {
+                    options.push('o');
+                }
+                options
+            }
             "@" => self.positional.join(" "),
             "*" => self.positional.join(
                 &self
@@ -1782,7 +2294,7 @@ impl Shell {
                 'v' | 'V' => output.push_str(env!("CARGO_PKG_VERSION")),
                 'w' => output.push_str(&display_cwd),
                 'W' => output.push_str(&directory),
-                '!' | '#' => output.push('1'),
+                '!' | '#' => output.push_str(&self.prompt_number.to_string()),
                 '$' => output.push(if username.eq_ignore_ascii_case("root") {
                     '#'
                 } else {
@@ -1959,6 +2471,9 @@ impl Shell {
 
     #[cfg(windows)]
     fn resolve_external_name(&self, name: &str) -> String {
+        if let Some(path) = self.command_hash.get(name) {
+            return path.clone();
+        }
         let path = Path::new(name);
         let has_separator = name.contains(['/', '\\']);
         let mut bases = Vec::new();
@@ -2001,7 +2516,10 @@ impl Shell {
 
     #[cfg(not(windows))]
     fn resolve_external_name(&self, name: &str) -> String {
-        name.to_string()
+        self.command_hash
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| name.to_string())
     }
 
     fn value_of(&self, name: &str) -> Option<String> {
@@ -2256,6 +2774,20 @@ fn finish_external(name: &str, output: std::io::Result<std::process::Output>) ->
     }
 }
 
+fn finish_external_status(
+    name: &str,
+    status: std::io::Result<std::process::ExitStatus>,
+) -> ExecResult {
+    match status {
+        Ok(status) => ExecResult::status(exit_status(&status)),
+        Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
+    }
+}
+
+fn pipeline_wait_status(status: std::io::Result<std::process::ExitStatus>) -> i32 {
+    status.map_or(126, |status| exit_status(&status))
+}
+
 fn is_special_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -2288,6 +2820,7 @@ fn is_builtin(name: &str) -> bool {
                 | "false"
                 | "getopts"
                 | "hash"
+                | "jobs"
                 | "printf"
                 | "pwd"
                 | "read"
@@ -2313,6 +2846,117 @@ fn valid_variable_name(name: &str) -> bool {
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
+
+fn remove_parameter_pattern(value: &str, pattern: &str, operator: &str) -> String {
+    let Ok(pattern) = Pattern::new(pattern) else {
+        return value.to_string();
+    };
+    let mut boundaries = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .chain(std::iter::once(value.len()))
+        .collect::<Vec<_>>();
+    match operator {
+        "#" => boundaries
+            .into_iter()
+            .find(|index| pattern.matches(&value[..*index]))
+            .map_or_else(|| value.to_string(), |index| value[index..].to_string()),
+        "##" => {
+            boundaries.reverse();
+            boundaries
+                .into_iter()
+                .find(|index| pattern.matches(&value[..*index]))
+                .map_or_else(|| value.to_string(), |index| value[index..].to_string())
+        }
+        "%" => {
+            boundaries.reverse();
+            boundaries
+                .into_iter()
+                .find(|index| pattern.matches(&value[*index..]))
+                .map_or_else(|| value.to_string(), |index| value[..index].to_string())
+        }
+        "%%" => boundaries
+            .into_iter()
+            .find(|index| pattern.matches(&value[*index..]))
+            .map_or_else(|| value.to_string(), |index| value[..index].to_string()),
+        _ => value.to_string(),
+    }
+}
+
+fn split_fields(value: &str, ifs: &str) -> Vec<String> {
+    if ifs.is_empty() {
+        return vec![value.to_string()];
+    }
+    let is_ifs_whitespace = |ch: char| ifs.contains(ch) && matches!(ch, ' ' | '\t' | '\n');
+    let is_ifs_other = |ch: char| ifs.contains(ch) && !matches!(ch, ' ' | '\t' | '\n');
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut chars = value.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if is_ifs_other(ch) {
+            fields.push(std::mem::take(&mut field));
+            while chars.peek().is_some_and(|next| is_ifs_whitespace(*next)) {
+                chars.next();
+            }
+        } else if is_ifs_whitespace(ch) {
+            while chars.peek().is_some_and(|next| is_ifs_whitespace(*next)) {
+                chars.next();
+            }
+            if !field.is_empty() {
+                fields.push(std::mem::take(&mut field));
+            }
+        } else {
+            field.push(ch);
+        }
+    }
+    if !field.is_empty() {
+        fields.push(field);
+    }
+    fields
+}
+
+fn normalize_signal(signal: &str) -> String {
+    match signal.trim_start_matches("SIG") {
+        "0" => "EXIT".into(),
+        "2" => "INT".into(),
+        "15" => "TERM".into(),
+        name => name.to_ascii_uppercase(),
+    }
+}
+
+fn symbolic_umask(mask: u32) -> String {
+    let permissions = 0o777 & !mask;
+    let render = |read, write, execute| {
+        format!(
+            "{}{}{}",
+            if permissions & read != 0 { 'r' } else { '-' },
+            if permissions & write != 0 { 'w' } else { '-' },
+            if permissions & execute != 0 { 'x' } else { '-' }
+        )
+    };
+    format!(
+        "u={},g={},o={}\n",
+        render(0o400, 0o200, 0o100),
+        render(0o040, 0o020, 0o010),
+        render(0o004, 0o002, 0o001)
+    )
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn set_process_umask(mask: u32) {
+    use nix::sys::stat::{Mode, umask};
+    umask(Mode::from_bits_truncate(mask));
+}
+
+#[cfg(target_os = "macos")]
+fn set_process_umask(mask: u32) {
+    use nix::sys::stat::{Mode, umask};
+    let mask = u16::try_from(mask).expect("validated permission masks fit macOS mode_t");
+    umask(Mode::from_bits_truncate(mask));
+}
+
+#[cfg(not(unix))]
+fn set_process_umask(_mask: u32) {}
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
@@ -2465,8 +3109,76 @@ fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
     command
 }
 
+#[cfg(unix)]
+fn configure_process_group(command: &mut ProcessCommand, group: Option<u32>) {
+    use std::os::unix::process::CommandExt;
+    command.process_group(group.unwrap_or(0) as i32);
+}
+
+#[cfg(not(unix))]
+fn configure_process_group(_command: &mut ProcessCommand, _group: Option<u32>) {}
+
+#[cfg(unix)]
+fn set_foreground_process_group(group: u32) {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    use nix::unistd::{Pid, tcsetpgrp};
+    // SAFETY: SIGTTOU is ignored only while the shell transfers terminal ownership.
+    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) };
+    let _ = tcsetpgrp(std::io::stdin(), Pid::from_raw(group as i32));
+}
+
+#[cfg(windows)]
+fn set_foreground_process_group(_group: u32) {
+    WINDOWS_CHILD_FOREGROUND.store(true, Ordering::SeqCst);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn set_foreground_process_group(_group: u32) {}
+
+#[cfg(unix)]
+fn restore_shell_process_group() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    use nix::unistd::{getpgrp, tcsetpgrp};
+    let _ = tcsetpgrp(std::io::stdin(), getpgrp());
+    // SAFETY: restore the conventional default action after terminal ownership is recovered.
+    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigDfl) };
+}
+
+#[cfg(windows)]
+fn restore_shell_process_group() {
+    WINDOWS_CHILD_FOREGROUND.store(false, Ordering::SeqCst);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn restore_shell_process_group() {}
+
+#[cfg(windows)]
+fn install_console_control_handler() {
+    use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    unsafe extern "system" fn handler(control: u32) -> i32 {
+        const CTRL_C_EVENT: u32 = 0;
+        i32::from(control == CTRL_C_EVENT && WINDOWS_CHILD_FOREGROUND.load(Ordering::SeqCst))
+    }
+    // SAFETY: the callback has static lifetime and performs only atomic operations.
+    let _ = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+}
+
+#[cfg(not(windows))]
+fn install_console_control_handler() {}
+
 fn exit_status(status: &std::process::ExitStatus) -> i32 {
-    status.code().unwrap_or(128)
+    status.code().unwrap_or_else(|| signal_exit_status(status))
+}
+
+#[cfg(unix)]
+fn signal_exit_status(status: &std::process::ExitStatus) -> i32 {
+    use std::os::unix::process::ExitStatusExt;
+    status.signal().map_or(128, |signal| 128 + signal)
+}
+
+#[cfg(not(unix))]
+fn signal_exit_status(_status: &std::process::ExitStatus) -> i32 {
+    128
 }
 
 struct ArithmeticParser<'a> {
@@ -2704,8 +3416,22 @@ mod tests {
         assert_eq!(fs::read(path).unwrap(), b"outerr");
         let result = shell.run("printf err 1>&2", &[]);
         assert_eq!(result.stderr, b"err");
-        assert_ne!(shell.run("printf x 9>file", &[]).status, 0);
-        assert_ne!(shell.run("printf x 2>&9", &[]).status, 0);
+        let descriptor = directory.path().join("descriptor");
+        assert_eq!(
+            shell
+                .run(
+                    &format!("exec 9>'{}'; printf descriptor >&9", descriptor.display()),
+                    &[],
+                )
+                .status,
+            0
+        );
+        assert_eq!(fs::read(descriptor).unwrap(), b"descriptor");
+        assert_eq!(shell.run("printf x >&9", &[]).status, 0);
+        assert_eq!(
+            fs::read(directory.path().join("descriptor")).unwrap(),
+            b"descriptorx"
+        );
         assert_eq!(shell.run("printf x 1>&-", &[]).stdout, b"");
         assert_ne!(shell.run("cat < /missing/isksh-file", &[]).status, 0);
     }
@@ -2841,7 +3567,7 @@ mod tests {
                 .status,
             0
         );
-        assert_ne!(shell.execute_builtin("trap", &[], &[]).status, 0);
+        assert_eq!(shell.execute_builtin("trap", &[], &[]).status, 0);
         assert_ne!(shell.execute_builtin("unsupported", &[], &[]).status, 0);
     }
 
@@ -2922,12 +3648,10 @@ mod tests {
         assert_eq!(parse_error.status, 2);
         assert!(!parse_error.stderr.is_empty());
         let background = shell.run("printf bg &", &[]);
-        assert_eq!(background.stdout, b"bg");
-        assert!(
-            String::from_utf8(background.stderr)
-                .unwrap()
-                .contains("synchronous")
-        );
+        assert!(background.stdout.is_empty());
+        assert!(background.stderr.is_empty());
+        assert!(!shell.run("jobs", &[]).stdout.is_empty());
+        assert_eq!(shell.run("wait", &[]).stdout, b"bg");
         assert_eq!(shell.run("printf pipe | cat", &[]).stdout, b"pipe");
         assert_eq!(
             shell
@@ -3194,7 +3918,7 @@ mod tests {
         assert_ne!(shell.run("cat <\"$@\"", &[]).status, 0);
         assert_eq!(shell.run("printf x 2>&-", &[]).stderr, b"");
         assert_eq!(shell.run("printf x 0<&-", &[]).status, 0);
-        assert_ne!(shell.run("printf x 3<&-", &[]).status, 0);
+        assert_eq!(shell.run("printf x 3<&-", &[]).status, 0);
         assert_ne!(
             shell
                 .run(&format!("printf x >'{}'", directory.path().display()), &[])
@@ -3273,7 +3997,30 @@ mod tests {
         );
         assert!(!shell.execute_builtin("times", &[], &[]).stdout.is_empty());
         assert_eq!(shell.execute_builtin("hash", &[], &[]).status, 0);
-        assert_ne!(shell.execute_builtin("umask", &[], &[]).status, 0);
+        assert_eq!(shell.execute_builtin("umask", &[], &[]).stdout, b"0022\n");
+        assert!(
+            String::from_utf8(shell.execute_builtin("umask", &["-S".into()], &[]).stdout)
+                .unwrap()
+                .contains("u=rwx")
+        );
+        assert_eq!(
+            shell.execute_builtin("umask", &["077".into()], &[]).status,
+            0
+        );
+        assert_ne!(
+            shell.execute_builtin("umask", &["999".into()], &[]).status,
+            0
+        );
+        assert_ne!(
+            shell
+                .execute_builtin("umask", &["022".into(), "extra".into()], &[])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell.execute_builtin("umask", &["022".into()], &[]).status,
+            0
+        );
         shell.run("readonly LOCKED_EXPORT=x", &[]);
         assert_ne!(
             shell
@@ -3657,5 +4404,195 @@ mod tests {
         );
         assert_eq!(shell.execute_external("/", &[], &[], true).status, 126);
         shell.set_interactive(false);
+    }
+
+    #[test]
+    fn runs_external_pipelines_concurrently_and_tracks_statuses() {
+        let mut shell = Shell::default();
+        let result = shell.run("yes | head -n 1", &[]);
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"y\n");
+        assert_eq!(
+            shell.run("printf '%s' \"${PIPESTATUS[@]}\"", &[]).stdout,
+            b"141 0"
+        );
+        assert_eq!(
+            shell
+                .run("set -o pipefail; sh -c 'exit 7' | sh -c 'exit 0'", &[])
+                .status,
+            7
+        );
+        assert!(
+            String::from_utf8(shell.run("set -o", &[]).stdout)
+                .unwrap()
+                .contains("pipefail\ton")
+        );
+        assert!(
+            String::from_utf8(shell.run("set +o", &[]).stdout)
+                .unwrap()
+                .contains("set -o pipefail")
+        );
+        assert_eq!(shell.run("set +o pipefail", &[]).status, 0);
+        assert!(
+            String::from_utf8(shell.run("set +o", &[]).stdout)
+                .unwrap()
+                .contains("set +o pipefail")
+        );
+        assert_eq!(shell.expand_parameter("-").unwrap(), "");
+        assert_ne!(shell.run("set -o missing", &[]).status, 0);
+        assert_ne!(shell.run("set -x", &[]).status, 0);
+
+        let failed = shell.run("sh -c 'sleep 1' | missing-isksh-command", &[]);
+        assert_eq!(failed.status, 127);
+        assert_eq!(shell.run("/ | sh -c 'cat'", &[]).status, 126);
+        assert_eq!(
+            shell
+                .run("BAD=$((1/0)) sh -c 'cat' | sh -c 'cat'", &[])
+                .status,
+            1
+        );
+        assert_eq!(shell.run("(printf group) | cat", &[]).stdout, b"group");
+        assert_eq!(shell.run("sh </dev/null | cat", &[]).status, 0);
+        shell.run("set -o pipefail", &[]);
+        assert_eq!(shell.run("false | true", &[]).status, 1);
+        assert_eq!(shell.expand_parameter("-").unwrap(), "o");
+        assert_eq!(shell.expand_parameter("PIPESTATUS").unwrap(), "1");
+        assert_eq!(
+            shell.run("! sh -c 'exit 0' | sh -c 'exit 0'", &[]).status,
+            1
+        );
+        shell.set_interactive(true);
+        assert_eq!(shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]).status, 0);
+    }
+
+    #[test]
+    fn manages_background_jobs_wait_and_special_parameter() {
+        let mut shell = Shell::default();
+        assert_eq!(shell.run("printf async &", &[]).status, 0);
+        let id = shell.expand_parameter("!").unwrap().parse::<u32>().unwrap();
+        while !shell
+            .background_jobs
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(std::thread::JoinHandle::is_finished)
+        {
+            std::thread::yield_now();
+        }
+        assert!(
+            String::from_utf8(shell.builtin_jobs().stdout)
+                .unwrap()
+                .contains(&format!("[{id}]"))
+        );
+        assert_eq!(shell.builtin_wait(&[format!("%{id}")]).stdout, b"async");
+        assert_ne!(shell.builtin_wait(&["bad".into()]).status, 0);
+        assert_ne!(shell.builtin_wait(&[id.to_string()]).status, 0);
+        assert!(shell.builtin_wait(&[]).stdout.is_empty());
+        let panic_id = BACKGROUND_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        shell.background_jobs.lock().unwrap().insert(
+            panic_id,
+            std::thread::spawn(|| panic!("expected test panic")),
+        );
+        assert_eq!(shell.builtin_wait(&[panic_id.to_string()]).status, 1);
+    }
+
+    #[test]
+    fn expands_posix_patterns_nested_defaults_and_ifs_fields() {
+        let mut shell = Shell::default();
+        let result = shell.run(
+            "base=abcabc; fallback=ok; printf '%s|' \"${base%c*}\" \"${base%%c*}\" \"${base#a*}\" \"${base##a*}\" \"${missing:-$fallback}\"; IFS=:; fields='a::b:'; printf '<%s>' $fields",
+            &[],
+        );
+        assert_eq!(result.stdout, b"abcab|ab|bcabc||ok|<a><><b>");
+        assert_eq!(split_fields(" a  b ", " \t\n"), vec!["a", "b"]);
+        assert_eq!(split_fields("a:  b", ": "), vec!["a", "b"]);
+        assert_eq!(split_fields("unchanged", ""), vec!["unchanged"]);
+        assert_eq!(remove_parameter_pattern("value", "[", "%"), "value");
+        assert_eq!(remove_parameter_pattern("value", "*", "invalid"), "value");
+        for operator in ["#", "##", "%", "%%"] {
+            assert_eq!(remove_parameter_pattern("value", "z*", operator), "value");
+        }
+    }
+
+    #[test]
+    fn supports_traps_and_starship_bash_initialization_fallback() {
+        let mut shell = Shell::default();
+        let result = shell.run("trap 'printf debug' DEBUG; printf body", &[]);
+        assert_eq!(result.stdout, b"debugbody");
+        assert!(
+            String::from_utf8(shell.run("trap -p DEBUG", &[]).stdout)
+                .unwrap()
+                .contains("DEBUG")
+        );
+        assert_eq!(shell.run("trap - DEBUG", &[]).status, 0);
+        assert_ne!(shell.run("trap action UNKNOWN", &[]).status, 0);
+        assert_ne!(shell.run("trap action", &[]).status, 0);
+        let exit = shell.run("trap 'printf exit-hook' EXIT; exit 4", &[]);
+        assert_eq!(exit.status, 4);
+        assert_eq!(exit.stdout, b"exit-hook");
+
+        assert_eq!(
+            shell
+                .execute_eval(
+                    &["starship_precmd() { :; }; STARSHIP_SHELL=\"bash\"".into()],
+                    &[],
+                )
+                .status,
+            0
+        );
+        assert_eq!(
+            shell.value_of("PS1").as_deref(),
+            Some("$(starship prompt --status=$?)")
+        );
+        assert_eq!(shell.value_of("STARSHIP_SHELL").as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn handles_persistent_descriptors_hash_and_wait_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let input = directory.path().join("input");
+        fs::write(&input, b"descriptor-input").unwrap();
+        let mut shell = Shell::default();
+        assert_eq!(
+            shell
+                .run(&format!("exec 4<'{}'; cat <&4", input.display()), &[])
+                .stdout,
+            b"descriptor-input"
+        );
+        assert_eq!(shell.run("exec 5<&-; cat <&5", &[]).status, 0);
+        assert_ne!(shell.run("cat <&bad", &[]).status, 0);
+        assert_ne!(shell.run("cat <&99", &[]).status, 0);
+        assert_ne!(shell.run("cat <&$((1/0))", &[]).status, 0);
+        fs::remove_file(&input).unwrap();
+        assert_ne!(shell.run("cat <&4", &[]).status, 0);
+
+        let mut fresh = Shell::default();
+        assert_ne!(fresh.run("printf x >&bad", &[]).status, 0);
+        assert_ne!(fresh.run("printf x >&8", &[]).status, 0);
+        assert_ne!(
+            fresh
+                .run(
+                    &format!("exec 6<'{}'", directory.path().join("missing").display()),
+                    &[],
+                )
+                .status,
+            0
+        );
+        assert_ne!(fresh.run("exec 6<$((1/0))", &[]).status, 0);
+
+        assert_eq!(fresh.builtin_hash(&["sh".into()]).status, 0);
+        assert!(
+            String::from_utf8(fresh.builtin_hash(&[]).stdout)
+                .unwrap()
+                .contains("sh=")
+        );
+        assert_ne!(fresh.builtin_hash(&["missing-isksh".into()]).status, 0);
+        assert_eq!(fresh.builtin_hash(&["-r".into()]).status, 0);
+        assert!(fresh.command_hash.is_empty());
+
+        let error = std::io::Error::other("wait failed");
+        assert_eq!(pipeline_wait_status(Err(error)), 126);
+        let error = std::io::Error::other("wait failed");
+        assert_eq!(finish_external_status("command", Err(error)).status, 126);
     }
 }
