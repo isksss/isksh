@@ -1,0 +1,39 @@
+min_version = "2026.7.0"
+
+[tools]
+rust = { version = "1.97.1", components = ["clippy", "rustfmt"], targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc-windows-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"] }
+zig = "0.15.2"
+"cargo:cargo-zigbuild" = "0.20.1"
+
+[tasks.build]
+description = "Build the development binary"
+run = "cargo build --locked"
+
+[tasks.build-release]
+description = "Build static Linux and Windows release binaries"
+run = "bash scripts/build-release.sh"
+
+[tasks.test]
+description = "Run all tests"
+run = "cargo test --locked && bash scripts/differential.sh"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --all-targets --locked -- -D warnings"
+
+[tasks.fmt-check]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[tasks.check-targets]
+description = "Check every supported compilation target"
+run = "bash scripts/check-targets.sh"
+
+[tasks.verify-static]
+description = "Verify release binaries have no bundled runtime dependency"
+depends = ["build-release"]
+run = "bash scripts/verify-static.sh"
+
+[tasks.check-all]
+description = "Run formatting, lint, tests, target checks and static verification"
+depends = ["fmt-check", "lint", "test", "check-targets", "verify-static"]

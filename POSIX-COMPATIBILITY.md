@@ -1,0 +1,21 @@
+# POSIX.1-2024 compatibility
+
+基準文書は[Shell Command Language, POSIX.1-2024](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html)です。
+
+| 分野 | 状態 | 備考 |
+|---|---|---|
+| Token recognition / quoting | Partial | UTF-8入力のみ |
+| Simple commands / assignments | Partial | 基本的な検索・実行に対応 |
+| Parameter expansion | Partial | 基本形式と既定値演算子に対応 |
+| Command / arithmetic substitution | Partial | 基本形式に対応 |
+| Field splitting / pathname expansion | Partial | UTF-8とホストファイルシステムに依存 |
+| Redirection / here-document | Partial | 基本リダイレクトに対応、here-documentは段階実装 |
+| Pipelines / AND-OR lists | Supported | MVP範囲 |
+| Compound commands | Partial | if/for/while/until/group/subshellを優先 |
+| Functions | Partial | 基本的な定義・呼び出しに対応 |
+| Built-in utilities | Partial | MVP対象を実装。trap/umask/hash/execの完全なOS動作は未対応 |
+| Job control | Not supported | MVP対象外 |
+| Interactive editing | Not supported | MVP対象外 |
+| Non-UTF-8 shell data | Not supported | 明示的エラー |
+
+WindowsではPOSIXシグナル、プロセスグループ、パス表現を完全には再現できません。`.cmd`と`.bat`は`cmd.exe`経由で実行し、PowerShellスクリプトは自動実行しません。
