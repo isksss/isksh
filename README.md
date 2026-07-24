@@ -1,5 +1,7 @@
 # isksh
 
+[![CI](https://github.com/isksss/isksh/actions/workflows/ci.yml/badge.svg)](https://github.com/isksss/isksh/actions/workflows/ci.yml)
+
 `isksh`はRust製のクロスプラットフォームシェルです。Windows、macOS、Linuxで動作する単体バイナリを提供し、POSIX.1-2024 Shell Command Languageとの互換性を目標にしています。
 
 現在はMVP開発段階です。POSIXおよびBashとの完全互換を保証するものではありません。詳細は[POSIX対応表](POSIX-COMPATIBILITY.md)を参照してください。
@@ -62,7 +64,7 @@ isksh -i
 3. `$HOME/.config/isksh/.iskrc`
 4. Windowsでは`$USERPROFILE/.config/isksh/.iskrc`
 
-`ISKSH_RC`を空文字列にすると読み込みを無効化できます。
+上記の`.iskrc`が存在しない場合は、dotfilesとの互換性のため`$HOME/.bashrc`を読み込みます。`ISKSH_RC`を設定した場合は`.bashrc`へフォールバックせず、空文字列にすると読み込みを無効化できます。
 
 ```sh
 export EDITOR=vim
@@ -110,6 +112,22 @@ eval "$(starship init bash)"
 ```
 
 生成されたBashスクリプトを検出した場合、isksh向けの`PS1`・`PS2`設定へ変換します。コマンド実行時間、右プロンプト、DEBUG trapを利用するpreexec処理など、Bash固有フックに依存する一部機能は対象外です。
+
+## dotfilesツール互換性
+
+[isksss/dotfiles](https://github.com/isksss/dotfiles)の`mise.toml`に掲載されたCLI/TUIは、通常の外部コマンドとしてPATH検索、引数・環境変数・終了コード伝播、パイプ、リダイレクト、対話端末の継承を利用できます。`.exe`、`.com`、`.cmd`、`.bat`を含むWindowsの探索規則にも対応します。
+
+Bash向け初期化は次の形式をiskshの対話機能へ変換します。
+
+| ツール | 初期化 | iskshでの動作 |
+|---|---|---|
+| mise | `eval "$(mise activate bash)"` | `MISE_SHELL`とプロンプト時の`hook-env`更新 |
+| Starship | `eval "$(starship init bash)"` | `PS1`・`PS2`プロンプト |
+| zoxide | `eval "$(zoxide init bash)"` | `z`・`zi`とディレクトリ登録 |
+| Atuin | `eval "$(atuin init bash)"` | 初期化を受理し、iskshの永続履歴と`Ctrl+R`を使用 |
+| fzf | `source <(fzf --bash)` | 初期化を受理し、iskshのTab補完と`Ctrl+R`を使用 |
+
+Atuin/fzfのBash Readline専用widgetはRust製ラインエディタへ直接登録せず、同等操作のisksh標準機能へ置き換えます。各ツール本体、Neovim、lazygit、lazydocker、yazi、zellijなどの全画面UIは端末を直接継承します。
 
 ## 対話履歴と補完
 

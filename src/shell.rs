@@ -206,6 +206,18 @@ impl Shell {
         self.positional = values;
     }
 
+    pub fn command_search_path(&self) -> Option<String> {
+        self.value_of("PATH")
+    }
+
+    pub fn configured_command_names(&self) -> Vec<String> {
+        self.aliases
+            .keys()
+            .chain(self.functions.keys())
+            .cloned()
+            .collect()
+    }
+
     /// Controls whether foreground external commands may use the shell's terminal directly.
     pub fn set_interactive(&mut self, interactive: bool) {
         self.terminal_io = interactive;
@@ -260,6 +272,14 @@ impl Shell {
     }
 
     pub fn run(&mut self, source: &str, input: &[u8]) -> RunResult {
+        if let Some(result) = self.apply_known_bash_integration(source) {
+            self.last_status = result.status;
+            return RunResult {
+                status: result.status,
+                stdout: result.stdout,
+                stderr: result.stderr,
+            };
+        }
         let script = match parse(source) {
             Ok(script) => script,
             Err(error) => {
@@ -584,6 +604,8 @@ impl Shell {
                 }
                 if let Some(body) = else_body {
                     output.append(self.execute_script(body, input));
+                } else {
+                    output.status = 0;
                 }
                 output
             }
@@ -1800,6 +1822,16 @@ impl Shell {
 
     fn execute_eval(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let source = args.join(" ");
+        if let Some(result) = self.apply_known_bash_integration(&source) {
+            return result;
+        }
+        match parse(&source) {
+            Ok(script) => self.execute_script(&script, input),
+            Err(error) => ExecResult::error(2, format!("isksh: {error}")),
+        }
+    }
+
+    fn apply_known_bash_integration(&mut self, source: &str) -> Option<ExecResult> {
         if source.contains("starship_precmd()") && source.contains("STARSHIP_SHELL=\"bash\"") {
             let _ = self.set_variable("PS1", "$(starship prompt --status=$?)".into(), None, false);
             let _ = self.set_variable(
@@ -1809,11 +1841,60 @@ impl Shell {
                 false,
             );
             let _ = self.set_variable("STARSHIP_SHELL", "bash".into(), Some(true), false);
-            return ExecResult::status(0);
+            return Some(ExecResult::status(0));
         }
-        match parse(&source) {
-            Ok(script) => self.execute_script(&script, input),
-            Err(error) => ExecResult::error(2, format!("isksh: {error}")),
+        if source.contains("_mise_hook_prompt_command") && source.contains("__MISE_EXE=") {
+            let executable = source.lines().find_map(|line| {
+                line.trim()
+                    .strip_prefix("export __MISE_EXE=")
+                    .map(|value| value.trim_matches(['\'', '"']).to_string())
+            });
+            if let Some(executable) = executable {
+                let _ = self.set_variable("__MISE_EXE", executable, Some(true), false);
+            }
+            let _ = self.set_variable("MISE_SHELL", "bash".into(), Some(true), false);
+            self.append_prompt_command("eval \"$(mise hook-env -s bash)\"");
+            return Some(ExecResult::status(0));
+        }
+        if source.contains("function __zoxide_hook()") && source.contains("__zoxide_z()") {
+            let _ = self.set_variable("_ZO_DOCTOR", "0".into(), Some(true), false);
+            self.append_prompt_command("zoxide add -- \"$PWD\" >/dev/null 2>&1");
+            let functions = concat!(
+                "z() { __zoxide_result=$(zoxide query -- \"$@\") || return; ",
+                "cd \"$__zoxide_result\"; }\n",
+                "zi() { __zoxide_result=$(zoxide query -i -- \"$@\") || return; ",
+                "cd \"$__zoxide_result\"; }\n",
+            );
+            let script = parse(functions).expect("built-in zoxide adapter must parse");
+            let result = self.execute_script(&script, &[]);
+            return Some(result);
+        }
+        if source.contains("__atuin_bind_ctrl_r=true") && source.contains("__atuin_initialized") {
+            let _ = self.set_variable("__atuin_initialized", "true".into(), None, false);
+            let _ = self.set_variable("ATUIN_SHELL", "bash".into(), Some(true), false);
+            if source.contains("export ATUIN_TMUX_POPUP=false") {
+                let _ = self.set_variable("ATUIN_TMUX_POPUP", "false".into(), Some(true), false);
+            }
+            return Some(ExecResult::status(0));
+        }
+        if source.contains("### key-bindings.bash ###")
+            || source.contains("### completion.bash ###")
+        {
+            let _ = self.set_variable("ISKSH_FZF_INTEGRATION", "1".into(), Some(true), false);
+            return Some(ExecResult::status(0));
+        }
+        None
+    }
+
+    fn append_prompt_command(&mut self, command: &str) {
+        let current = self.value_of("PROMPT_COMMAND").unwrap_or_default();
+        if !current.split(';').any(|part| part.trim() == command) {
+            let value = if current.is_empty() {
+                command.to_string()
+            } else {
+                format!("{current}; {command}")
+            };
+            let _ = self.set_variable("PROMPT_COMMAND", value, None, false);
         }
     }
 
@@ -2708,6 +2789,7 @@ fn evaluate_conditional(tokens: &[String], shell: &Shell) -> Result<bool, String
             "-e" => shell.resolve_path(value).exists(),
             "-f" => shell.resolve_path(value).is_file(),
             "-d" => shell.resolve_path(value).is_dir(),
+            "-r" => fs::File::open(shell.resolve_path(value)).is_ok(),
             "-v" => {
                 shell.value_of(value).is_some()
                     || parse_array_reference(value)
@@ -3070,6 +3152,7 @@ fn builtin_test(args: &[String]) -> ExecResult {
         [operator, value] if operator == "-e" => Path::new(value).exists(),
         [operator, value] if operator == "-f" => Path::new(value).is_file(),
         [operator, value] if operator == "-d" => Path::new(value).is_dir(),
+        [operator, value] if operator == "-r" => fs::File::open(value).is_ok(),
         [left, operator, right] if operator == "=" => left == right,
         [left, operator, right] if operator == "!=" => left != right,
         [left, operator, right] if operator == "-eq" => {
@@ -3595,6 +3678,8 @@ mod tests {
             (vec!["1", "-eq", "1"], 0),
             (vec!["1", "-ne", "2"], 0),
             (vec!["bad", "-eq", "bad"], 0),
+            (vec!["-r", "Cargo.toml"], 0),
+            (vec!["-r", "missing-isksh-file"], 1),
             (vec!["too", "many", "values", "here"], 1),
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
@@ -4181,7 +4266,12 @@ mod tests {
                 .status,
             0
         );
-        assert_eq!(shell.run("[[ -v a[4] && -d . && ! -f . ]]", &[]).status, 0);
+        assert_eq!(
+            shell
+                .run("[[ -v a[4] && -d . && -r Cargo.toml && ! -f . ]]", &[])
+                .status,
+            0
+        );
     }
 
     #[test]
@@ -4545,6 +4635,100 @@ mod tests {
             Some("$(starship prompt --status=$?)")
         );
         assert_eq!(shell.value_of("STARSHIP_SHELL").as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn translates_dotfiles_bash_tool_integrations() {
+        let mut shell = Shell::default();
+        assert!(shell.command_search_path().is_some());
+        shell.builtin_unset(&["PATH".into()]);
+        assert_eq!(shell.command_search_path(), None);
+        shell
+            .set_variable("PATH", "/tools".into(), Some(true), false)
+            .unwrap();
+        shell
+            .set_variable("PROMPT_COMMAND", "printf pre".into(), None, false)
+            .unwrap();
+        let mise = concat!(
+            "export __MISE_EXE='/tools/mise'\n",
+            "_mise_hook_prompt_command() { :; }\n",
+        );
+        assert_eq!(shell.run(mise, &[]).status, 0);
+        assert_eq!(shell.value_of("__MISE_EXE").as_deref(), Some("/tools/mise"));
+        assert_eq!(shell.value_of("MISE_SHELL").as_deref(), Some("bash"));
+        assert_eq!(shell.run(mise, &[]).status, 0);
+        let prompt_command = shell.value_of("PROMPT_COMMAND").unwrap();
+        assert!(prompt_command.starts_with("printf pre; "));
+        assert_eq!(prompt_command.matches("mise hook-env").count(), 1);
+
+        let zoxide = "function __zoxide_hook() { :; }; __zoxide_z() { :; }";
+        assert_eq!(shell.execute_eval(&[zoxide.into()], &[]).status, 0);
+        assert!(shell.functions.contains_key("z"));
+        assert!(shell.functions.contains_key("zi"));
+        assert!(shell.configured_command_names().contains(&"z".to_string()));
+        assert_eq!(shell.value_of("_ZO_DOCTOR").as_deref(), Some("0"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("destination");
+            fs::create_dir(&destination).unwrap();
+            let executable = directory.path().join("zoxide");
+            fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\ncase $1 in query) printf '%s' '{}' ;; add) exit 0 ;; esac\n",
+                    destination.display()
+                ),
+            )
+            .unwrap();
+            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755)).unwrap();
+            shell
+                .set_variable(
+                    "PATH",
+                    directory.path().to_string_lossy().into_owned(),
+                    Some(true),
+                    false,
+                )
+                .unwrap();
+            let expected = format!("{}\n", destination.display()).into_bytes();
+            assert_eq!(shell.run("z target; pwd", &[]).stdout, expected);
+            shell.cwd = std::env::current_dir().unwrap();
+            let expected = format!("{}\n", destination.display()).into_bytes();
+            assert_eq!(shell.run("zi target; pwd", &[]).stdout, expected);
+        }
+
+        let atuin = concat!(
+            "export ATUIN_TMUX_POPUP=false\n",
+            "__atuin_bind_ctrl_r=true; __atuin_initialized=true",
+        );
+        assert_eq!(shell.run(atuin, &[]).status, 0);
+        assert_eq!(shell.value_of("ATUIN_SHELL").as_deref(), Some("bash"));
+        assert_eq!(
+            shell.value_of("__atuin_initialized").as_deref(),
+            Some("true")
+        );
+        assert_eq!(shell.value_of("ATUIN_TMUX_POPUP").as_deref(), Some("false"));
+
+        assert_eq!(
+            shell
+                .run("### key-bindings.bash ###\nprintf ignored", &[])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell.value_of("ISKSH_FZF_INTEGRATION").as_deref(),
+            Some("1")
+        );
+
+        let mut mise_without_export = Shell::default();
+        assert_eq!(
+            mise_without_export
+                .run("__MISE_EXE=x; _mise_hook_prompt_command() { :; }", &[])
+                .status,
+            0
+        );
+        assert_eq!(mise_without_export.value_of("__MISE_EXE"), None);
     }
 
     #[test]

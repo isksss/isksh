@@ -21,6 +21,11 @@ fn and_or_lists_follow_exit_status() {
 }
 
 #[test]
+fn if_without_matching_branch_returns_success() {
+    assert_script("if false; then printf unexpected; fi", "", 0);
+}
+
+#[test]
 fn quotes_control_field_splitting() {
     assert_script(
         "value='a b'; for x in $value; do printf '<%s>' \"$x\"; done",

@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Test, lint, cross-build, and static verification
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Build development container
+        run: docker compose build dev
+
+      - name: Run all checks
+        run: docker compose run --rm dev mise run check-all
+
+      - name: Upload Windows binary for host smoke test
+        uses: actions/upload-artifact@v7
+        with:
+          name: isksh-windows-x86_64
+          path: |
+            dist/isksh-windows-x86_64.exe
+            dist/isksh-windows-x86_64.exe.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  windows-smoke:
+    name: Windows host smoke test
+    needs: quality
+    runs-on: windows-2025
+    timeout-minutes: 10
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download Windows binary
+        uses: actions/download-artifact@v8
+        with:
+          name: isksh-windows-x86_64
+          path: dist
+
+      - name: Run Windows smoke tests
+        shell: pwsh
+        run: ./scripts/windows-smoke.ps1

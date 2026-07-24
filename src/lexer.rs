@@ -94,6 +94,9 @@ impl<'a> Lexer<'a> {
                 });
             } else {
                 let word = self.word(conditional)?;
+                if word.parts.is_empty() {
+                    continue;
+                }
                 if word.as_plain_literal() == Some("[[") {
                     conditional = true;
                 } else if word.as_plain_literal() == Some("]]") {
@@ -220,7 +223,6 @@ impl<'a> Lexer<'a> {
             }
         }
         self.flush_literal(&mut parts, &mut literal, false);
-        debug_assert!(!parts.is_empty());
         Ok(Word { parts })
     }
 
@@ -532,6 +534,7 @@ mod tests {
         let tokens = lex("\"\" \"a\\\nb\" \"`printf x`\" ${'x'} ${a{b}}").unwrap();
         assert_eq!(tokens.len(), 5);
         assert!(lex("\"x\\").unwrap_err().incomplete);
+        assert!(lex("\\\n").unwrap().is_empty());
     }
 
     #[test]

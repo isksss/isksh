@@ -13,6 +13,22 @@ pub fn startup_file() -> Option<PathBuf> {
     )
 }
 
+pub fn bash_startup_file() -> Option<PathBuf> {
+    bash_startup_file_from(
+        std::env::var_os("ISKSH_RC").is_some(),
+        std::env::var_os("HOME").or(std::env::var_os("USERPROFILE")),
+    )
+}
+
+fn bash_startup_file_from(override_present: bool, home: Option<OsString>) -> Option<PathBuf> {
+    if override_present {
+        return None;
+    }
+    home.filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .map(|path| path.join(".bashrc"))
+}
+
 fn startup_file_from(
     override_path: Option<OsString>,
     config_home: Option<OsString>,
@@ -55,6 +71,7 @@ mod tests {
     #[test]
     fn resolves_override_xdg_home_and_disabled_paths() {
         let _ = startup_file();
+        let _ = bash_startup_file();
         assert_eq!(
             startup_file_from(Some("custom.rc".into()), None, None),
             Some(PathBuf::from("custom.rc"))
@@ -69,6 +86,13 @@ mod tests {
         );
         assert_eq!(startup_file_from(Some(OsString::new()), None, None), None);
         assert_eq!(startup_file_from(None, None, None), None);
+        assert_eq!(bash_startup_file_from(true, Some("home".into())), None);
+        assert_eq!(
+            bash_startup_file_from(false, Some("home".into())),
+            Some(PathBuf::from("home/.bashrc"))
+        );
+        assert_eq!(bash_startup_file_from(false, Some(OsString::new())), None);
+        assert_eq!(bash_startup_file_from(false, None), None);
     }
 
     #[test]

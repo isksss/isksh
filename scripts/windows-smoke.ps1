@@ -5,6 +5,9 @@ New-Item -ItemType Directory -Path $sandbox | Out-Null
 try {
     Copy-Item $binary (Join-Path $sandbox 'isksh.exe')
     Set-Content -LiteralPath (Join-Path $sandbox 'sample.cmd') -Encoding Ascii -Value '@echo cmd-ok'
+    foreach ($tool in @('mise', 'nvim', 'lazygit', 'yazi', 'zellij', 'codex')) {
+        Set-Content -LiteralPath (Join-Path $sandbox "$tool.cmd") -Encoding Ascii -Value "@echo $tool-ok"
+    }
     Push-Location $sandbox
     try {
         $output = & .\isksh.exe -c 'value=windows; printf "%s" "$value"'
@@ -14,6 +17,12 @@ try {
         $cmdOutput = & .\isksh.exe -c 'sample'
         if ($LASTEXITCODE -ne 0 -or $cmdOutput -ne 'cmd-ok') {
             throw "isksh Windows PATHEXT smoke test failed"
+        }
+        foreach ($tool in @('mise', 'nvim', 'lazygit', 'yazi', 'zellij', 'codex')) {
+            $toolOutput = & .\isksh.exe -c $tool
+            if ($LASTEXITCODE -ne 0 -or $toolOutput -ne "$tool-ok") {
+                throw "isksh Windows tool smoke test failed: $tool"
+            }
         }
     } finally {
         Pop-Location

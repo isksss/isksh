@@ -1,4 +1,4 @@
-use isksh::{Shell, load_startup_file, run_interactive, startup_file};
+use isksh::{Shell, bash_startup_file, load_startup_file, run_interactive, startup_file};
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
@@ -50,7 +50,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
         let mut reader = BufReader::new(io::stdin());
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        if let Some(path) = startup_file() {
+        for path in startup_file().into_iter().chain(bash_startup_file()) {
             match load_startup_file(&mut shell, &path) {
                 Ok(Some(result)) => {
                     stdout
@@ -62,11 +62,13 @@ fn run_cli() -> Result<i32, (i32, String)> {
                     if let Some(status) = shell.take_exit_status() {
                         return Ok(status);
                     }
+                    break;
                 }
                 Ok(None) => {}
                 Err(error) => {
                     writeln!(stderr, "isksh: {}: {error}", path.display())
                         .map_err(|error| (1, error.to_string()))?;
+                    break;
                 }
             }
         }
@@ -166,7 +168,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     let mut editor = Editor::<ShellHelper, DefaultHistory>::new().map_err(io::Error::other)?;
     editor.set_helper(Some(ShellHelper {
         files: FilenameCompleter::new(),
-        commands: command_candidates(),
+        commands: command_candidates(shell),
     }));
     let history = history_file();
     if let Some(parent) = history.parent() {
@@ -176,7 +178,11 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     let mut source = String::new();
     let mut status = 0;
     loop {
-        match editor.readline(&shell.prompt(!source.is_empty())) {
+        let prompt = shell.prompt(!source.is_empty());
+        if let Some(helper) = editor.helper_mut() {
+            helper.commands = command_candidates(shell);
+        }
+        match editor.readline(&prompt) {
             Ok(line) => {
                 source.push_str(&line);
                 source.push('\n');
@@ -208,7 +214,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     Ok(status)
 }
 
-fn command_candidates() -> Vec<String> {
+fn command_candidates(shell: &Shell) -> Vec<String> {
     let mut commands = BTreeSet::from(
         [
             "alias", "cd", "command", "echo", "eval", "exec", "exit", "export", "false", "jobs",
@@ -217,7 +223,8 @@ fn command_candidates() -> Vec<String> {
         ]
         .map(str::to_string),
     );
-    if let Some(path) = std::env::var_os("PATH") {
+    commands.extend(shell.configured_command_names());
+    if let Some(path) = shell.command_search_path() {
         for directory in std::env::split_paths(&path) {
             let Ok(entries) = fs::read_dir(directory) else {
                 continue;

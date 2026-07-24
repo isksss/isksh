@@ -155,6 +155,39 @@ fn interactive_mode_loads_iskrc() {
     assert!(stdout.contains("loaded:alias-loaded"));
 }
 
+#[test]
+fn interactive_mode_falls_back_to_bashrc() {
+    let directory = tempfile::tempdir().unwrap();
+    std::fs::write(
+        directory.path().join(".bashrc"),
+        "export FROM_BASHRC=loaded\nalias bash-configured='printf bashrc-loaded'\n",
+    )
+    .unwrap();
+    let mut child = isksh()
+        .arg("-i")
+        .env_remove("ISKSH_RC")
+        .env("HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"printf '%s:' \"$FROM_BASHRC\"; bash-configured\nexit\n")
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .contains("loaded:bashrc-loaded")
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn rejects_non_utf8_argument() {
