@@ -62,6 +62,7 @@ pub struct CaseArm {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SimpleCommand {
     pub assignments: Vec<(String, Word)>,
+    pub array_assignments: Vec<(String, Vec<Word>)>,
     pub words: Vec<Word>,
     pub redirections: Vec<Redirection>,
 }
@@ -118,4 +119,5 @@ pub enum WordPart {
     Parameter { expression: String, quoted: bool },
     CommandSubstitution { source: String, quoted: bool },
     Arithmetic { expression: String, quoted: bool },
+    ProcessSubstitution { source: String, input: bool },
 }

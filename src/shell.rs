@@ -1,11 +1,15 @@
 use crate::ast::*;
 use crate::parser::parse;
 use glob::{MatchOptions, Pattern, glob_with};
-use std::collections::HashMap;
+use regex::Regex;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static PROCESS_SUBSTITUTION_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 struct Variable {
@@ -29,6 +33,27 @@ struct ExecResult {
     stdout: Vec<u8>,
     stderr: Vec<u8>,
     flow: Flow,
+}
+
+#[derive(Debug, Clone)]
+enum OutputSink {
+    Stdout,
+    Stderr,
+    File(PathBuf),
+    Closed,
+}
+
+#[derive(Debug, Clone)]
+struct PendingProcessSubstitution {
+    path: PathBuf,
+    source: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct LocalScope {
+    variables: HashMap<String, Option<Variable>>,
+    indexed_arrays: HashMap<String, Option<BTreeMap<usize, String>>>,
+    associative_arrays: HashMap<String, Option<BTreeMap<String, String>>>,
 }
 
 impl ExecResult {
@@ -67,6 +92,13 @@ pub struct RunResult {
     pub stderr: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InputState {
+    Complete,
+    Incomplete,
+    Invalid(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct Shell {
     variables: HashMap<String, Variable>,
@@ -75,10 +107,17 @@ pub struct Shell {
     last_status: i32,
     functions: HashMap<String, Command>,
     aliases: HashMap<String, String>,
+    indexed_arrays: HashMap<String, BTreeMap<usize, String>>,
+    associative_arrays: HashMap<String, BTreeMap<String, String>>,
+    shell_options: HashSet<String>,
+    pending_process_substitutions: Vec<PendingProcessSubstitution>,
+    local_scopes: Vec<LocalScope>,
+    expanding_aliases: Vec<String>,
     cwd: PathBuf,
     loop_depth: usize,
     function_depth: usize,
     getopts_offset: usize,
+    exit_status: Option<i32>,
 }
 
 impl Default for Shell {
@@ -108,15 +147,45 @@ impl Shell {
             last_status: 0,
             functions: HashMap::new(),
             aliases: HashMap::new(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            indexed_arrays: HashMap::new(),
+            associative_arrays: HashMap::new(),
+            shell_options: HashSet::new(),
+            pending_process_substitutions: Vec::new(),
+            local_scopes: Vec::new(),
+            expanding_aliases: Vec::new(),
+            cwd: std::env::current_dir().unwrap_or(PathBuf::from(".")),
             loop_depth: 0,
             function_depth: 0,
             getopts_offset: 1,
+            exit_status: None,
         }
     }
 
     pub fn set_positional(&mut self, values: Vec<String>) {
         self.positional = values;
+    }
+
+    pub fn check_input(source: &str) -> InputState {
+        match parse(source) {
+            Ok(_) => InputState::Complete,
+            Err(error) if error.incomplete => InputState::Incomplete,
+            Err(error) => InputState::Invalid(error.to_string()),
+        }
+    }
+
+    pub fn prompt(&self, continuation: bool) -> String {
+        let name = if continuation { "PS2" } else { "PS1" };
+        self.value_of(name).unwrap_or_else(|| {
+            if continuation {
+                "> ".to_string()
+            } else {
+                "$ ".to_string()
+            }
+        })
+    }
+
+    pub fn take_exit_status(&mut self) -> Option<i32> {
+        self.exit_status.take()
     }
 
     pub fn run(&mut self, source: &str, input: &[u8]) -> RunResult {
@@ -132,7 +201,10 @@ impl Shell {
         };
         let result = self.execute_script(&script, input);
         let status = match result.flow {
-            Flow::Exit(status) | Flow::Return(status) => status,
+            Flow::Exit(status) => {
+                self.exit_status = Some(status);
+                status
+            }
             _ => result.status,
         };
         self.last_status = status;
@@ -366,6 +438,19 @@ impl Shell {
     }
 
     fn execute_simple(&mut self, command: &SimpleCommand, input: &[u8]) -> ExecResult {
+        for (name, words) in &command.array_assignments {
+            let mut values = BTreeMap::new();
+            for (index, word) in words.iter().enumerate() {
+                match self.expand_scalar(word) {
+                    Ok(value) => {
+                        values.insert(index, value);
+                    }
+                    Err(message) => return ExecResult::error(1, format!("isksh: {message}")),
+                }
+            }
+            self.associative_arrays.remove(name);
+            self.indexed_arrays.insert(name.clone(), values);
+        }
         let mut assignments = Vec::new();
         for (name, word) in &command.assignments {
             match self.expand_scalar(word) {
@@ -376,16 +461,22 @@ impl Shell {
 
         if command.words.is_empty() {
             for (name, value) in assignments {
-                if let Err(message) = self.set_variable(&name, value, None, false) {
+                if let Err(message) = self.set_assignment(&name, value, None) {
                     return ExecResult::error(1, message);
                 }
             }
             return self.apply_redirections(command, input, ExecResult::status(0));
         }
 
+        let conditional = command.words.first().and_then(Word::as_plain_literal) == Some("[[");
         let mut words = Vec::new();
         for word in &command.words {
-            match self.expand_word(word) {
+            let expanded = if conditional {
+                self.expand_scalar(word).map(|value| vec![value])
+            } else {
+                self.expand_word(word)
+            };
+            match expanded {
                 Ok(mut fields) => words.append(&mut fields),
                 Err(message) => return ExecResult::error(1, format!("isksh: {message}")),
             }
@@ -419,6 +510,16 @@ impl Shell {
                     Ok(path) => path,
                     Err(message) => return ExecResult::error(1, message),
                 };
+                if redirection.kind == RedirectionKind::ReadWrite
+                    && let Err(error) = OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .truncate(false)
+                        .open(&path)
+                {
+                    return ExecResult::error(1, format!("isksh: {error}"));
+                }
                 match fs::read(path) {
                     Ok(bytes) => command_input = bytes,
                     Err(error) => return ExecResult::error(1, format!("isksh: {error}")),
@@ -427,17 +528,42 @@ impl Shell {
         }
 
         let name = words.remove(0);
+        if assignments.is_empty()
+            && !self.expanding_aliases.contains(&name)
+            && let Some(replacement) = self.aliases.get(&name).cloned()
+        {
+            let mut source = replacement;
+            for argument in &words {
+                source.push(' ');
+                source.push_str(&shell_quote(argument));
+            }
+            self.expanding_aliases.push(name.clone());
+            let result = self.execute_eval(&[source], &command_input);
+            self.expanding_aliases.pop();
+            return self.apply_redirections(command, &command_input, result);
+        }
         let is_special = is_special_builtin(&name);
         let has_temporary_assignments = !assignments.is_empty();
         let saved_variables = if is_special || !has_temporary_assignments {
-            None
+            Vec::new()
         } else {
-            Some(self.variables.clone())
+            assignments
+                .iter()
+                .map(|(key, _)| (key.clone(), self.variables.get(key).cloned()))
+                .collect()
         };
+        if let Some((key, _)) = assignments.iter().find(|(key, _)| {
+            !valid_assignment_name(key)
+                || self
+                    .variables
+                    .get(key)
+                    .is_some_and(|variable| variable.readonly)
+        }) {
+            return ExecResult::error(1, format!("isksh: {key}: invalid or readonly variable"));
+        }
         for (key, value) in assignments {
-            if let Err(message) = self.set_variable(&key, value, Some(true), false) {
-                return ExecResult::error(1, message);
-            }
+            let inserted = self.set_assignment(&key, value, Some(true));
+            debug_assert!(inserted.is_ok());
         }
         let mut result = if let Some(function) = self.functions.get(&name).cloned() {
             self.execute_function(&function, words, &command_input)
@@ -446,10 +572,20 @@ impl Shell {
         } else {
             self.execute_external(&name, &words, &command_input)
         };
-        if let Some(previous) = saved_variables {
-            self.variables = previous;
+        for (name, previous) in saved_variables {
+            if let Some(previous) = previous {
+                self.variables.insert(name, previous);
+            } else {
+                self.variables.remove(&name);
+            }
         }
         result = self.apply_redirections(command, &command_input, result);
+        let mut substitutions = self.finish_process_substitutions();
+        result.stdout.append(&mut substitutions.stdout);
+        result.stderr.append(&mut substitutions.stderr);
+        if substitutions.status != 0 && result.status == 0 {
+            result.status = substitutions.status;
+        }
         result
     }
 
@@ -459,6 +595,8 @@ impl Shell {
         _input: &[u8],
         mut result: ExecResult,
     ) -> ExecResult {
+        let mut stdout_sink = OutputSink::Stdout;
+        let mut stderr_sink = OutputSink::Stderr;
         for redirection in &command.redirections {
             let fd = redirection.fd.unwrap_or(match redirection.kind {
                 RedirectionKind::Input
@@ -471,33 +609,35 @@ impl Shell {
                 | RedirectionKind::Clobber
                 | RedirectionKind::Append
                 | RedirectionKind::ReadWrite => {
+                    if redirection.kind == RedirectionKind::ReadWrite && fd == 0 {
+                        continue;
+                    }
+                    if !matches!(fd, 1 | 2) {
+                        return ExecResult::error(1, "isksh: unsupported output file descriptor");
+                    }
                     let path = match self.redirection_path(&redirection.target) {
                         Ok(path) => path,
                         Err(message) => return ExecResult::error(1, message),
                     };
                     let mut options = OpenOptions::new();
-                    options.create(true).write(true);
-                    if redirection.kind == RedirectionKind::Append {
-                        options.append(true);
-                    } else if redirection.kind != RedirectionKind::ReadWrite {
-                        options.truncate(true);
-                    } else {
+                    options.create(true).write(true).append(true);
+                    if redirection.kind != RedirectionKind::Append
+                        && redirection.kind != RedirectionKind::ReadWrite
+                        && let Err(error) = fs::write(&path, [])
+                    {
+                        return ExecResult::error(1, format!("isksh: {error}"));
+                    }
+                    if redirection.kind == RedirectionKind::ReadWrite {
                         options.read(true);
                     }
-                    let data = if fd == 2 {
-                        &result.stderr
+                    if let Err(error) = options.open(&path) {
+                        return ExecResult::error(1, format!("isksh: {error}"));
+                    }
+                    let sink = OutputSink::File(path);
+                    if fd == 2 {
+                        stderr_sink = sink;
                     } else {
-                        &result.stdout
-                    };
-                    match options.open(path).and_then(|mut file| file.write_all(data)) {
-                        Ok(()) => {
-                            if fd == 2 {
-                                result.stderr.clear();
-                            } else {
-                                result.stdout.clear();
-                            }
-                        }
-                        Err(error) => return ExecResult::error(1, format!("isksh: {error}")),
+                        stdout_sink = sink;
                     }
                 }
                 RedirectionKind::DuplicateOutput | RedirectionKind::DuplicateInput => {
@@ -505,10 +645,24 @@ impl Shell {
                         Ok(target) => target,
                         Err(message) => return ExecResult::error(1, message),
                     };
-                    if fd == 2 && target == "1" {
-                        result.stdout.extend_from_slice(&result.stderr);
-                        result.stderr.clear();
-                    } else if target != "-" {
+                    if matches!(fd, 1 | 2) {
+                        let sink = match target.as_str() {
+                            "1" => stdout_sink.clone(),
+                            "2" => stderr_sink.clone(),
+                            "-" => OutputSink::Closed,
+                            _ => {
+                                return ExecResult::error(
+                                    1,
+                                    "isksh: unsupported file descriptor duplication",
+                                );
+                            }
+                        };
+                        if fd == 2 {
+                            stderr_sink = sink;
+                        } else {
+                            stdout_sink = sink;
+                        }
+                    } else if fd != 0 || target != "-" {
                         return ExecResult::error(
                             1,
                             "isksh: unsupported file descriptor duplication",
@@ -518,6 +672,24 @@ impl Shell {
                 RedirectionKind::HereDocument | RedirectionKind::HereDocumentStrip => {}
                 RedirectionKind::Input => {}
             }
+        }
+        let stdout = std::mem::take(&mut result.stdout);
+        let stderr = std::mem::take(&mut result.stderr);
+        if let Err(error) = write_output_sink(
+            &stdout_sink,
+            &stdout,
+            &mut result.stdout,
+            &mut result.stderr,
+        ) {
+            return ExecResult::error(1, format!("isksh: {error}"));
+        }
+        if let Err(error) = write_output_sink(
+            &stderr_sink,
+            &stderr,
+            &mut result.stdout,
+            &mut result.stderr,
+        ) {
+            return ExecResult::error(1, format!("isksh: {error}"));
         }
         result
     }
@@ -530,7 +702,12 @@ impl Shell {
     ) -> ExecResult {
         let old_positional = std::mem::replace(&mut self.positional, arguments);
         self.function_depth += 1;
+        self.local_scopes.push(LocalScope::default());
         let mut result = self.execute_command(body, input);
+        let scope = self.local_scopes.pop().expect("function scope exists");
+        restore_map(&mut self.variables, scope.variables);
+        restore_map(&mut self.indexed_arrays, scope.indexed_arrays);
+        restore_map(&mut self.associative_arrays, scope.associative_arrays);
         self.function_depth -= 1;
         self.positional = old_positional;
         if let Flow::Return(status) = result.flow {
@@ -561,20 +738,15 @@ impl Shell {
             }
             Err(error) => return ExecResult::error(126, format!("isksh: {name}: {error}")),
         };
-        if let Some(mut stdin) = child.stdin.take()
-            && let Err(error) = stdin.write_all(input)
-        {
-            return ExecResult::error(1, format!("isksh: {error}"));
+        let stdin_writer = child.stdin.take().map(|mut stdin| {
+            let input = input.to_vec();
+            std::thread::spawn(move || stdin.write_all(&input))
+        });
+        let output = child.wait_with_output();
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
         }
-        match child.wait_with_output() {
-            Ok(output) => ExecResult {
-                status: exit_status(&output.status),
-                stdout: output.stdout,
-                stderr: output.stderr,
-                flow: Flow::None,
-            },
-            Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
-        }
+        finish_external(name, output)
     }
 
     fn execute_builtin(&mut self, name: &str, args: &[String], input: &[u8]) -> ExecResult {
@@ -619,16 +791,28 @@ impl Shell {
             "break" => self.loop_flow(args, true),
             "continue" => self.loop_flow(args, false),
             "eval" => self.execute_eval(args, input),
-            "." => self.builtin_dot(args, input),
-            "exec" | "command" => {
+            "." | "source" => self.builtin_dot(args, input),
+            "declare" | "typeset" | "local" => self.builtin_declare(name, args),
+            "shopt" => self.builtin_shopt(args),
+            "type" => self.builtin_type(args),
+            "mapfile" | "readarray" => self.builtin_mapfile(args, input),
+            "[[" => self.builtin_double_bracket(args),
+            "exec" => {
                 if args.is_empty() {
                     ExecResult::status(0)
-                } else if is_builtin(&args[0]) {
-                    self.execute_builtin(&args[0], &args[1..], input)
                 } else {
-                    self.execute_external(&args[0], &args[1..], input)
+                    let mut result = if is_builtin(&args[0]) {
+                        self.execute_builtin(&args[0], &args[1..], input)
+                    } else {
+                        self.execute_external(&args[0], &args[1..], input)
+                    };
+                    if result.flow == Flow::None {
+                        result.flow = Flow::Exit(result.status);
+                    }
+                    result
                 }
             }
+            "command" => self.builtin_command(args, input),
             "read" => self.builtin_read(args, input),
             "test" => builtin_test(args),
             "[" => {
@@ -645,7 +829,10 @@ impl Shell {
                 stdout: b"0m0.000s 0m0.000s\n0m0.000s 0m0.000s\n".to_vec(),
                 ..ExecResult::status(0)
             },
-            "trap" | "hash" | "umask" => ExecResult::status(0),
+            "hash" => ExecResult::status(0),
+            "trap" | "umask" => {
+                ExecResult::error(2, format!("isksh: {name}: not supported on this release"))
+            }
             _ => ExecResult::error(127, format!("isksh: {name}: unsupported builtin")),
         }
     }
@@ -655,7 +842,7 @@ impl Shell {
             .first()
             .cloned()
             .or_else(|| self.value_of("HOME"))
-            .unwrap_or_else(|| ".".into());
+            .unwrap_or(".".into());
         let path = self.resolve_path(&target);
         match fs::canonicalize(path) {
             Ok(path) if path.is_dir() => {
@@ -667,18 +854,300 @@ impl Shell {
         }
     }
 
+    fn builtin_declare(&mut self, command: &str, args: &[String]) -> ExecResult {
+        if command == "local" && self.function_depth == 0 {
+            return ExecResult::error(1, "isksh: local: can only be used in a function");
+        }
+        let mut indexed = false;
+        let mut associative = false;
+        let mut print = false;
+        let mut global = false;
+        let mut index = 0;
+        while let Some(option) = args.get(index).filter(|value| value.starts_with('-')) {
+            for flag in option[1..].chars() {
+                match flag {
+                    'a' => indexed = true,
+                    'A' => associative = true,
+                    'p' => print = true,
+                    'g' => global = true,
+                    _ => {
+                        return ExecResult::error(
+                            2,
+                            format!("isksh: {command}: -{flag}: unsupported option"),
+                        );
+                    }
+                }
+            }
+            index += 1;
+        }
+        let mut output = String::new();
+        for argument in &args[index..] {
+            let (name, value) = argument
+                .split_once('=')
+                .map_or((argument.as_str(), None), |(name, value)| {
+                    (name, Some(value))
+                });
+            if !valid_variable_name(name) {
+                return ExecResult::error(1, format!("isksh: {command}: {name}: invalid name"));
+            }
+            if (command == "local" || command != "local" && self.function_depth > 0 && !global)
+                && let Some(scope) = self.local_scopes.last_mut()
+            {
+                scope
+                    .variables
+                    .entry(name.to_string())
+                    .or_insert_with(|| self.variables.get(name).cloned());
+                scope
+                    .indexed_arrays
+                    .entry(name.to_string())
+                    .or_insert_with(|| self.indexed_arrays.get(name).cloned());
+                scope
+                    .associative_arrays
+                    .entry(name.to_string())
+                    .or_insert_with(|| self.associative_arrays.get(name).cloned());
+            }
+            if print {
+                if let Some(values) = self.indexed_arrays.get(name) {
+                    output.push_str(&format_array_declaration(
+                        "declare -a",
+                        name,
+                        values.iter().map(|(k, v)| (k.to_string(), v.as_str())),
+                    ));
+                } else if let Some(values) = self.associative_arrays.get(name) {
+                    output.push_str(&format_array_declaration(
+                        "declare -A",
+                        name,
+                        values.iter().map(|(k, v)| (k.clone(), v.as_str())),
+                    ));
+                } else if let Some(value) = self.value_of(name) {
+                    output.push_str(&format!("declare -- {name}={}\n", shell_quote(&value)));
+                } else {
+                    return ExecResult::status(1);
+                }
+            } else if associative {
+                self.indexed_arrays.remove(name);
+                self.associative_arrays.entry(name.to_string()).or_default();
+            } else if indexed {
+                self.associative_arrays.remove(name);
+                self.indexed_arrays.entry(name.to_string()).or_default();
+            } else if let Some(value) = value
+                && let Err(message) = self.set_variable(name, value.to_string(), None, false)
+            {
+                return ExecResult::error(1, message);
+            }
+        }
+        ExecResult {
+            stdout: output.into_bytes(),
+            ..ExecResult::status(0)
+        }
+    }
+
+    fn builtin_shopt(&mut self, args: &[String]) -> ExecResult {
+        let mut mode = None;
+        let mut quiet = false;
+        let mut names = Vec::new();
+        for argument in args {
+            match argument.as_str() {
+                "-s" => mode = Some(true),
+                "-u" => mode = Some(false),
+                "-q" => quiet = true,
+                "-p" => {}
+                value if value.starts_with('-') => {
+                    return ExecResult::error(2, "isksh: shopt: unsupported option");
+                }
+                _ => names.push(argument.as_str()),
+            }
+        }
+        const OPTIONS: &[&str] = &["dotglob", "extglob", "globstar", "nocasematch", "nullglob"];
+        if names.iter().any(|name| !OPTIONS.contains(name)) {
+            return ExecResult::error(1, "isksh: shopt: invalid shell option name");
+        }
+        if let Some(enabled) = mode {
+            for name in &names {
+                if enabled {
+                    self.shell_options.insert((*name).to_string());
+                } else {
+                    self.shell_options.remove(*name);
+                }
+            }
+        }
+        let selected: Vec<_> = if names.is_empty() {
+            OPTIONS.to_vec()
+        } else {
+            names
+        };
+        let all_enabled = selected
+            .iter()
+            .all(|name| self.shell_options.contains(*name));
+        let stdout = if quiet {
+            Vec::new()
+        } else {
+            selected
+                .into_iter()
+                .map(|name| {
+                    format!(
+                        "shopt -{} {name}\n",
+                        if self.shell_options.contains(name) {
+                            's'
+                        } else {
+                            'u'
+                        }
+                    )
+                })
+                .collect::<String>()
+                .into_bytes()
+        };
+        ExecResult {
+            status: i32::from(!all_enabled),
+            stdout,
+            ..ExecResult::status(0)
+        }
+    }
+
+    fn builtin_type(&self, args: &[String]) -> ExecResult {
+        let terse = args.first().map(String::as_str) == Some("-t");
+        let names = if terse { &args[1..] } else { args };
+        let mut output = String::new();
+        for name in names {
+            let (kind, detail) = if self.aliases.contains_key(name) {
+                ("alias", format!("{name} is an alias"))
+            } else if self.functions.contains_key(name) {
+                ("function", format!("{name} is a function"))
+            } else if is_builtin(name) {
+                ("builtin", format!("{name} is a shell builtin"))
+            } else {
+                let path = self.resolve_command_file(name);
+                if !path.is_file() {
+                    return ExecResult::status(1);
+                }
+                ("file", format!("{name} is {}", path.display()))
+            };
+            output.push_str(if terse { kind } else { &detail });
+            output.push('\n');
+        }
+        ExecResult {
+            stdout: output.into_bytes(),
+            ..ExecResult::status(0)
+        }
+    }
+
+    fn builtin_mapfile(&mut self, args: &[String], input: &[u8]) -> ExecResult {
+        let mut trim = false;
+        let mut index = 0;
+        while args.get(index).is_some_and(|arg| arg.starts_with('-')) {
+            match args[index].as_str() {
+                "-t" => trim = true,
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                _ => return ExecResult::error(2, "isksh: mapfile: unsupported option"),
+            }
+            index += 1;
+        }
+        let name = args.get(index).map(String::as_str).unwrap_or("MAPFILE");
+        if !valid_variable_name(name) {
+            return ExecResult::error(1, "isksh: mapfile: invalid array name");
+        }
+        let text = match std::str::from_utf8(input) {
+            Ok(value) => value,
+            Err(_) => return ExecResult::error(1, "isksh: mapfile: input is not valid UTF-8"),
+        };
+        let values = text
+            .split_inclusive('\n')
+            .enumerate()
+            .map(|(index, line)| {
+                let value = if trim {
+                    line.trim_end_matches('\n').trim_end_matches('\r')
+                } else {
+                    line
+                };
+                (index, value.to_string())
+            })
+            .collect();
+        self.associative_arrays.remove(name);
+        self.indexed_arrays.insert(name.to_string(), values);
+        ExecResult::status(0)
+    }
+
+    fn builtin_double_bracket(&self, args: &[String]) -> ExecResult {
+        if args.last().map(String::as_str) != Some("]]") {
+            return ExecResult::error(2, "isksh: [[: missing ]]");
+        }
+        match evaluate_conditional(&args[..args.len() - 1], self) {
+            Ok(value) => ExecResult::status(i32::from(!value)),
+            Err(message) => ExecResult::error(2, format!("isksh: [[: {message}")),
+        }
+    }
+
+    fn builtin_command(&mut self, args: &[String], input: &[u8]) -> ExecResult {
+        let mut index = 0;
+        let mut describe = false;
+        while let Some(option) = args.get(index).map(String::as_str) {
+            match option {
+                "-v" | "-V" => {
+                    describe = true;
+                    index += 1;
+                }
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                _ => break,
+            }
+        }
+        let Some(name) = args.get(index) else {
+            return ExecResult::status(0);
+        };
+        if describe {
+            let description = if let Some(alias) = self.aliases.get(name) {
+                Some(format!("alias {name}='{alias}'"))
+            } else if is_builtin(name) || self.functions.contains_key(name) {
+                Some(name.clone())
+            } else {
+                let path = self.resolve_command_file(name);
+                path.is_file().then(|| path.to_string_lossy().into_owned())
+            };
+            return match description {
+                Some(mut value) => {
+                    value.push('\n');
+                    ExecResult {
+                        stdout: value.into_bytes(),
+                        ..ExecResult::status(0)
+                    }
+                }
+                None => ExecResult::status(1),
+            };
+        }
+        if is_builtin(name) {
+            self.execute_builtin(name, &args[index + 1..], input)
+        } else {
+            self.execute_external(name, &args[index + 1..], input)
+        }
+    }
+
     fn builtin_export(&mut self, args: &[String], readonly: bool) -> ExecResult {
         if args.is_empty() {
             let mut names: Vec<_> = self
                 .variables
                 .iter()
-                .filter(|(_, value)| value.exported || readonly && value.readonly)
+                .filter(|(_, value)| {
+                    if readonly {
+                        value.readonly
+                    } else {
+                        value.exported
+                    }
+                })
                 .collect();
             names.sort_by_key(|(name, _)| *name);
+            let declaration = if readonly { "readonly" } else { "export" };
             let stdout = names
                 .into_iter()
                 .map(|(name, value)| {
-                    format!("export {name}='{}'\n", value.value.replace('\'', "'\\''"))
+                    format!(
+                        "{declaration} {name}='{}'\n",
+                        value.value.replace('\'', "'\\''")
+                    )
                 })
                 .collect::<String>()
                 .into_bytes();
@@ -699,17 +1168,16 @@ impl Shell {
             if let Err(message) = self.set_variable(
                 name,
                 value.unwrap_or_else(|| self.value_of(name).unwrap_or_default()),
-                Some(!readonly),
+                (!readonly).then_some(true),
                 readonly,
             ) {
                 return ExecResult::error(1, message);
             }
-            if let Some(variable) = self.variables.get_mut(name) {
-                if readonly {
-                    variable.readonly = true;
-                } else {
-                    variable.exported = true;
-                }
+            let variable = self.variables.get_mut(name).expect("variable was inserted");
+            if readonly {
+                variable.readonly = true;
+            } else {
+                variable.exported = true;
             }
         }
         ExecResult::status(0)
@@ -799,11 +1267,19 @@ impl Shell {
     }
 
     fn builtin_read(&mut self, args: &[String], input: &[u8]) -> ExecResult {
-        let line = String::from_utf8_lossy(input)
-            .lines()
-            .next()
-            .unwrap_or_default()
-            .to_string();
+        let input = match std::str::from_utf8(input) {
+            Ok(input) => input,
+            Err(error) => {
+                return ExecResult::error(
+                    1,
+                    format!(
+                        "isksh: read: input is not valid UTF-8 at byte {}",
+                        error.valid_up_to()
+                    ),
+                );
+            }
+        };
+        let line = input.lines().next().unwrap_or_default().to_string();
         let names = if args.is_empty() {
             vec!["REPLY".to_string()]
         } else {
@@ -973,7 +1449,7 @@ impl Shell {
                         && part.starts_with('~')
                         && (part.len() == 1 || part.as_bytes().get(1) == Some(&b'/'))
                     {
-                        value.push_str(&self.value_of("HOME").unwrap_or_else(|| "~".into()));
+                        value.push_str(&self.value_of("HOME").unwrap_or("~".into()));
                         value.push_str(&part[1..]);
                     } else {
                         value.push_str(part);
@@ -1001,6 +1477,28 @@ impl Shell {
                 WordPart::Arithmetic { expression, quoted } => {
                     value.push_str(&self.evaluate_arithmetic(expression)?.to_string());
                     split |= !quoted;
+                }
+                WordPart::ProcessSubstitution { source, input } => {
+                    let id = PROCESS_SUBSTITUTION_ID.fetch_add(1, Ordering::Relaxed);
+                    let path =
+                        std::env::temp_dir().join(format!("isksh-{}-{id}.tmp", std::process::id()));
+                    if *input {
+                        let result = self.clone().run(source, &[]);
+                        fs::write(&path, result.stdout).map_err(io_error_string)?;
+                        self.pending_process_substitutions
+                            .push(PendingProcessSubstitution {
+                                path: path.clone(),
+                                source: None,
+                            });
+                    } else {
+                        fs::write(&path, []).map_err(io_error_string)?;
+                        self.pending_process_substitutions
+                            .push(PendingProcessSubstitution {
+                                path: path.clone(),
+                                source: Some(source.clone()),
+                            });
+                    }
+                    value.push_str(&path.to_string_lossy());
                 }
             }
         }
@@ -1055,6 +1553,32 @@ impl Shell {
     }
 
     fn expand_parameter(&mut self, expression: &str) -> Result<String, String> {
+        if let Some(reference) = expression.strip_prefix('!')
+            && let Some((name, subscript)) = parse_array_reference(reference)
+            && matches!(subscript, "@" | "*")
+        {
+            return Ok(self.array_keys(name).join(" "));
+        }
+        if let Some(reference) = expression.strip_prefix('#')
+            && let Some((name, subscript)) = parse_array_reference(reference)
+        {
+            return Ok(if matches!(subscript, "@" | "*") {
+                self.array_values(name).len().to_string()
+            } else {
+                self.array_value(name, subscript)
+                    .unwrap_or_default()
+                    .chars()
+                    .count()
+                    .to_string()
+            });
+        }
+        if let Some((name, subscript)) = parse_array_reference(expression) {
+            return Ok(if matches!(subscript, "@" | "*") {
+                self.array_values(name).join(" ")
+            } else {
+                self.array_value(name, subscript).unwrap_or_default()
+            });
+        }
         if let Some(name) = expression.strip_prefix('#')
             && valid_variable_name(name)
         {
@@ -1073,37 +1597,34 @@ impl Shell {
                 let current = self.value_of(name);
                 let colon = operator.starts_with(':');
                 let missing = current.is_none() || colon && current.as_deref() == Some("");
-                return match operator.trim_start_matches(':') {
-                    "-" => Ok(if missing {
+                let operation = operator.trim_start_matches(':');
+                return if operation == "-" {
+                    Ok(if missing {
                         word.to_string()
                     } else {
                         current.unwrap_or_default()
-                    }),
-                    "+" => Ok(if missing {
+                    })
+                } else if operation == "+" {
+                    Ok(if missing {
                         String::new()
                     } else {
                         word.to_string()
-                    }),
-                    "=" => {
-                        if missing {
-                            self.set_variable(name, word.to_string(), None, false)?;
-                            Ok(word.to_string())
-                        } else {
-                            Ok(current.unwrap_or_default())
-                        }
+                    })
+                } else if operation == "=" {
+                    if missing {
+                        self.set_variable(name, word.to_string(), None, false)?;
+                        Ok(word.to_string())
+                    } else {
+                        Ok(current.unwrap_or_default())
                     }
-                    "?" => {
-                        if missing {
-                            Err(if word.is_empty() {
-                                format!("{name}: parameter is unset or null")
-                            } else {
-                                word.to_string()
-                            })
-                        } else {
-                            Ok(current.unwrap_or_default())
-                        }
-                    }
-                    _ => unreachable!(),
+                } else if missing {
+                    Err(if word.is_empty() {
+                        format!("{name}: parameter is unset or null")
+                    } else {
+                        word.to_string()
+                    })
+                } else {
+                    Ok(current.unwrap_or_default())
                 };
             }
         }
@@ -1182,12 +1703,18 @@ impl Shell {
                     if chars[index] == '(' {
                         depth += 1;
                     } else if chars[index] == ')' {
-                        if arithmetic && depth == 1 && chars.get(index + 1) == Some(&')') {
-                            break;
-                        }
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
+                        if arithmetic {
+                            if depth == 1 && chars.get(index + 1) == Some(&')') {
+                                break;
+                            }
+                            if depth > 1 {
+                                depth -= 1;
+                            }
+                        } else {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
                         }
                     }
                     index += 1;
@@ -1329,6 +1856,9 @@ impl Shell {
         exported: Option<bool>,
         readonly: bool,
     ) -> Result<(), String> {
+        if !valid_variable_name(name) {
+            return Err(format!("isksh: {name}: invalid variable name"));
+        }
         if self
             .variables
             .get(name)
@@ -1349,6 +1879,219 @@ impl Shell {
             },
         );
         Ok(())
+    }
+
+    fn set_assignment(
+        &mut self,
+        target: &str,
+        value: String,
+        exported: Option<bool>,
+    ) -> Result<(), String> {
+        if let Some((name, subscript)) = parse_array_reference(target) {
+            if let Some(values) = self.associative_arrays.get_mut(name) {
+                values.insert(subscript.to_string(), value);
+                return Ok(());
+            }
+            let index = subscript
+                .parse::<usize>()
+                .map_err(|_| format!("isksh: {target}: invalid indexed-array subscript"))?;
+            self.indexed_arrays
+                .entry(name.to_string())
+                .or_default()
+                .insert(index, value);
+            Ok(())
+        } else {
+            self.set_variable(target, value, exported, false)
+        }
+    }
+
+    fn array_value(&self, name: &str, subscript: &str) -> Option<String> {
+        if let Some(values) = self.associative_arrays.get(name) {
+            values.get(subscript).cloned()
+        } else {
+            let index = subscript.parse::<usize>().ok()?;
+            self.indexed_arrays
+                .get(name)
+                .and_then(|values| values.get(&index))
+                .cloned()
+        }
+    }
+
+    fn array_values(&self, name: &str) -> Vec<String> {
+        self.indexed_arrays
+            .get(name)
+            .map(|values| values.values().cloned().collect())
+            .or_else(|| {
+                self.associative_arrays
+                    .get(name)
+                    .map(|values| values.values().cloned().collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn array_keys(&self, name: &str) -> Vec<String> {
+        self.indexed_arrays
+            .get(name)
+            .map(|values| values.keys().map(ToString::to_string).collect())
+            .or_else(|| {
+                self.associative_arrays
+                    .get(name)
+                    .map(|values| values.keys().cloned().collect())
+            })
+            .unwrap_or_default()
+    }
+
+    fn finish_process_substitutions(&mut self) -> ExecResult {
+        let mut result = ExecResult::status(0);
+        for pending in std::mem::take(&mut self.pending_process_substitutions) {
+            if let Some(source) = pending.source {
+                match fs::read(&pending.path) {
+                    Ok(input) => {
+                        let child = self.clone().run(&source, &input);
+                        result.stdout.extend(child.stdout);
+                        result.stderr.extend(child.stderr);
+                        if child.status != 0 {
+                            result.status = child.status;
+                        }
+                    }
+                    Err(error) => result
+                        .stderr
+                        .extend_from_slice(format!("isksh: {error}\n").as_bytes()),
+                }
+            }
+            let _ = fs::remove_file(pending.path);
+        }
+        result
+    }
+}
+
+fn parse_array_reference(value: &str) -> Option<(&str, &str)> {
+    let (name, subscript) = value.split_once('[')?;
+    let subscript = subscript.strip_suffix(']')?;
+    (valid_variable_name(name) && !subscript.is_empty()).then_some((name, subscript))
+}
+
+fn io_error_string(error: std::io::Error) -> String {
+    error.to_string()
+}
+
+fn restore_map<T>(target: &mut HashMap<String, T>, saved: HashMap<String, Option<T>>) {
+    for (name, value) in saved {
+        if let Some(value) = value {
+            target.insert(name, value);
+        } else {
+            target.remove(&name);
+        }
+    }
+}
+
+fn valid_assignment_name(value: &str) -> bool {
+    valid_variable_name(value) || parse_array_reference(value).is_some()
+}
+
+fn format_array_declaration<'a>(
+    prefix: &str,
+    name: &str,
+    values: impl Iterator<Item = (String, &'a str)>,
+) -> String {
+    let entries = values
+        .map(|(key, value)| format!("[{key}]={}", shell_quote(value)))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("{prefix} {name}=({entries})\n")
+}
+
+fn evaluate_conditional(tokens: &[String], shell: &Shell) -> Result<bool, String> {
+    if tokens.is_empty() {
+        return Err("expression required".into());
+    }
+    if let Some(index) = conditional_operator(tokens, "||") {
+        return Ok(evaluate_conditional(&tokens[..index], shell)?
+            || evaluate_conditional(&tokens[index + 1..], shell)?);
+    }
+    if let Some(index) = conditional_operator(tokens, "&&") {
+        return Ok(evaluate_conditional(&tokens[..index], shell)?
+            && evaluate_conditional(&tokens[index + 1..], shell)?);
+    }
+    if tokens.first().map(String::as_str) == Some("!") {
+        return Ok(!evaluate_conditional(&tokens[1..], shell)?);
+    }
+    if tokens.first().map(String::as_str) == Some("(")
+        && tokens.last().map(String::as_str) == Some(")")
+    {
+        return evaluate_conditional(&tokens[1..tokens.len() - 1], shell);
+    }
+    match tokens {
+        [value] => Ok(!value.is_empty()),
+        [operator, value] => Ok(match operator.as_str() {
+            "-n" => !value.is_empty(),
+            "-z" => value.is_empty(),
+            "-e" => shell.resolve_path(value).exists(),
+            "-f" => shell.resolve_path(value).is_file(),
+            "-d" => shell.resolve_path(value).is_dir(),
+            "-v" => {
+                shell.value_of(value).is_some()
+                    || parse_array_reference(value)
+                        .is_some_and(|(name, key)| shell.array_value(name, key).is_some())
+            }
+            _ => return Err(format!("unknown unary operator: {operator}")),
+        }),
+        [left, operator, right] => match operator.as_str() {
+            "=" | "==" => Pattern::new(right)
+                .map(|pattern| pattern.matches(left))
+                .map_err(|error| error.to_string()),
+            "!=" => Pattern::new(right)
+                .map(|pattern| !pattern.matches(left))
+                .map_err(|error| error.to_string()),
+            "=~" => Regex::new(right)
+                .map(|regex| regex.is_match(left))
+                .map_err(|error| error.to_string()),
+            "<" => Ok(left < right),
+            ">" => Ok(left > right),
+            "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
+                let left = left
+                    .parse::<i64>()
+                    .map_err(|_| "integer expression expected".to_string())?;
+                let right = right
+                    .parse::<i64>()
+                    .map_err(|_| "integer expression expected".to_string())?;
+                Ok(match operator.as_str() {
+                    "-eq" => left == right,
+                    "-ne" => left != right,
+                    "-lt" => left < right,
+                    "-le" => left <= right,
+                    "-gt" => left > right,
+                    _ => left >= right,
+                })
+            }
+            _ => Err(format!("unknown binary operator: {operator}")),
+        },
+        _ => Err("invalid conditional expression".into()),
+    }
+}
+
+fn conditional_operator(tokens: &[String], expected: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    for (index, token) in tokens.iter().enumerate() {
+        match token.as_str() {
+            "(" => depth += 1,
+            ")" => depth = depth.saturating_sub(1),
+            value if value == expected && depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn finish_external(name: &str, output: std::io::Result<std::process::Output>) -> ExecResult {
+    match output {
+        Ok(output) => ExecResult {
+            status: exit_status(&output.status),
+            stdout: output.stdout,
+            stderr: output.stderr,
+            flow: Flow::None,
+        },
+        Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
     }
 }
 
@@ -1392,6 +2135,15 @@ fn is_builtin(name: &str) -> bool {
                 | "true"
                 | "umask"
                 | "wait"
+                | "source"
+                | "declare"
+                | "typeset"
+                | "local"
+                | "shopt"
+                | "type"
+                | "mapfile"
+                | "readarray"
+                | "[["
         )
 }
 
@@ -1399,6 +2151,29 @@ fn valid_variable_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn write_output_sink(
+    sink: &OutputSink,
+    data: &[u8],
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    match sink {
+        OutputSink::Stdout => stdout.extend_from_slice(data),
+        OutputSink::Stderr => stderr.extend_from_slice(data),
+        OutputSink::File(path) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?
+            .write_all(data)?,
+        OutputSink::Closed => {}
+    }
+    Ok(())
 }
 
 fn flow_status(args: &[String], constructor: fn(i32) -> Flow, default: i32) -> ExecResult {
@@ -1701,5 +2476,925 @@ mod tests {
             "set -- -ab value; while getopts 'ab:' option; do printf '%s:%s;' \"$option\" \"${OPTARG:-}\"; done",
         );
         assert_eq!(result.stdout, b"a:;b:value;");
+    }
+
+    #[test]
+    fn exercises_control_flow_and_shell_state() {
+        let mut shell = Shell::default();
+        let result = shell.run(
+            "x=outer; (x=inner); { x=group; }; until true; do false; done; false || true; ! false; printf '%s' \"$x\"",
+            &[],
+        );
+        assert_eq!(result.stdout, b"group");
+        assert_eq!(result.status, 0);
+
+        assert_eq!(shell.run("return", &[]).status, 1);
+        assert_eq!(shell.run("break", &[]).status, 1);
+        assert_eq!(shell.run("continue", &[]).status, 1);
+        assert_eq!(shell.run("exit 258", &[]).status, 2);
+        assert_eq!(shell.take_exit_status(), Some(2));
+        assert_eq!(shell.take_exit_status(), None);
+    }
+
+    #[test]
+    fn exercises_parameter_tilde_glob_and_arithmetic_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(directory.path().join("a.txt"), b"").unwrap();
+        fs::write(directory.path().join("b.txt"), b"").unwrap();
+        let mut shell = Shell {
+            cwd: directory.path().to_path_buf(),
+            ..Shell::default()
+        };
+        shell
+            .set_variable(
+                "HOME",
+                directory.path().to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        shell.set_positional(vec!["one".into(), "two".into()]);
+        let result = shell.run(
+            "unset x; printf '%s|' \"${x-word}\" \"${x+no}\" \"${x=assigned}\" \"${x+yes}\" \"${#x}\" \"$#\" \"$0\" \"$1\" \"$9\" \"$@\" \"$*\" ~/*.txt",
+            &[],
+        );
+        let output = String::from_utf8(result.stdout).unwrap();
+        assert!(output.contains("word||assigned|yes|8|2|"));
+        assert!(output.contains("a.txt"));
+        assert!(output.contains("b.txt"));
+        assert_ne!(shell.run("printf '%s' $((1 / 0))", &[]).status, 0);
+        assert_ne!(shell.run("printf '%s' $((1 +))", &[]).status, 0);
+        assert_ne!(shell.run("printf '%s' $((1 2))", &[]).status, 0);
+        assert_ne!(shell.run("printf '%s' $((1 + (2))", &[]).status, 0);
+        assert_ne!(shell.run("printf '%s' ${missing:?required}", &[]).status, 0);
+    }
+
+    #[test]
+    fn exercises_redirection_order_and_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("combined");
+        let escaped = path.to_string_lossy().replace('\\', "/");
+        let mut shell = Shell::default();
+        let result = shell.run(
+            &format!("sh -c 'printf out; printf err >&2' >'{escaped}' 2>&1"),
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        assert_eq!(fs::read(path).unwrap(), b"outerr");
+        let result = shell.run("printf err 1>&2", &[]);
+        assert_eq!(result.stderr, b"err");
+        assert_ne!(shell.run("printf x 9>file", &[]).status, 0);
+        assert_ne!(shell.run("printf x 2>&9", &[]).status, 0);
+        assert_eq!(shell.run("printf x 1>&-", &[]).stdout, b"");
+        assert_ne!(shell.run("cat < /missing/isksh-file", &[]).status, 0);
+    }
+
+    #[test]
+    fn exercises_builtins() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        fs::write(&file, "value=dot\n").unwrap();
+        let mut shell = Shell::default();
+        let _named = Shell::new(String::from("named"));
+
+        assert_eq!(shell.execute_builtin("false", &[], &[]).status, 1);
+        assert_eq!(
+            shell
+                .execute_builtin("echo", &["-n".into(), "x".into()], &[])
+                .stdout,
+            b"x"
+        );
+        assert!(
+            shell
+                .execute_builtin("pwd", &[], &[])
+                .stdout
+                .ends_with(b"\n")
+        );
+        assert_eq!(
+            shell
+                .builtin_cd(&[directory.path().to_string_lossy().into_owned()])
+                .status,
+            0
+        );
+        shell
+            .set_variable(
+                "HOME",
+                directory.path().to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(shell.builtin_cd(&[]).status, 0);
+        assert_ne!(
+            shell
+                .builtin_cd(&[file.to_string_lossy().into_owned()])
+                .status,
+            0
+        );
+        assert_ne!(shell.builtin_cd(&["missing".into()]).status, 0);
+
+        assert_eq!(
+            shell
+                .builtin_export(&["EXPORTED=value".into()], false)
+                .status,
+            0
+        );
+        assert_eq!(shell.builtin_export(&["NAME_ONLY".into()], false).status, 0);
+        assert!(
+            String::from_utf8(shell.builtin_export(&[], false).stdout)
+                .unwrap()
+                .contains("EXPORTED")
+        );
+        assert_eq!(
+            shell.builtin_export(&["LOCKED=value".into()], true).status,
+            0
+        );
+        assert!(
+            String::from_utf8(shell.builtin_export(&[], true).stdout)
+                .unwrap()
+                .contains("readonly LOCKED")
+        );
+        assert_ne!(shell.builtin_export(&["1BAD=x".into()], false).status, 0);
+        assert_ne!(shell.builtin_unset(&["LOCKED".into()]).status, 0);
+        assert_eq!(shell.builtin_unset(&["EXPORTED".into()]).status, 0);
+
+        assert!(!shell.builtin_set(&[]).stdout.is_empty());
+        assert_eq!(
+            shell
+                .builtin_set(&["--".into(), "a".into(), "b".into()])
+                .status,
+            0
+        );
+        assert_eq!(shell.builtin_shift(&[]).status, 0);
+        assert_ne!(shell.builtin_shift(&["9".into()]).status, 0);
+        assert_ne!(shell.builtin_set(&["-e".into()]).status, 0);
+
+        assert_eq!(
+            shell.execute_eval(&["printf eval".into()], &[]).stdout,
+            b"eval"
+        );
+        assert_ne!(shell.execute_eval(&["if".into()], &[]).status, 0);
+        assert_eq!(
+            shell
+                .builtin_dot(&[file.to_string_lossy().into_owned()], &[])
+                .status,
+            0
+        );
+        assert_ne!(shell.builtin_dot(&[], &[]).status, 0);
+        assert_ne!(shell.builtin_dot(&["missing".into()], &[]).status, 0);
+
+        assert_eq!(shell.builtin_read(&[], b"answer\n").status, 0);
+        assert_eq!(shell.value_of("REPLY").as_deref(), Some("answer"));
+        assert_eq!(
+            shell
+                .builtin_read(&["A".into(), "B".into()], b"a b c\n")
+                .status,
+            0
+        );
+        assert_eq!(shell.value_of("B").as_deref(), Some("b c"));
+        assert_ne!(shell.builtin_read(&[], &[0xff]).status, 0);
+        assert_ne!(shell.builtin_read(&["1BAD".into()], b"x").status, 0);
+
+        assert_eq!(shell.builtin_alias(&["ll=printf alias".into()]).status, 0);
+        assert_eq!(shell.run("ll", &[]).stdout, b"alias");
+        assert!(!shell.builtin_alias(&[]).stdout.is_empty());
+        assert_ne!(shell.builtin_alias(&["missing".into()]).status, 0);
+        assert_eq!(shell.builtin_unalias(&["ll".into()]).status, 0);
+
+        assert_eq!(
+            shell
+                .builtin_command(&["-v".into(), "printf".into()], &[])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_command(&["-v".into(), "missing-isksh".into()], &[])
+                .status,
+            1
+        );
+        assert_eq!(shell.builtin_command(&[], &[]).status, 0);
+        assert_eq!(
+            shell
+                .builtin_command(&["--".into(), "true".into()], &[])
+                .status,
+            0
+        );
+        assert_ne!(shell.execute_builtin("trap", &[], &[]).status, 0);
+        assert_ne!(shell.execute_builtin("unsupported", &[], &[]).status, 0);
+    }
+
+    #[test]
+    fn exercises_printf_test_getopts_and_external_commands() {
+        assert_eq!(builtin_printf(&[]).status, 0);
+        assert_eq!(
+            builtin_printf(&[
+                "%%:%d:%i:%b:%q\\n".into(),
+                "2".into(),
+                "bad".into(),
+                "a\\tb".into(),
+                "x".into()
+            ])
+            .stdout,
+            b"%:2:0:a\tb:%q\n"
+        );
+        for (args, expected) in [
+            (vec![], 1),
+            (vec!["x"], 0),
+            (vec!["-n", "x"], 0),
+            (vec!["-z", ""], 0),
+            (vec!["a", "=", "a"], 0),
+            (vec!["a", "!=", "b"], 0),
+            (vec!["1", "-eq", "1"], 0),
+            (vec!["1", "-ne", "2"], 0),
+            (vec!["bad", "-eq", "bad"], 0),
+            (vec!["too", "many", "values", "here"], 1),
+        ] {
+            let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
+            assert_eq!(builtin_test(&args).status, expected);
+        }
+
+        let mut shell = Shell::default();
+        assert_ne!(shell.builtin_getopts(&[]).status, 0);
+        shell.set_positional(vec!["-x".into()]);
+        assert_eq!(
+            shell.builtin_getopts(&[":a".into(), "OPT".into()]).status,
+            0
+        );
+        assert_eq!(shell.value_of("OPT").as_deref(), Some("?"));
+        shell.builtin_set(&["--".into(), "-a".into()]);
+        assert_eq!(
+            shell.builtin_getopts(&["a:".into(), "OPT".into()]).status,
+            0
+        );
+        assert_eq!(shell.value_of("OPT").as_deref(), Some("?"));
+        shell.builtin_set(&["--".into(), "--".into()]);
+        assert_eq!(shell.builtin_getopts(&["a".into(), "OPT".into()]).status, 1);
+        assert_eq!(
+            shell
+                .execute_external("missing-isksh-command", &[], &[])
+                .status,
+            127
+        );
+        assert_eq!(
+            shell
+                .execute_external("sh", &["-c".into(), "exit 3".into()], &[])
+                .status,
+            3
+        );
+    }
+
+    #[test]
+    fn exercises_input_classification_background_pipeline_and_nested_flow() {
+        assert!(matches!(
+            Shell::check_input("echo ok"),
+            InputState::Complete
+        ));
+        assert!(matches!(
+            Shell::check_input("if true"),
+            InputState::Incomplete
+        ));
+        assert!(matches!(Shell::check_input(")"), InputState::Invalid(_)));
+
+        let mut shell = Shell::default();
+        let parse_error = shell.run(")", &[]);
+        assert_eq!(parse_error.status, 2);
+        assert!(!parse_error.stderr.is_empty());
+        let background = shell.run("printf bg &", &[]);
+        assert_eq!(background.stdout, b"bg");
+        assert!(
+            String::from_utf8(background.stderr)
+                .unwrap()
+                .contains("synchronous")
+        );
+        assert_eq!(shell.run("printf pipe | cat", &[]).stdout, b"pipe");
+        assert_eq!(
+            shell
+                .run(
+                    "for a in 1; do for b in 1; do break 2; done; printf no; done; printf yes",
+                    &[],
+                )
+                .stdout,
+            b"yes"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "for a in 1 2; do for b in 1; do continue 2; done; printf no; done; printf yes",
+                    &[],
+                )
+                .stdout,
+            b"yes"
+        );
+        shell.set_positional(vec!["a".into(), "b".into()]);
+        assert_eq!(shell.run("for x; do printf %s $x; done", &[]).stdout, b"ab");
+        assert_eq!(shell.run("case no in yes) false;; esac", &[]).status, 0);
+        assert_eq!(shell.run("f() { return 5; }; f", &[]).status, 5);
+        assert_eq!(
+            shell
+                .run("if false; then printf no; else printf else; fi", &[])
+                .stdout,
+            b"else"
+        );
+        assert_eq!(shell.run("exit 3 && printf no", &[]).status, 3);
+        assert_eq!(shell.run("true && printf and", &[]).stdout, b"and");
+        assert_eq!(
+            shell
+                .run("f() { while true; do return 4; done; }; f", &[])
+                .status,
+            4
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "while true; do while true; do break 2; done; done; printf done",
+                    &[],
+                )
+                .stdout,
+            b"done"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "i=0; while test $i -ne 2; do i=$((i+1)); while true; do continue 2; done; done; printf done",
+                    &[],
+                )
+                .stdout,
+            b"done"
+        );
+        assert_eq!(shell.run("for x in a; do exit 6; done", &[]).status, 6);
+    }
+
+    #[test]
+    fn exercises_assignment_alias_and_expansion_edge_cases() {
+        let mut shell = Shell::default();
+        shell.run("KEEP=old; readonly LOCK=old", &[]);
+        assert_ne!(shell.run("KEEP=temp LOCK=new true", &[]).status, 0);
+        assert_eq!(shell.value_of("KEEP").as_deref(), Some("old"));
+        assert_eq!(
+            shell
+                .run("TEMP=value true; printf %s \"${TEMP-no}\"", &[])
+                .stdout,
+            b"no"
+        );
+        assert_eq!(shell.run("PREFIX=x read RESULT", b"persist\n").status, 0);
+        assert_eq!(shell.value_of("RESULT").as_deref(), Some("persist"));
+        assert_eq!(shell.run("printf '<%s>' $UNSET", &[]).stdout, b"<>");
+
+        shell.run("alias say='printf \"<%s>\"'", &[]);
+        assert_eq!(shell.run("say \"a'b\"", &[]).stdout, b"<a'b>");
+        shell.run("alias self=self", &[]);
+        assert_eq!(shell.run("self", &[]).status, 127);
+        assert!(
+            shell
+                .builtin_command(&["-v".into(), "say".into()], &[])
+                .stdout
+                .starts_with(b"alias")
+        );
+
+        shell.set_positional(vec!["a".into(), "b".into()]);
+        assert_ne!(shell.run("printf x >\"$@\"", &[]).status, 0);
+        assert_eq!(
+            shell.run("printf %s 'no-match-*.isksh'", &[]).stdout,
+            b"no-match-*.isksh"
+        );
+        assert_ne!(shell.run("printf %s [bad", &[]).status, 0);
+        assert_eq!(shell.expand_parameter("bad name:-x").unwrap(), "");
+        assert_eq!(
+            shell.expand_parameter("EMPTY?").unwrap_err(),
+            "EMPTY: parameter is unset or null"
+        );
+        shell
+            .set_variable("PRESENT", "yes".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.expand_parameter("PRESENT=other").unwrap(), "yes");
+        assert_eq!(shell.expand_parameter("PRESENT?bad").unwrap(), "yes");
+        assert_ne!(shell.run("readonly ONLY=old; ONLY=new", &[]).status, 0);
+        assert_eq!(shell.run("$UNSET", &[]).status, 0);
+        assert_eq!(
+            shell.run("printf %s no-match-*.isksh", &[]).stdout,
+            b"no-match-*.isksh"
+        );
+
+        let non_utf8 = Word {
+            parts: vec![WordPart::CommandSubstitution {
+                source: "sh -c 'printf \\\\377'".into(),
+                quoted: false,
+            }],
+        };
+        assert!(shell.expand_word(&non_utf8).is_err());
+        let failed = Word {
+            parts: vec![WordPart::CommandSubstitution {
+                source: "sh -c 'printf err >&2; exit 1'".into(),
+                quoted: false,
+            }],
+        };
+        assert!(shell.expand_word(&failed).unwrap().is_empty());
+        let bad = Word {
+            parts: vec![WordPart::Arithmetic {
+                expression: "1/0".into(),
+                quoted: false,
+            }],
+        };
+        let empty = Script { lists: Vec::new() };
+        assert_ne!(
+            shell
+                .execute_for("x", std::slice::from_ref(&bad), &empty, &[])
+                .status,
+            0
+        );
+        assert_ne!(
+            shell
+                .execute_for(
+                    "1BAD",
+                    &[Word {
+                        parts: vec![WordPart::Literal {
+                            value: "x".into(),
+                            quoted: false,
+                        }],
+                    }],
+                    &empty,
+                    &[],
+                )
+                .status,
+            0
+        );
+        assert_ne!(shell.execute_case(&bad, &[], &[]).status, 0);
+        let literal = Word {
+            parts: vec![WordPart::Literal {
+                value: "x".into(),
+                quoted: false,
+            }],
+        };
+        assert_ne!(
+            shell
+                .execute_case(
+                    &literal,
+                    &[CaseArm {
+                        patterns: vec![bad],
+                        body: empty,
+                    }],
+                    &[],
+                )
+                .status,
+            0
+        );
+    }
+
+    #[test]
+    fn exercises_heredoc_and_redirection_internal_errors() {
+        let mut shell = Shell::default();
+        assert_eq!(
+            shell
+                .expand_here_document("\\$x|\\`|\\\\|a\\\nb|$?|$x|$((2*(3)))|$(printf sub)|$!")
+                .unwrap(),
+            "$x|`|\\|ab|0||6|sub|$!"
+        );
+        assert!(shell.expand_here_document("${x").is_err());
+        assert!(shell.expand_here_document("$(printf x").is_err());
+        assert!(shell.expand_here_document("$((1 + 2)").is_err());
+        assert_eq!(shell.expand_here_document("tail\\").unwrap(), "tail\\");
+        assert_eq!(shell.expand_here_document("\\q").unwrap(), "\\q");
+        shell.set_variable("HD", "ok".into(), None, false).unwrap();
+        assert_eq!(shell.expand_here_document("${HD}").unwrap(), "ok");
+        shell
+            .set_variable("LONG_NAME", "long".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.expand_here_document("$LONG_NAME").unwrap(), "long");
+        assert_eq!(
+            shell.expand_here_document("$(printf (nested))").unwrap(),
+            ""
+        );
+        assert!(
+            shell
+                .expand_here_document("$(sh -c 'printf \\\\377')")
+                .is_err()
+        );
+
+        let missing_document = SimpleCommand {
+            words: vec![Word {
+                parts: vec![WordPart::Literal {
+                    value: "cat".into(),
+                    quoted: false,
+                }],
+            }],
+            redirections: vec![Redirection {
+                fd: None,
+                kind: RedirectionKind::HereDocument,
+                target: Word::default(),
+                here_document: None,
+            }],
+            ..SimpleCommand::default()
+        };
+        assert_eq!(shell.execute_simple(&missing_document, &[]).status, 2);
+
+        let invalid_document = SimpleCommand {
+            words: vec![Word {
+                parts: vec![WordPart::Literal {
+                    value: "cat".into(),
+                    quoted: false,
+                }],
+            }],
+            redirections: vec![Redirection {
+                fd: None,
+                kind: RedirectionKind::HereDocument,
+                target: Word::default(),
+                here_document: Some(HereDocument {
+                    body: "${x".into(),
+                    expand: true,
+                }),
+            }],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&invalid_document, &[]).status, 0);
+        assert_eq!(
+            shell.run("V=expanded\ncat <<EOF\n$V\nEOF\n", &[]).stdout,
+            b"expanded\n"
+        );
+        assert_eq!(shell.run("cat <<'EOF'\n$V\nEOF\n", &[]).stdout, b"$V\n");
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory
+            .path()
+            .join("rw")
+            .to_string_lossy()
+            .replace('\\', "/");
+        fs::write(&path, b"input").unwrap();
+        assert_eq!(shell.run(&format!("cat <'{path}'"), &[]).stdout, b"input");
+        assert_eq!(shell.run(&format!("cat 0<>'{path}'"), &[]).stdout, b"input");
+        assert_eq!(
+            shell
+                .run(&format!("printf changed 1<>'{path}'"), &[])
+                .status,
+            0
+        );
+        assert_ne!(shell.run("cat <>/missing/isksh/dir/file", &[]).status, 0);
+        shell.set_positional(vec!["one".into(), "two".into()]);
+        assert_ne!(shell.run("cat <\"$@\"", &[]).status, 0);
+        assert_eq!(shell.run("printf x 2>&-", &[]).stderr, b"");
+        assert_eq!(shell.run("printf x 0<&-", &[]).status, 0);
+        assert_ne!(shell.run("printf x 3<&-", &[]).status, 0);
+        assert_ne!(
+            shell
+                .run(&format!("printf x >'{}'", directory.path().display()), &[])
+                .status,
+            0
+        );
+        assert_ne!(shell.run("printf x >>/dev/full", &[]).status, 0);
+        assert_ne!(
+            shell.run("sh -c 'printf x >&2' 2>>/dev/full", &[]).status,
+            0
+        );
+        assert_ne!(shell.run("printf x >>/", &[]).status, 0);
+
+        let bad_word = Word {
+            parts: vec![WordPart::Arithmetic {
+                expression: "1 / 0".into(),
+                quoted: false,
+            }],
+        };
+        let bad_assignment = SimpleCommand {
+            assignments: vec![("X".into(), bad_word.clone())],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&bad_assignment, &[]).status, 0);
+        let invalid_name_assignment = SimpleCommand {
+            assignments: vec![("1BAD".into(), Word::default())],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(
+            shell.execute_simple(&invalid_name_assignment, &[]).status,
+            0
+        );
+        let bad_command = SimpleCommand {
+            words: vec![bad_word.clone()],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&bad_command, &[]).status, 0);
+        let bad_redirect = SimpleCommand {
+            words: vec![Word {
+                parts: vec![WordPart::Literal {
+                    value: "true".into(),
+                    quoted: false,
+                }],
+            }],
+            redirections: vec![Redirection {
+                fd: Some(2),
+                kind: RedirectionKind::DuplicateOutput,
+                target: bad_word,
+                here_document: None,
+            }],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&bad_redirect, &[]).status, 0);
+    }
+
+    #[test]
+    fn exercises_remaining_builtin_and_arithmetic_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("file");
+        fs::write(&file, b"").unwrap();
+        let mut shell = Shell::default();
+        assert_eq!(shell.execute_builtin(":", &[], &[]).status, 0);
+        assert_eq!(
+            shell.execute_builtin("echo", &["x".into()], &[]).stdout,
+            b"x\n"
+        );
+        assert_eq!(shell.execute_builtin("exec", &[], &[]).status, 0);
+        assert_eq!(shell.run("exec true; printf no", &[]).stdout, b"");
+        assert_eq!(shell.run("exec sh -c 'exit 9'", &[]).status, 9);
+        assert_eq!(shell.execute_builtin("[", &["x".into()], &[]).status, 2);
+        assert_eq!(
+            shell
+                .execute_builtin("[", &["x".into(), "]".into()], &[])
+                .status,
+            0
+        );
+        assert!(!shell.execute_builtin("times", &[], &[]).stdout.is_empty());
+        assert_eq!(shell.execute_builtin("hash", &[], &[]).status, 0);
+        assert_ne!(shell.execute_builtin("umask", &[], &[]).status, 0);
+        shell.run("readonly LOCKED_EXPORT=x", &[]);
+        assert_ne!(
+            shell
+                .builtin_export(&["LOCKED_EXPORT=y".into()], false)
+                .status,
+            0
+        );
+
+        let command_path = std::env::var("PATH")
+            .unwrap()
+            .split(':')
+            .map(PathBuf::from)
+            .find(|path| path.join("sh").is_file())
+            .unwrap()
+            .join("sh");
+        assert_eq!(
+            shell
+                .builtin_command(&["-V".into(), "sh".into()], &[])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_command(
+                    &[
+                        command_path.to_string_lossy().into_owned(),
+                        "-c".into(),
+                        "exit 6".into()
+                    ],
+                    &[]
+                )
+                .status,
+            6
+        );
+
+        for args in [
+            vec!["-e", file.to_str().unwrap()],
+            vec!["-f", file.to_str().unwrap()],
+            vec!["-d", directory.path().to_str().unwrap()],
+        ] {
+            assert_eq!(
+                builtin_test(&args.into_iter().map(str::to_string).collect::<Vec<_>>()).status,
+                0
+            );
+        }
+        assert_eq!(shell.evaluate_arithmetic("-5 + +2 - 1").unwrap(), -4);
+        assert_eq!(shell.evaluate_arithmetic("7 % 4").unwrap(), 3);
+        assert_eq!(shell.evaluate_arithmetic("8 / 2").unwrap(), 4);
+        assert!(shell.evaluate_arithmetic("7 % 0").is_err());
+        assert!(shell.evaluate_arithmetic("(1 + 2").is_err());
+        assert!(shell.set_variable("1BAD", "x".into(), None, false).is_err());
+        shell.set_variable("RO", "x".into(), None, true).unwrap();
+        assert!(shell.set_variable("RO", "y".into(), None, false).is_err());
+        assert_eq!(shell.execute_external("/", &[], &[]).status, 126);
+        assert_eq!(
+            finish_external(
+                "broken",
+                Err(std::io::Error::other("simulated wait failure"))
+            )
+            .status,
+            126
+        );
+        assert_eq!(builtin_printf(&["\\r\\t\\\\\\x".into()]).stdout, b"\r\t\\x");
+        shell.builtin_alias(&["known=value".into()]);
+        assert_eq!(shell.builtin_alias(&["known".into()]).status, 0);
+        shell.run("RESTORE=old", &[]);
+        assert_eq!(shell.run("RESTORE=temp true", &[]).status, 0);
+        assert_eq!(shell.value_of("RESTORE").as_deref(), Some("old"));
+    }
+
+    #[test]
+    fn exercises_getopts_operand_variants() {
+        let mut shell = Shell::default();
+        assert_eq!(
+            shell
+                .builtin_getopts(&["a:".into(), "OPT".into(), "-avalue".into()])
+                .status,
+            0
+        );
+        assert_eq!(shell.value_of("OPTARG").as_deref(), Some("value"));
+        shell
+            .set_variable("OPTIND", "1".into(), None, false)
+            .unwrap();
+        shell.getopts_offset = 1;
+        assert_eq!(
+            shell
+                .builtin_getopts(&["a:".into(), "OPT".into(), "-a".into(), "value".into(),])
+                .status,
+            0
+        );
+        shell
+            .set_variable("OPTIND", "1".into(), None, false)
+            .unwrap();
+        shell.getopts_offset = 1;
+        assert_eq!(
+            shell
+                .builtin_getopts(&[":a:".into(), "OPT".into(), "-a".into()])
+                .status,
+            0
+        );
+        assert_eq!(shell.value_of("OPT").as_deref(), Some(":"));
+        shell
+            .set_variable("OPTIND", "1".into(), None, false)
+            .unwrap();
+        assert_eq!(
+            shell
+                .builtin_getopts(&["a".into(), "OPT".into(), "plain".into()])
+                .status,
+            1
+        );
+        shell
+            .set_variable("OPTIND", "1".into(), None, false)
+            .unwrap();
+        shell.getopts_offset = 2;
+        assert_eq!(
+            shell
+                .builtin_getopts(&["a".into(), "OPT".into(), "-a".into()])
+                .status,
+            1
+        );
+        shell
+            .set_variable("OPTIND", "1".into(), None, false)
+            .unwrap();
+        shell.getopts_offset = 1;
+        assert_eq!(
+            shell
+                .builtin_getopts(&["a".into(), "OPT".into(), "-a".into()])
+                .status,
+            0
+        );
+    }
+
+    #[test]
+    fn supports_bash_arrays_and_conditionals() {
+        let mut shell = Shell::default();
+        let result = shell.run(
+            "a=(zero 'one value' two); a[4]=four; printf '%s|%s|%s|%s\\n' \"${a[1]}\" \"${#a[@]}\" \"${!a[@]}\" \"${a[@]}\"; [[ foobar == foo* && 4 -gt 2 ]]; echo $?",
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        assert_eq!(
+            result.stdout,
+            b"one value|4|0 1 2 4|zero one value two four\n0\n"
+        );
+
+        assert_eq!(
+            shell
+                .run(
+                    "declare -A map; map[key]=value; [[ ${map[key]} =~ ^val && ! -z ${map[key]} ]]",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .run("[[ 2 -ge 3 || ( x != y && -n yes ) ]]", &[])
+                .status,
+            0
+        );
+        assert_eq!(shell.run("[[ -v a[4] && -d . && ! -f . ]]", &[]).status, 0);
+    }
+
+    #[test]
+    fn supports_process_substitution_and_bashrc_builtins() {
+        let mut shell = Shell::default();
+        let result = shell.run("cat <(printf input); printf output > >(cat)", &[]);
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"inputoutput");
+
+        assert_eq!(
+            shell
+                .run("shopt -s nullglob; shopt -q nullglob", &[])
+                .status,
+            0
+        );
+        assert!(!shell.run("shopt -u nullglob; shopt", &[]).stdout.is_empty());
+        assert_eq!(
+            shell
+                .run("mapfile -t lines; printf '%s' \"${lines[1]}\"", b"a\nb\n")
+                .stdout,
+            b"b"
+        );
+        assert_eq!(shell.run("declare -p lines", &[]).status, 0);
+        assert_eq!(shell.run("type -t printf", &[]).stdout, b"builtin\n");
+        assert_eq!(shell.run("local value=x", &[]).status, 1);
+        assert_eq!(shell.run("value=outer; f() { local value=x; printf '%s' \"$value\"; }; f; printf '%s' \"$value\"", &[]).stdout, b"xouter");
+        assert_eq!(shell.run("g() { local created=yes; declare -a local_array; local_array[0]=x; }; g; printf '%s' \"$created${local_array[0]}\"", &[]).stdout, b"");
+    }
+
+    #[test]
+    fn covers_bash_compatibility_errors_and_variants() {
+        let mut shell = Shell::default();
+        assert_eq!(
+            io_error_string(std::io::Error::other("expected")),
+            "expected"
+        );
+        let bad_word = Word {
+            parts: vec![WordPart::Arithmetic {
+                expression: "1/0".into(),
+                quoted: false,
+            }],
+        };
+        let command = SimpleCommand {
+            array_assignments: vec![("bad".into(), vec![bad_word])],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&command, &[]).status, 0);
+
+        assert_eq!(shell.run("printf x > >(false)", &[]).status, 1);
+        let missing = std::env::temp_dir().join("isksh-deliberately-missing-process-substitution");
+        shell
+            .pending_process_substitutions
+            .push(PendingProcessSubstitution {
+                path: missing,
+                source: Some(":".into()),
+            });
+        assert!(!shell.finish_process_substitutions().stderr.is_empty());
+
+        shell.run(
+            "scalar=value; indexed=(abc); declare -A assoc; assoc[key]=xyz",
+            &[],
+        );
+        assert_eq!(
+            shell
+                .run("printf '%s|%s' \"${assoc[@]}\" \"${!assoc[@]}\"", &[])
+                .stdout,
+            b"xyz|key"
+        );
+        for source in [
+            "declare -p scalar",
+            "declare -p indexed",
+            "declare -p assoc",
+            "declare -a new_indexed",
+            "declare -g plain=x",
+        ] {
+            assert_eq!(shell.run(source, &[]).status, 0, "{source}");
+        }
+        for source in [
+            "declare -p missing",
+            "declare -z x",
+            "declare 1bad=x",
+            "shopt invalid",
+            "shopt -x",
+        ] {
+            assert_ne!(shell.run(source, &[]).status, 0, "{source}");
+        }
+        shell.run("readonly locked=x", &[]);
+        assert_ne!(shell.run("declare locked=y", &[]).status, 0);
+
+        shell.run("alias named='true'; fun() { :; }", &[]);
+        assert!(
+            String::from_utf8(shell.run("type named fun printf sh", &[]).stdout)
+                .unwrap()
+                .contains("alias")
+        );
+        assert_eq!(shell.run("type definitely_missing_command", &[]).status, 1);
+
+        assert_eq!(shell.run("mapfile -- rows", b"a\n").status, 0);
+        assert_ne!(shell.run("mapfile -x", b"").status, 0);
+        assert_ne!(shell.run("mapfile 1bad", b"").status, 0);
+        assert_ne!(shell.run("mapfile rows", &[0xff]).status, 0);
+
+        assert_eq!(
+            shell.run("printf '%s' \"${#indexed[0]}\"", &[]).stdout,
+            b"3"
+        );
+        for source in [
+            "[[ ]]",
+            "[[",
+            "[[ -x value ]]",
+            "[[ a nonsense b ]]",
+            "[[ 1 -eq nope ]]",
+            "[[ nope -eq 1 ]]",
+            "[[ x == [ ]]",
+            "[[ x != [ ]]",
+            "[[ x =~ ( ]]",
+            "[[ a b c d ]]",
+        ] {
+            assert_ne!(shell.run(source, &[]).status, 0, "{source}");
+        }
+        assert_eq!(shell.run("[[ value ]]", &[]).status, 0);
+        assert_ne!(shell.run("indexed[bad]=x", &[]).status, 0);
     }
 }

@@ -1,6 +1,6 @@
-use isksh::Shell;
+use isksh::{Shell, load_startup_file, run_interactive, startup_file};
 use std::fs;
-use std::io::{self, Read, Write};
+use std::io::{self, BufReader, IsTerminal, Read, Write};
 
 fn main() {
     let status = match run_cli() {
@@ -25,13 +25,43 @@ fn run_cli() -> Result<i32, (i32, String)> {
 
     if arguments.first().map(String::as_str) == Some("--help") {
         println!(
-            "isksh 0.1.0\n\nUsage:\n  isksh SCRIPT [ARG...]\n  isksh -c COMMAND [NAME [ARG...]]\n  isksh -s [ARG...]\n"
+            "isksh 0.1.0\n\nUsage:\n  isksh SCRIPT [ARG...]\n  isksh -c COMMAND [NAME [ARG...]]\n  isksh -s [ARG...]\n  isksh -i\n"
         );
         return Ok(0);
     }
     if arguments.first().map(String::as_str) == Some("--version") {
         println!("isksh {}", env!("CARGO_PKG_VERSION"));
         return Ok(0);
+    }
+
+    let force_interactive = arguments.as_slice() == ["-i"];
+    if force_interactive || arguments.is_empty() && io::stdin().is_terminal() {
+        let mut shell = Shell::new("isksh");
+        let mut reader = BufReader::new(io::stdin());
+        let mut stdout = io::stdout();
+        let mut stderr = io::stderr();
+        if let Some(path) = startup_file() {
+            match load_startup_file(&mut shell, &path) {
+                Ok(Some(result)) => {
+                    stdout
+                        .write_all(&result.stdout)
+                        .map_err(|error| (1, error.to_string()))?;
+                    stderr
+                        .write_all(&result.stderr)
+                        .map_err(|error| (1, error.to_string()))?;
+                    if let Some(status) = shell.take_exit_status() {
+                        return Ok(status);
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    writeln!(stderr, "isksh: {}: {error}", path.display())
+                        .map_err(|error| (1, error.to_string()))?;
+                }
+            }
+        }
+        return run_interactive(&mut shell, &mut reader, &mut stdout, &mut stderr, true)
+            .map_err(|error| (1, error.to_string()));
     }
 
     let (source, name, positional) = match arguments.first().map(String::as_str) {

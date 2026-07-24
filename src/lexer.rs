@@ -44,6 +44,7 @@ pub struct LexError {
     pub message: String,
     pub line: usize,
     pub column: usize,
+    pub incomplete: bool,
 }
 
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
@@ -71,6 +72,7 @@ impl<'a> Lexer<'a> {
 
     fn lex_all(mut self) -> Result<Vec<Token>, LexError> {
         let mut tokens = Vec::new();
+        let mut conditional = false;
         while let Some(ch) = self.peek() {
             if matches!(ch, ' ' | '\t' | '\r') {
                 self.bump();
@@ -84,14 +86,19 @@ impl<'a> Lexer<'a> {
             }
             let line = self.line;
             let column = self.column;
-            if let Some(op) = self.operator() {
+            if !conditional && let Some(op) = self.operator() {
                 tokens.push(Token {
                     kind: TokenKind::Operator(op),
                     line,
                     column,
                 });
             } else {
-                let word = self.word()?;
+                let word = self.word(conditional)?;
+                if word.as_plain_literal() == Some("[[") {
+                    conditional = true;
+                } else if word.as_plain_literal() == Some("]]") {
+                    conditional = false;
+                }
                 tokens.push(Token {
                     kind: TokenKind::Word(word),
                     line,
@@ -103,6 +110,9 @@ impl<'a> Lexer<'a> {
     }
 
     fn operator(&mut self) -> Option<Operator> {
+        if self.starts_with("<(") || self.starts_with(">(") {
+            return None;
+        }
         let pairs = [
             ("<<-", Operator::HereDocumentStrip),
             ("&&", Operator::AndIf),
@@ -140,17 +150,33 @@ impl<'a> Lexer<'a> {
         Some(op)
     }
 
-    fn word(&mut self) -> Result<Word, LexError> {
+    fn word(&mut self, conditional: bool) -> Result<Word, LexError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
         while let Some(ch) = self.peek() {
-            if matches!(
-                ch,
-                ' ' | '\t' | '\r' | '\n' | ';' | '&' | '|' | '(' | ')' | '{' | '}' | '<' | '>'
-            ) {
+            if conditional && literal.is_empty() && self.starts_with("]]") {
+                self.bump();
+                self.bump();
+                literal.push_str("]]");
+                break;
+            }
+            if matches!(ch, ' ' | '\t' | '\r' | '\n')
+                || !conditional && matches!(ch, ';' | '&' | '|' | '(' | ')' | '{' | '}')
+                || !conditional
+                    && matches!(ch, '<' | '>')
+                    && self.chars.get(self.index + 1) != Some(&'(')
+            {
                 break;
             }
             match ch {
+                '<' | '>' if self.chars.get(self.index + 1) == Some(&'(') => {
+                    self.flush_literal(&mut parts, &mut literal, false);
+                    let input = ch == '<';
+                    self.bump();
+                    self.bump();
+                    let source = self.collect_balanced('(', ')')?;
+                    parts.push(WordPart::ProcessSubstitution { source, input });
+                }
                 '\\' => {
                     self.bump();
                     if self.peek() == Some('\n') {
@@ -158,7 +184,8 @@ impl<'a> Lexer<'a> {
                     } else if let Some(escaped) = self.bump() {
                         literal.push(escaped);
                     } else {
-                        return self.error("末尾のバックスラッシュに文字がありません");
+                        return self
+                            .incomplete_error("末尾のバックスラッシュに続く文字がありません");
                     }
                 }
                 '\'' => {
@@ -193,18 +220,15 @@ impl<'a> Lexer<'a> {
             }
         }
         self.flush_literal(&mut parts, &mut literal, false);
-        if parts.is_empty() {
-            self.error("空のwordです")
-        } else {
-            Ok(Word { parts })
-        }
+        debug_assert!(!parts.is_empty());
+        Ok(Word { parts })
     }
 
     fn double_quoted(&mut self, parts: &mut Vec<WordPart>) -> Result<(), LexError> {
         let mut literal = String::new();
         loop {
             match self.peek() {
-                None => return self.error("二重引用符が閉じられていません"),
+                None => return self.incomplete_error("二重引用符が閉じられていません"),
                 Some('"') => {
                     self.bump();
                     self.flush_literal(parts, &mut literal, true);
@@ -227,7 +251,7 @@ impl<'a> Lexer<'a> {
                             self.bump();
                         }
                         Some(_) => literal.push('\\'),
-                        None => return self.error("二重引用符が閉じられていません"),
+                        None => return self.incomplete_error("二重引用符が閉じられていません"),
                     }
                 }
                 Some('$') => {
@@ -326,7 +350,7 @@ impl<'a> Lexer<'a> {
                 value.push(ch);
             }
         }
-        self.error("置換式が閉じられていません")
+        self.incomplete_error("置換式が閉じられていません")
     }
 
     fn collect_balanced_arithmetic(&mut self) -> Result<String, LexError> {
@@ -347,7 +371,7 @@ impl<'a> Lexer<'a> {
                 value.push(ch);
             }
         }
-        self.error("算術展開が閉じられていません")
+        self.incomplete_error("算術展開が閉じられていません")
     }
 
     fn backticks(&mut self) -> Result<String, LexError> {
@@ -365,7 +389,7 @@ impl<'a> Lexer<'a> {
                 value.push(ch);
             }
         }
-        self.error("バッククォートが閉じられていません")
+        self.incomplete_error("バッククォートが閉じられていません")
     }
 
     fn collect_until(&mut self, end: char) -> Result<String, LexError> {
@@ -376,7 +400,7 @@ impl<'a> Lexer<'a> {
             }
             value.push(ch);
         }
-        self.error("引用符が閉じられていません")
+        self.incomplete_error("引用符が閉じられていません")
     }
 
     fn flush_literal(&self, parts: &mut Vec<WordPart>, value: &mut String, quoted: bool) {
@@ -413,11 +437,12 @@ impl<'a> Lexer<'a> {
         Some(ch)
     }
 
-    fn error<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
+    fn incomplete_error<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
         Err(LexError {
             message: message.into(),
             line: self.line,
             column: self.column,
+            incomplete: true,
         })
     }
 }
@@ -430,12 +455,10 @@ mod tests {
     fn preserves_quote_context_and_expansions() {
         let tokens = lex("echo 'a b' \"$name\" ${value:-x} $(printf y)").unwrap();
         assert_eq!(tokens.len(), 5);
-        let TokenKind::Word(word) = &tokens[2].kind else {
-            panic!("expected word")
-        };
         assert!(matches!(
-            word.parts.as_slice(),
-            [WordPart::Parameter { quoted: true, .. }]
+            &tokens[2].kind,
+            TokenKind::Word(Word { parts })
+                if matches!(parts.as_slice(), [WordPart::Parameter { quoted: true, .. }])
         ));
     }
 
@@ -443,5 +466,81 @@ mod tests {
     fn reports_unclosed_quote_with_position() {
         let error = lex("echo 'oops").unwrap_err();
         assert_eq!(error.line, 1);
+        assert!(error.incomplete);
+    }
+
+    #[test]
+    fn recognizes_every_operator_and_comment() {
+        let tokens =
+            lex("word \r# comment\n; & && || | ( ) { } < > >> << <<- <& >& <> >| ;;").unwrap();
+        let operators = tokens
+            .into_iter()
+            .filter_map(|token| match token.kind {
+                TokenKind::Operator(operator) => Some(operator),
+                TokenKind::Word(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operators,
+            vec![
+                Operator::Newline,
+                Operator::Semicolon,
+                Operator::Background,
+                Operator::AndIf,
+                Operator::OrIf,
+                Operator::Pipe,
+                Operator::LeftParen,
+                Operator::RightParen,
+                Operator::LeftBrace,
+                Operator::RightBrace,
+                Operator::Input,
+                Operator::Output,
+                Operator::Append,
+                Operator::HereDocument,
+                Operator::HereDocumentStrip,
+                Operator::DuplicateInput,
+                Operator::DuplicateOutput,
+                Operator::ReadWrite,
+                Operator::Clobber,
+                Operator::CaseEnd,
+            ]
+        );
+    }
+
+    #[test]
+    fn handles_escape_and_all_substitution_forms() {
+        let tokens =
+            lex("a\\ b\\\n c \"\\$\\`\\\"\\\\\\q$var${x}$(echo (x))$((1+(2)))$-$$$9\" `a\\`b` $")
+                .unwrap();
+        assert_eq!(tokens.len(), 5);
+        assert!(matches!(
+            &tokens[2].kind,
+            TokenKind::Word(Word { parts }) if parts.iter().any(|part| matches!(part, WordPart::Arithmetic { .. }))
+        ));
+    }
+
+    #[test]
+    fn reports_each_incomplete_lexical_form() {
+        for source in ["\\", "\"", "'", "${x", "$(x", "$((1", "`x"] {
+            let error = lex(source).unwrap_err();
+            assert!(error.incomplete, "{source}: {error}");
+        }
+    }
+
+    #[test]
+    fn covers_double_quote_and_balanced_quote_edges() {
+        let tokens = lex("\"\" \"a\\\nb\" \"`printf x`\" ${'x'} ${a{b}}").unwrap();
+        assert_eq!(tokens.len(), 5);
+        assert!(lex("\"x\\").unwrap_err().incomplete);
+    }
+
+    #[test]
+    fn recognizes_bash_conditionals_and_process_substitution() {
+        let tokens = lex("[[ x == x && 2 > 1 ]]; cat <(printf x) >(cat)").unwrap();
+        assert!(
+            matches!(&tokens[0].kind, TokenKind::Word(word) if word.as_plain_literal() == Some("[["))
+        );
+        assert!(tokens.iter().any(|token| matches!(&token.kind, TokenKind::Word(Word { parts }) if parts.iter().any(|part| matches!(part, WordPart::ProcessSubstitution { input: true, .. })))));
+        assert!(tokens.iter().any(|token| matches!(&token.kind, TokenKind::Word(Word { parts }) if parts.iter().any(|part| matches!(part, WordPart::ProcessSubstitution { input: false, .. })))));
     }
 }

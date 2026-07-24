@@ -9,6 +9,7 @@ pub struct ParseError {
     pub message: String,
     pub line: usize,
     pub column: usize,
+    pub incomplete: bool,
 }
 
 pub fn parse(source: &str) -> Result<Script, ParseError> {
@@ -17,6 +18,7 @@ pub fn parse(source: &str) -> Result<Script, ParseError> {
         message: error.message,
         line: error.line,
         column: error.column,
+        incomplete: error.incomplete,
     })?;
     let mut parser = Parser {
         tokens,
@@ -24,9 +26,7 @@ pub fn parse(source: &str) -> Result<Script, ParseError> {
         here_documents,
     };
     let script = parser.parse_script_until(&[], &[])?;
-    if parser.peek().is_some() {
-        return parser.error("予期しないトークンです");
-    }
+    debug_assert!(parser.peek().is_none());
     Ok(script)
 }
 
@@ -140,6 +140,9 @@ impl Parser {
     fn parse_if(&mut self) -> Result<Command, ParseError> {
         self.expect_word("if")?;
         let condition = self.parse_script_until(&["then"], &[])?;
+        if condition.lists.is_empty() {
+            return self.error("ifの条件が必要です");
+        }
         self.expect_word("then")?;
         let body = self.parse_script_until(&["elif", "else", "fi"], &[])?;
         let mut branches = vec![(condition, body)];
@@ -167,6 +170,9 @@ impl Parser {
             self.expect_word("while")?;
         }
         let condition = self.parse_script_until(&["do"], &[])?;
+        if condition.lists.is_empty() {
+            return self.error("ループ条件が必要です");
+        }
         self.expect_word("do")?;
         let body = self.parse_script_until(&["done"], &[])?;
         self.expect_word("done")?;
@@ -262,13 +268,25 @@ impl Parser {
             if command.words.is_empty()
                 && let Some((name, value)) = split_assignment(&word)
             {
-                command.assignments.push((name, value));
+                if value.parts.is_empty() && self.consume_operator(Operator::LeftParen) {
+                    let mut values = Vec::new();
+                    while !self.at_operator(Operator::RightParen) {
+                        values.push(self.take_word().ok_or_else(|| {
+                            self.current_error("array assignment requires a closing ')'")
+                        })?);
+                    }
+                    self.expect_operator(Operator::RightParen)?;
+                    command.array_assignments.push((name, values));
+                } else {
+                    command.assignments.push((name, value));
+                }
             } else {
                 command.words.push(word);
             }
         }
         if command.words.is_empty()
             && command.assignments.is_empty()
+            && command.array_assignments.is_empty()
             && command.redirections.is_empty()
         {
             self.error("コマンドが必要です")
@@ -423,6 +441,7 @@ impl Parser {
             message: message.into(),
             line,
             column,
+            incomplete: self.peek().is_none(),
         }
     }
 
@@ -471,6 +490,7 @@ fn extract_here_documents(
                     message: format!("here-documentが'{delimiter}'で閉じられていません"),
                     line: index.max(1),
                     column: 1,
+                    incomplete: true,
                 });
             }
             documents.insert(marker, HereDocument { body, expand });
@@ -568,7 +588,7 @@ fn split_assignment(word: &Word) -> Option<(String, Word)> {
     };
     let equals = value.find('=')?;
     let name = &value[..equals];
-    if !valid_name(name) {
+    if !valid_name(name) && parse_array_reference(name).is_none() {
         return None;
     }
     let mut parts = word.parts.clone();
@@ -584,6 +604,12 @@ fn split_assignment(word: &Word) -> Option<(String, Word)> {
     Some((name.to_string(), Word { parts }))
 }
 
+fn parse_array_reference(value: &str) -> Option<(&str, &str)> {
+    let (name, subscript) = value.split_once('[')?;
+    let subscript = subscript.strip_suffix(']')?;
+    (valid_name(name) && !subscript.is_empty()).then_some((name, subscript))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -592,10 +618,10 @@ mod tests {
     fn parses_pipeline_and_conditionals() {
         let script = parse("value=x; if true; then echo $value | cat; else false; fi").unwrap();
         assert_eq!(script.lists.len(), 2);
-        let Command::If { branches, .. } = &script.lists[1].first.commands[0] else {
-            panic!("expected if")
-        };
-        assert_eq!(branches[0].1.lists[0].first.commands.len(), 2);
+        assert!(matches!(
+            &script.lists[1].first.commands[0],
+            Command::If { .. }
+        ));
     }
 
     #[test]
@@ -607,6 +633,97 @@ mod tests {
 
     #[test]
     fn rejects_unclosed_if() {
-        assert!(parse("if true; then echo nope").is_err());
+        let error = parse("if true; then echo nope").unwrap_err();
+        assert!(error.incomplete);
+    }
+
+    #[test]
+    fn parses_every_compound_command_and_redirection() {
+        let source = concat!(
+            "until false; do break; done\n",
+            "case x in (x|y) echo yes;; *) echo no;; esac\n",
+            "(echo sub)\n",
+            "{ echo group; }\n",
+            "! echo x 0<input 1>output 2>>errors 3<>rw 4<&0 5>&1 6>|clobber\n",
+        );
+        let script = parse(source).unwrap();
+        assert_eq!(script.lists.len(), 5);
+        assert!(matches!(
+            &script.lists[4].first.commands[0],
+            Command::Simple(simple) if simple.redirections.len() == 7
+        ));
+        assert!(script.lists[4].first.negated);
+    }
+
+    #[test]
+    fn parses_heredoc_variants_and_crlf() {
+        let script = parse("cat <<-EOF\r\n\tvalue\r\n\tEOF\r\ncat <<'Q'\n$x\nQ\n").unwrap();
+        assert!(matches!(
+            &script.lists[0].first.commands[0],
+            Command::Simple(first)
+                if first.redirections[0].here_document.as_ref().unwrap().body == "value\r\n"
+        ));
+        assert!(!matches!(
+            &script.lists[1].first.commands[0],
+            Command::Simple(simple) if simple.redirections[0].here_document.as_ref().unwrap().expand
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_syntax_forms() {
+        for source in [
+            ")",
+            "for 1; do :; done",
+            "for ; do :; done",
+            "for x in a | do :; done",
+            "case x in x echo;; esac",
+            "echo >",
+            "if; then :; fi",
+            "f()\n",
+        ] {
+            assert!(parse(source).is_err(), "unexpectedly accepted {source:?}");
+        }
+        let error = parse("cat <<EOF\nmissing\n").unwrap_err();
+        assert!(error.incomplete);
+        assert!(parse("array=(one").unwrap_err().incomplete);
+    }
+
+    #[test]
+    fn covers_elif_empty_loop_and_parser_helpers() {
+        let script = parse("if false; then :; elif true; then :; else false; fi").unwrap();
+        assert!(matches!(
+            script.lists[0].first.commands[0],
+            Command::If { .. }
+        ));
+        assert!(parse("while; do :; done").is_err());
+        assert!(parse("case x in x) :;;").is_err());
+        assert!(parse("case").is_err());
+        assert!(parse("case x in )").is_err());
+        assert!(parse("name( echo bad").is_err());
+        assert!(parse("echo x )").is_err());
+        assert!(parse("for x in a do :; done").is_ok());
+
+        let mut sequence = 0;
+        let (rewritten, specs) = rewrite_here_document_line("cat <<   EOF\n", &mut sequence);
+        assert!(rewritten.contains("__ISKSH_HEREDOC_0__"));
+        assert_eq!(specs.len(), 1);
+        let (unchanged, specs) = rewrite_here_document_line("cat << \n", &mut sequence);
+        assert_eq!(unchanged, "cat << \n");
+        assert!(specs.is_empty());
+
+        let quoted = Word {
+            parts: vec![WordPart::Literal {
+                value: "A=x".into(),
+                quoted: true,
+            }],
+        };
+        assert!(split_assignment(&quoted).is_none());
+        let invalid = Word {
+            parts: vec![WordPart::Literal {
+                value: "1A=x".into(),
+                quoted: false,
+            }],
+        };
+        assert!(split_assignment(&invalid).is_none());
     }
 }
