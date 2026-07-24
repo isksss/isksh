@@ -15,7 +15,7 @@
 | Functions | Partial | 基本的な定義・呼び出しに対応 |
 | Built-in utilities | Partial | MVP対象を実装。trap/umask/hash/execの完全なOS動作は未対応 |
 | Job control | Not supported | MVP対象外 |
-| Interactive shell | Partial | PS1/PS2、継続入力、状態保持、exit、EOFに対応。履歴・補完・ジョブ制御は未対応 |
+| Interactive shell | Partial | PS1/PS2、PROMPT_COMMAND、Bash形式の主要プロンプト展開、継続入力、状態保持、exit、EOF、外部コマンドのTTY継承に対応。履歴・補完・ジョブ制御は未対応 |
 | Startup configuration | Partial | `.config/isksh/.iskrc`を読込。isksh対応範囲のbashrc形式を利用可能 |
 | Bash extensions | Partial | indexed/associative arrays、`[[ ]]`、process substitution、主要bashrc built-inを実装。高度な配列属性・拡張glob等は未対応 |
 | Non-UTF-8 shell data | Not supported | 明示的エラー |

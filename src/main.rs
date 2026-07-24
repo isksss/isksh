@@ -37,6 +37,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
     let force_interactive = arguments.as_slice() == ["-i"];
     if force_interactive || arguments.is_empty() && io::stdin().is_terminal() {
         let mut shell = Shell::new("isksh");
+        shell.set_interactive(true);
         let mut reader = BufReader::new(io::stdin());
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();

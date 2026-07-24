@@ -23,6 +23,8 @@ WindowsバイナリはWindows標準システムDLLを利用します。macOSで�
 - `if`、`case`、`for`、`while`、`until`、グループ、サブシェル、関数
 - POSIX系built-inと、対話モードに必要なシェル状態管理
 - `PS1`、`PS2`、複数行入力、`exit`、EOFを扱う対話シェル
+- 対話中の外部コマンドへ端末を直接引き渡すTTY実行
+- Bash形式のプロンプトエスケープ、プロンプト内の変数・コマンド・算術展開、`PROMPT_COMMAND`
 - `.iskrc`による起動設定
 - 添字配列・連想配列、`[[ ... ]]`、プロセス置換などの主要Bash拡張
 - `source`、`declare`、`typeset`、`local`、`shopt`、`type`、`mapfile`、`readarray`
@@ -78,6 +80,28 @@ greet() {
 `.bashrc`で利用される一般的な構文を可能な範囲で受理しますが、Bash固有機能は部分互換です。配列スライス、多次元配列、`declare`の高度な属性、拡張globなどは未対応です。
 
 プロセス置換`<(...)`と`>(...)`は全対象OSで動かすため一時ファイルを使用して直列実行します。BashのFIFOまたは`/dev/fd`を使う非同期実行とはタイミングが異なります。
+
+## Vim・Neovim・Starship
+
+対話モードから起動した単独の外部コマンドは、標準入力・標準出力・標準エラーと端末機能を直接引き継ぎます。そのため、`vim`と`nvim`はWindows/Linuxのどちらでも通常の全画面UIで利用できます。
+
+```sh
+vim README.md
+nvim README.md
+```
+
+パイプライン、リダイレクト、コマンド置換内では、シェルが入出力を接続または捕捉します。
+
+Starshipは`.iskrc`へ次を追加します。この方式はStarshipのプロンプトコマンドを直接使用するため、Windows/Linuxで同じ設定を利用できます。
+
+```sh
+PS1='$(starship prompt --status=$?)'
+PS2='$(starship prompt --continuation)'
+```
+
+`PS1`と`PS2`では、Bash形式の`\u`、`\h`、`\H`、`\w`、`\W`、`\s`、`\v`、`\V`、`\j`、`\n`、`\r`、`\e`、`\$`、`\nnn`、`\[`、`\]`を解釈した後、変数・コマンド・算術展開を行います。`PROMPT_COMMAND`もプライマリプロンプトの直前に実行します。
+
+Starship公式の`eval "$(starship init bash)"`が生成するスクリプトは、BashのDEBUG trap、ジョブ管理、`PIPESTATUS`などに依存するため、現時点では完全対応していません。上記の直接設定を使用してください。コマンド実行時間や右プロンプトなど、Bashフックに依存する一部機能は対象外です。
 
 ## Windows固有の動作
 

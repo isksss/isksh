@@ -118,6 +118,7 @@ pub struct Shell {
     function_depth: usize,
     getopts_offset: usize,
     exit_status: Option<i32>,
+    terminal_io: bool,
 }
 
 impl Default for Shell {
@@ -128,7 +129,7 @@ impl Default for Shell {
 
 impl Shell {
     pub fn new(name: impl Into<String>) -> Self {
-        let variables = std::env::vars()
+        let mut variables: HashMap<_, _> = std::env::vars()
             .map(|(name, value)| {
                 (
                     name,
@@ -140,6 +141,15 @@ impl Shell {
                 )
             })
             .collect();
+        let cwd = std::env::current_dir().unwrap_or(PathBuf::from("."));
+        variables.insert(
+            "PWD".into(),
+            Variable {
+                value: cwd.to_string_lossy().into_owned(),
+                exported: true,
+                readonly: false,
+            },
+        );
         Self {
             variables,
             positional: Vec::new(),
@@ -153,16 +163,22 @@ impl Shell {
             pending_process_substitutions: Vec::new(),
             local_scopes: Vec::new(),
             expanding_aliases: Vec::new(),
-            cwd: std::env::current_dir().unwrap_or(PathBuf::from(".")),
+            cwd,
             loop_depth: 0,
             function_depth: 0,
             getopts_offset: 1,
             exit_status: None,
+            terminal_io: false,
         }
     }
 
     pub fn set_positional(&mut self, values: Vec<String>) {
         self.positional = values;
+    }
+
+    /// Controls whether foreground external commands may use the shell's terminal directly.
+    pub fn set_interactive(&mut self, interactive: bool) {
+        self.terminal_io = interactive;
     }
 
     pub fn check_input(source: &str) -> InputState {
@@ -173,15 +189,34 @@ impl Shell {
         }
     }
 
-    pub fn prompt(&self, continuation: bool) -> String {
+    pub fn prompt(&mut self, continuation: bool) -> String {
         let name = if continuation { "PS2" } else { "PS1" };
-        self.value_of(name).unwrap_or_else(|| {
+        let default = || {
             if continuation {
                 "> ".to_string()
             } else {
                 "$ ".to_string()
             }
-        })
+        };
+        let saved_status = self.last_status;
+        let mut prefix = String::new();
+        if !continuation
+            && let Some(command) = self.value_of("PROMPT_COMMAND")
+            && !command.is_empty()
+        {
+            let result = self.run(&command, &[]);
+            prefix.push_str(&String::from_utf8_lossy(&result.stdout));
+        }
+        self.last_status = saved_status;
+        let value = self.value_of(name).unwrap_or_else(default);
+        let escaped = self.expand_prompt_escapes(&value);
+        prefix.push_str(
+            &self
+                .expand_here_document(&escaped)
+                .unwrap_or_else(|_| escaped.clone()),
+        );
+        self.last_status = saved_status;
+        prefix
     }
 
     pub fn take_exit_status(&mut self) -> Option<i32> {
@@ -231,6 +266,7 @@ impl Shell {
     fn execute_and_or(&mut self, list: &AndOr, input: &[u8]) -> ExecResult {
         let mut result = if list.background {
             let mut child = self.clone();
+            child.terminal_io = false;
             let mut result = child.execute_pipeline(&list.first, input);
             result
                 .stderr
@@ -265,6 +301,7 @@ impl Shell {
                 self.execute_command(command, &pipe_input)
             } else {
                 let mut child = self.clone();
+                child.terminal_io = false;
                 child.execute_command(command, &pipe_input)
             };
             all_stderr.append(&mut result.stderr);
@@ -565,13 +602,16 @@ impl Shell {
             let inserted = self.set_assignment(&key, value, Some(true));
             debug_assert!(inserted.is_ok());
         }
+        let previous_terminal_io = self.terminal_io;
+        self.terminal_io &= command.redirections.is_empty() && command_input.is_empty();
         let mut result = if let Some(function) = self.functions.get(&name).cloned() {
             self.execute_function(&function, words, &command_input)
         } else if is_builtin(&name) {
             self.execute_builtin(&name, &words, &command_input)
         } else {
-            self.execute_external(&name, &words, &command_input)
+            self.execute_external(&name, &words, &command_input, self.terminal_io)
         };
+        self.terminal_io = previous_terminal_io;
         for (name, previous) in saved_variables {
             if let Some(previous) = previous {
                 self.variables.insert(name, previous);
@@ -717,20 +757,38 @@ impl Shell {
         result
     }
 
-    fn execute_external(&self, name: &str, arguments: &[String], input: &[u8]) -> ExecResult {
+    fn execute_external(
+        &self,
+        name: &str,
+        arguments: &[String],
+        input: &[u8],
+        terminal_io: bool,
+    ) -> ExecResult {
         let resolved_name = self.resolve_external_name(name);
         let mut process = platform_command(&resolved_name, arguments);
-        process
-            .current_dir(&self.cwd)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .env_clear();
+        process.current_dir(&self.cwd).env_clear();
         for (name, variable) in &self.variables {
             if variable.exported {
                 process.env(name, &variable.value);
             }
         }
+        if terminal_io {
+            process
+                .stdin(Stdio::inherit())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            return match process.status() {
+                Ok(status) => ExecResult::status(exit_status(&status)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    ExecResult::error(127, format!("isksh: {name}: command not found"))
+                }
+                Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
+            };
+        }
+        process
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -804,7 +862,12 @@ impl Shell {
                     let mut result = if is_builtin(&args[0]) {
                         self.execute_builtin(&args[0], &args[1..], input)
                     } else {
-                        self.execute_external(&args[0], &args[1..], input)
+                        self.execute_external(
+                            &args[0],
+                            &args[1..],
+                            input,
+                            self.terminal_io && input.is_empty(),
+                        )
                     };
                     if result.flow == Flow::None {
                         result.flow = Flow::Exit(result.status);
@@ -846,7 +909,11 @@ impl Shell {
         let path = self.resolve_path(&target);
         match fs::canonicalize(path) {
             Ok(path) if path.is_dir() => {
+                let previous = self.cwd.to_string_lossy().into_owned();
                 self.cwd = path;
+                let current = self.cwd.to_string_lossy().into_owned();
+                let _ = self.set_variable("OLDPWD", previous, Some(true), false);
+                let _ = self.set_variable("PWD", current, Some(true), false);
                 ExecResult::status(0)
             }
             Ok(_) => ExecResult::error(1, format!("isksh: cd: {target}: not a directory")),
@@ -1122,7 +1189,12 @@ impl Shell {
         if is_builtin(name) {
             self.execute_builtin(name, &args[index + 1..], input)
         } else {
-            self.execute_external(name, &args[index + 1..], input)
+            self.execute_external(
+                name,
+                &args[index + 1..],
+                input,
+                self.terminal_io && input.is_empty(),
+            )
         }
     }
 
@@ -1463,6 +1535,7 @@ impl Shell {
                 }
                 WordPart::CommandSubstitution { source, quoted } => {
                     let mut child = self.clone();
+                    child.terminal_io = false;
                     let result = child.run(source, &[]);
                     if result.status != 0 && !result.stderr.is_empty() {
                         // Command substitution preserves stdout even when the command fails.
@@ -1483,7 +1556,9 @@ impl Shell {
                     let path =
                         std::env::temp_dir().join(format!("isksh-{}-{id}.tmp", std::process::id()));
                     if *input {
-                        let result = self.clone().run(source, &[]);
+                        let mut child = self.clone();
+                        child.terminal_io = false;
+                        let result = child.run(source, &[]);
                         fs::write(&path, result.stdout).map_err(io_error_string)?;
                         self.pending_process_substitutions
                             .push(PendingProcessSubstitution {
@@ -1653,6 +1728,90 @@ impl Shell {
         })
     }
 
+    fn expand_prompt_escapes(&self, value: &str) -> String {
+        let username = self
+            .value_of("USER")
+            .or_else(|| self.value_of("USERNAME"))
+            .unwrap_or_default();
+        let hostname = self
+            .value_of("HOSTNAME")
+            .or_else(|| self.value_of("COMPUTERNAME"))
+            .unwrap_or_default();
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        let home = self
+            .value_of("HOME")
+            .or_else(|| self.value_of("USERPROFILE"));
+        let display_cwd = home
+            .filter(|home| {
+                cwd == *home || cwd.starts_with(&format!("{home}{}", std::path::MAIN_SEPARATOR))
+            })
+            .map_or_else(|| cwd.clone(), |home| format!("~{}", &cwd[home.len()..]));
+        let directory = if display_cwd == "~" {
+            "~".to_string()
+        } else {
+            Path::new(&display_cwd)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or(display_cwd.clone())
+        };
+        let shell_name = Path::new(&self.name)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.name.clone());
+        let mut chars = value.chars().peekable();
+        let mut output = String::new();
+        while let Some(ch) = chars.next() {
+            if ch != '\\' {
+                output.push(ch);
+                continue;
+            }
+            let Some(escape) = chars.next() else {
+                output.push('\\');
+                break;
+            };
+            match escape {
+                'a' => output.push('\x07'),
+                'e' => output.push('\x1b'),
+                'h' => output.push_str(hostname.split('.').next().unwrap_or_default()),
+                'H' => output.push_str(&hostname),
+                'j' => output.push('0'),
+                'n' => output.push('\n'),
+                'r' => output.push('\r'),
+                's' => output.push_str(&shell_name),
+                'u' => output.push_str(&username),
+                'v' | 'V' => output.push_str(env!("CARGO_PKG_VERSION")),
+                'w' => output.push_str(&display_cwd),
+                'W' => output.push_str(&directory),
+                '!' | '#' => output.push('1'),
+                '$' => output.push(if username.eq_ignore_ascii_case("root") {
+                    '#'
+                } else {
+                    '$'
+                }),
+                '\\' => output.push('\\'),
+                '[' | ']' => {}
+                first if first.is_ascii_digit() && first < '8' => {
+                    let mut octal = first.to_string();
+                    while octal.len() < 3
+                        && chars
+                            .peek()
+                            .is_some_and(|next| next.is_ascii_digit() && *next < '8')
+                    {
+                        octal.push(chars.next().expect("peeked octal digit"));
+                    }
+                    if let Ok(byte) = u8::from_str_radix(&octal, 8) {
+                        output.push(char::from(byte));
+                    }
+                }
+                other => {
+                    output.push('\\');
+                    output.push(other);
+                }
+            }
+        }
+        output
+    }
+
     fn expand_here_document(&mut self, body: &str) -> Result<String, String> {
         let chars: Vec<char> = body.chars().collect();
         let mut output = String::new();
@@ -1727,7 +1886,9 @@ impl Shell {
                     output.push_str(&self.evaluate_arithmetic(&expression)?.to_string());
                     index += 2;
                 } else {
-                    let result = self.clone().run(&expression, &[]);
+                    let mut child = self.clone();
+                    child.terminal_io = false;
+                    let result = child.run(&expression, &[]);
                     let text = String::from_utf8(result.stdout).map_err(|_| {
                         "command substitution produced non-UTF-8 output".to_string()
                     })?;
@@ -2732,13 +2893,13 @@ mod tests {
         assert_eq!(shell.builtin_getopts(&["a".into(), "OPT".into()]).status, 1);
         assert_eq!(
             shell
-                .execute_external("missing-isksh-command", &[], &[])
+                .execute_external("missing-isksh-command", &[], &[], false)
                 .status,
             127
         );
         assert_eq!(
             shell
-                .execute_external("sh", &["-c".into(), "exit 3".into()], &[])
+                .execute_external("sh", &["-c".into(), "exit 3".into()], &[], false)
                 .status,
             3
         );
@@ -3166,7 +3327,7 @@ mod tests {
         assert!(shell.set_variable("1BAD", "x".into(), None, false).is_err());
         shell.set_variable("RO", "x".into(), None, true).unwrap();
         assert!(shell.set_variable("RO", "y".into(), None, false).is_err());
-        assert_eq!(shell.execute_external("/", &[], &[]).status, 126);
+        assert_eq!(shell.execute_external("/", &[], &[], false).status, 126);
         assert_eq!(
             finish_external(
                 "broken",
@@ -3396,5 +3557,105 @@ mod tests {
         }
         assert_eq!(shell.run("[[ value ]]", &[]).status, 0);
         assert_ne!(shell.run("indexed[bad]=x", &[]).status, 0);
+    }
+
+    #[test]
+    fn expands_bash_style_prompts_and_runs_prompt_command() {
+        let directory = tempfile::tempdir().unwrap();
+        let child = directory.path().join("project");
+        fs::create_dir(&child).unwrap();
+        let mut shell = Shell::new("path/to/isksh");
+        shell.cwd = child;
+        shell
+            .set_variable(
+                "HOME",
+                directory.path().to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        shell
+            .set_variable("USER", "tester".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("HOSTNAME", "host.example".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("PROMPT_COMMAND", "printf pre".into(), None, false)
+            .unwrap();
+        shell.last_status = 7;
+        shell
+            .set_variable(
+                "PS1",
+                "\\u@\\h/\\H:\\w:\\W:\\s:\\v:\\V:\\j:\\!:\\#:\\$:\\[\\e\\]\\101:\\q:\\\\:$(printf dyn):$? ".into(),
+                None,
+                false,
+            )
+            .unwrap();
+        let prompt = shell.prompt(false);
+        assert!(prompt.starts_with("pretester@host/host.example:~/project:project:isksh:"));
+        assert!(prompt.contains(":0:1:1:$:\u{1b}A:\\q:\\:dyn:7 "));
+        assert_eq!(shell.last_status, 7);
+
+        shell
+            .set_variable("USER", "root".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("PS1", "\\$".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.prompt(false), "pre#");
+        shell.set_variable("PS1", "$(".into(), None, false).unwrap();
+        assert_eq!(shell.prompt(false), "pre$(");
+        shell.cwd = directory.path().to_path_buf();
+        shell
+            .set_variable("PS1", "\\W\\a\\n\\r\\".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.prompt(false), "pre~\u{7}\n\r\\");
+        shell.variables.remove("USER");
+        shell.variables.remove("HOSTNAME");
+        shell.variables.remove("HOME");
+        shell
+            .set_variable("USERNAME", "fallback-user".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("COMPUTERNAME", "fallback-host".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable(
+                "USERPROFILE",
+                directory.path().to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        shell.name = "/".into();
+        shell
+            .set_variable("PS1", "\\u@\\H:\\s".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.prompt(false), "prefallback-user@fallback-host:/");
+        shell
+            .set_variable("PS2", "next> ".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.prompt(true), "next> ");
+    }
+
+    #[test]
+    fn interactive_external_commands_inherit_the_terminal() {
+        let mut shell = Shell::default();
+        shell.set_interactive(true);
+        assert_eq!(
+            shell
+                .execute_external("sh", &["-c".into(), "exit 7".into()], &[], true)
+                .status,
+            7
+        );
+        assert_eq!(
+            shell
+                .execute_external("missing-isksh-command", &[], &[], true)
+                .status,
+            127
+        );
+        assert_eq!(shell.execute_external("/", &[], &[], true).status, 126);
+        shell.set_interactive(false);
     }
 }
