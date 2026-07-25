@@ -121,6 +121,7 @@ pub struct Shell {
     last_status: i32,
     functions: HashMap<String, Command>,
     aliases: HashMap<String, String>,
+    abbreviations: HashMap<String, String>,
     indexed_arrays: HashMap<String, BTreeMap<usize, String>>,
     associative_arrays: HashMap<String, BTreeMap<String, String>>,
     shell_options: HashSet<String>,
@@ -180,6 +181,7 @@ impl Shell {
             last_status: 0,
             functions: HashMap::new(),
             aliases: HashMap::new(),
+            abbreviations: HashMap::new(),
             indexed_arrays: HashMap::new(),
             associative_arrays: HashMap::new(),
             shell_options: HashSet::new(),
@@ -215,9 +217,82 @@ impl Shell {
     pub fn configured_command_names(&self) -> Vec<String> {
         self.aliases
             .keys()
+            .chain(self.abbreviations.keys())
             .chain(self.functions.keys())
             .cloned()
             .collect()
+    }
+
+    pub fn configured_abbreviations(&self) -> HashMap<String, String> {
+        self.abbreviations.clone()
+    }
+
+    /// Expands command-position abbreviations in interactive input.
+    pub fn expand_abbreviations(&self, source: &str) -> String {
+        let mut output = String::with_capacity(source.len());
+        let mut rest = source;
+        let mut command_position = true;
+        while !rest.is_empty() {
+            let whitespace = rest
+                .find(|character: char| !character.is_whitespace())
+                .unwrap_or(rest.len());
+            output.push_str(&rest[..whitespace]);
+            if rest[..whitespace].contains('\n') {
+                command_position = true;
+            }
+            rest = &rest[whitespace..];
+            if rest.is_empty() {
+                break;
+            }
+            if rest.starts_with([';', '|', '&', '(', ')']) {
+                let length = rest.chars().next().unwrap().len_utf8();
+                output.push_str(&rest[..length]);
+                rest = &rest[length..];
+                command_position = true;
+                continue;
+            }
+            let mut quoted = false;
+            let mut quote = None;
+            let mut escaped = false;
+            let mut length = rest.len();
+            for (index, character) in rest.char_indices() {
+                if escaped {
+                    escaped = false;
+                } else if let Some(delimiter) = quote {
+                    if character == delimiter {
+                        quote = None;
+                    } else if delimiter == '"' && character == '\\' {
+                        escaped = true;
+                    }
+                } else if matches!(character, '\'' | '"') {
+                    quoted = true;
+                    quote = Some(character);
+                } else if character == '\\' {
+                    quoted = true;
+                    escaped = true;
+                } else if character.is_whitespace() || ";|&()".contains(character) {
+                    length = index;
+                    break;
+                }
+            }
+            let word = &rest[..length];
+            if command_position
+                && !quoted
+                && let Some(expansion) = self.abbreviations.get(word)
+            {
+                output.push_str(expansion);
+            } else {
+                output.push_str(word);
+            }
+            if !word
+                .split_once('=')
+                .is_some_and(|(name, _)| valid_variable_name(name))
+            {
+                command_position = false;
+            }
+            rest = &rest[length..];
+        }
+        output
     }
 
     /// Controls whether foreground external commands may use the shell's terminal directly.
@@ -1206,6 +1281,7 @@ impl Shell {
                 }
             }
             "alias" => self.builtin_alias(args),
+            "abbr" => self.builtin_abbr(args),
             "unalias" => self.builtin_unalias(args),
             "getopts" => self.builtin_getopts(args),
             "jobs" => self.builtin_jobs(),
@@ -2352,6 +2428,99 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    fn builtin_abbr(&mut self, args: &[String]) -> ExecResult {
+        let mut operation = None;
+        let mut operands = Vec::new();
+        let mut options = true;
+        for argument in args {
+            match argument.as_str() {
+                "-a" | "--add" if options => operation = Some("add"),
+                "-e" | "--erase" if options => operation = Some("erase"),
+                "-q" | "--query" if options => operation = Some("query"),
+                "-l" | "--list" if options => operation = Some("list"),
+                "-s" | "--show" if options => operation = Some("show"),
+                "-r" | "--rename" if options => operation = Some("rename"),
+                "-g" | "--global" | "-U" | "--universal" if options => {}
+                "-h" | "--help" if options => operation = Some("help"),
+                "--" if options => options = false,
+                value if options && value.starts_with('-') => {
+                    return ExecResult::error(2, format!("isksh: abbr: unknown option: {value}"));
+                }
+                value => operands.push(value),
+            }
+        }
+        let operation = operation.unwrap_or(if operands.len() >= 2 { "add" } else { "show" });
+        match operation {
+            "add" => {
+                let Some((name, expansion)) = operands.split_first() else {
+                    return ExecResult::error(2, "isksh: abbr: --add requires a name");
+                };
+                if expansion.is_empty()
+                    || name.is_empty()
+                    || name.chars().any(|character| character.is_whitespace())
+                {
+                    return ExecResult::error(2, "isksh: abbr: invalid abbreviation");
+                }
+                self.abbreviations
+                    .insert((*name).to_string(), expansion.join(" "));
+                ExecResult::status(0)
+            }
+            "erase" => {
+                for name in operands {
+                    self.abbreviations.remove(name);
+                }
+                ExecResult::status(0)
+            }
+            "query" => ExecResult::status(i32::from(
+                operands.is_empty()
+                    || !operands
+                        .iter()
+                        .any(|name| self.abbreviations.contains_key(*name)),
+            )),
+            "list" => {
+                let mut names = self.abbreviations.keys().cloned().collect::<Vec<_>>();
+                names.sort();
+                ExecResult {
+                    stdout: names
+                        .into_iter()
+                        .map(|name| format!("{name}\n"))
+                        .collect::<String>()
+                        .into_bytes(),
+                    ..ExecResult::status(0)
+                }
+            }
+            "rename" => {
+                if operands.len() != 2 || !self.abbreviations.contains_key(operands[0]) {
+                    return ExecResult::error(2, "isksh: abbr: invalid rename");
+                }
+                let expansion = self.abbreviations.remove(operands[0]).unwrap();
+                self.abbreviations
+                    .insert(operands[1].to_string(), expansion);
+                ExecResult::status(0)
+            }
+            "help" => ExecResult {
+                stdout: b"usage: abbr [-a|-e|-r|-q|-l|-s] [NAME [EXPANSION]]\n".to_vec(),
+                ..ExecResult::status(0)
+            },
+            _ => {
+                let mut abbreviations = self.abbreviations.iter().collect::<Vec<_>>();
+                abbreviations.sort_by_key(|(name, _)| *name);
+                let stdout = abbreviations
+                    .into_iter()
+                    .filter(|(name, _)| operands.is_empty() || operands.contains(&name.as_str()))
+                    .map(|(name, value)| {
+                        format!("abbr -a {name} '{}'\n", value.replace('\'', "'\\''"))
+                    })
+                    .collect::<String>()
+                    .into_bytes();
+                ExecResult {
+                    stdout,
+                    ..ExecResult::status(0)
+                }
+            }
+        }
+    }
+
     fn expand_word(&mut self, word: &Word) -> Result<Vec<String>, String> {
         self.expand_word_context(word, true, true)
     }
@@ -3232,6 +3401,7 @@ const BUILTIN_NAMES: &[&str] = &[
     ":",
     "[",
     "[[",
+    "abbr",
     "alias",
     "break",
     "builtin",
@@ -5283,5 +5453,42 @@ mod tests {
         assert_eq!(pipeline_wait_status(Err(error)), 126);
         let error = std::io::Error::other("wait failed");
         assert_eq!(finish_external_status("command", Err(error)).status, 126);
+    }
+
+    #[test]
+    fn manages_and_expands_interactive_abbreviations() {
+        let mut shell = Shell::default();
+        assert_ne!(shell.run("abbr -a", &[]).status, 0);
+        assert_ne!(shell.run("abbr -a bad", &[]).status, 0);
+        assert_ne!(shell.run("abbr --unknown", &[]).status, 0);
+        assert_eq!(shell.run("abbr -a g printf git", &[]).status, 0);
+        assert_eq!(shell.run("abbr --add z 'printf zed'", &[]).status, 0);
+        assert_eq!(shell.run("abbr -g c printf core", &[]).status, 0);
+        assert_eq!(shell.run("abbr -- --dash printf dash", &[]).status, 0);
+        assert!(shell.configured_command_names().contains(&"g".to_string()));
+        assert!(!shell.configured_abbreviations().is_empty());
+        assert_eq!(shell.run("abbr -q g missing", &[]).status, 0);
+        assert_ne!(shell.run("abbr --query missing", &[]).status, 0);
+        assert_ne!(shell.run("abbr -q", &[]).status, 0);
+        assert_eq!(shell.run("abbr -r z zz", &[]).status, 0);
+        assert_ne!(shell.run("abbr --rename missing nope", &[]).status, 0);
+        assert_eq!(shell.run("abbr -l", &[]).stdout, b"--dash\nc\ng\nzz\n");
+        assert_eq!(
+            shell.run("abbr -s g", &[]).stdout,
+            b"abbr -a g 'printf git'\n"
+        );
+        assert_eq!(
+            shell.expand_abbreviations(
+                "g ok; zz\nX=1 g assigned\nprintf g\n'g'\necho \" ; g \"\necho \"escaped \\\" g\"\n\\g\n",
+            ),
+            "printf git ok; printf zed\nX=1 printf git assigned\nprintf g\n'g'\necho \" ; g \"\necho \"escaped \\\" g\"\n\\g\n"
+        );
+        assert_eq!(shell.run("abbr -e g", &[]).status, 0);
+        assert_eq!(shell.expand_abbreviations("g"), "g");
+        assert_eq!(shell.run("abbr --erase z", &[]).status, 0);
+        assert!(!shell.run("abbr --show", &[]).stdout.is_empty());
+        assert!(!shell.run("abbr --help", &[]).stdout.is_empty());
+        assert_eq!(shell.run("abbr -e -- --dash c zz", &[]).status, 0);
+        assert!(shell.run("abbr --list", &[]).stdout.is_empty());
     }
 }

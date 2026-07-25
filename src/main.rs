@@ -1,15 +1,21 @@
 use isksh::{Shell, bash_startup_file, load_startup_file, run_interactive, startup_file};
+use rustyline::Movement;
+use rustyline::Word;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::DefaultHistory;
 use rustyline::validate::Validator;
+use rustyline::{
+    Cmd, ConditionalEventHandler, Event, EventContext, EventHandler, KeyEvent, RepeatCount,
+};
 use rustyline::{Context, Editor, Helper};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 
 fn main() {
     let status = match run_cli() {
@@ -34,7 +40,8 @@ fn run_cli() -> Result<i32, (i32, String)> {
 
     if arguments.first().map(String::as_str) == Some("--help") {
         println!(
-            "isksh 0.1.0\n\nUsage:\n  isksh SCRIPT [ARG...]\n  isksh -c COMMAND [NAME [ARG...]]\n  isksh -s [ARG...]\n  isksh -i\n"
+            "isksh {}\n\nUsage:\n  isksh SCRIPT [ARG...]\n  isksh -c COMMAND [NAME [ARG...]]\n  isksh -s [ARG...]\n  isksh -i\n",
+            env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
     }
@@ -126,6 +133,53 @@ struct ShellHelper {
     commands: Vec<String>,
 }
 
+struct AbbreviationHandler(Arc<RwLock<HashMap<String, String>>>);
+
+impl ConditionalEventHandler for AbbreviationHandler {
+    fn handle(&self, _: &Event, _: RepeatCount, _: bool, context: &EventContext) -> Option<Cmd> {
+        let before_cursor = &context.line()[..context.pos()];
+        if in_shell_quote(before_cursor) {
+            return None;
+        }
+        let start = before_cursor
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace() || ";|&()".contains(*character))
+            .map_or(0, |(index, character)| index + character.len_utf8());
+        let word = &before_cursor[start..];
+        let prefix = before_cursor[..start].trim_end();
+        if !prefix.is_empty() && !prefix.ends_with([';', '|', '&', '(', ')']) {
+            return None;
+        }
+        let expansion = self.0.read().ok()?.get(word)?.clone();
+        Some(Cmd::Replace(
+            Movement::BackwardWord(1, Word::Big),
+            Some(format!("{expansion} ")),
+        ))
+    }
+}
+
+fn in_shell_quote(source: &str) -> bool {
+    let mut quote = None;
+    let mut escaped = false;
+    for character in source.chars() {
+        if escaped {
+            escaped = false;
+        } else if let Some(delimiter) = quote {
+            if character == delimiter {
+                quote = None;
+            } else if delimiter == '"' && character == '\\' {
+                escaped = true;
+            }
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+        } else if character == '\\' {
+            escaped = true;
+        }
+    }
+    quote.is_some()
+}
+
 impl Helper for ShellHelper {}
 impl Validator for ShellHelper {}
 impl Highlighter for ShellHelper {}
@@ -166,6 +220,11 @@ impl Completer for ShellHelper {
 
 fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     let mut editor = Editor::<ShellHelper, DefaultHistory>::new().map_err(io::Error::other)?;
+    let abbreviations = Arc::new(RwLock::new(shell.configured_abbreviations()));
+    editor.bind_sequence(
+        KeyEvent::from(' '),
+        EventHandler::Conditional(Box::new(AbbreviationHandler(abbreviations.clone()))),
+    );
     editor.set_helper(Some(ShellHelper {
         files: FilenameCompleter::new(),
         commands: command_candidates(shell),
@@ -182,6 +241,9 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
         if let Some(helper) = editor.helper_mut() {
             helper.commands = command_candidates(shell);
         }
+        if let Ok(mut configured) = abbreviations.write() {
+            *configured = shell.configured_abbreviations();
+        }
         match editor.readline(&prompt) {
             Ok(line) => {
                 source.push_str(&line);
@@ -189,6 +251,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
                 if matches!(Shell::check_input(&source), isksh::InputState::Incomplete) {
                     continue;
                 }
+                source = shell.expand_abbreviations(&source);
                 if !source.trim().is_empty() {
                     let _ = editor.add_history_entry(source.trim_end());
                 }
@@ -217,9 +280,9 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
 fn command_candidates(shell: &Shell) -> Vec<String> {
     let mut commands = BTreeSet::from(
         [
-            "alias", "builtin", "cd", "command", "dirs", "echo", "eval", "exec", "exit", "export",
-            "false", "help", "jobs", "let", "popd", "printf", "pushd", "pwd", "read", "set",
-            "source", "test", "trap", "true", "type", "unalias", "unset", "wait",
+            "abbr", "alias", "builtin", "cd", "command", "dirs", "echo", "eval", "exec", "exit",
+            "export", "false", "help", "jobs", "let", "popd", "printf", "pushd", "pwd", "read",
+            "set", "source", "test", "trap", "true", "type", "unalias", "unset", "wait",
         ]
         .map(str::to_string),
     );
@@ -284,4 +347,17 @@ fn read_stdin_utf8() -> Result<String, (i32, String)> {
             ),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::in_shell_quote;
+
+    #[test]
+    fn identifies_open_shell_quotes() {
+        assert!(in_shell_quote("echo 'open"));
+        assert!(in_shell_quote("echo \"open\\\" still open"));
+        assert!(!in_shell_quote("echo 'closed'"));
+        assert!(!in_shell_quote("echo escaped\\ space"));
+    }
 }

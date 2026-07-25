@@ -43,6 +43,7 @@ isksh -i
 - POSIX形式のパラメータ・コマンド・算術・フィールド分割・パス名展開
 - 対話編集、履歴、補完、プロンプト展開、`Ctrl+R`検索
 - 配列、`[[ ... ]]`、プロセス置換、alias、主要built-inなどのBash機能
+- 対話コマンドを短縮するfish形式の`abbr -a NAME EXPANSION`
 - Starship、mise、zoxide、Atuin、fzfのBash形式初期化
 - Vim、Neovimなどの全画面アプリへの端末引き渡し
 - UTF-8スクリプトとLF・CRLF改行

@@ -33,6 +33,7 @@ pub fn run_interactive(
         match Shell::check_input(&source) {
             InputState::Incomplete => continue,
             InputState::Complete | InputState::Invalid(_) => {
+                source = shell.expand_abbreviations(&source);
                 let result = shell.run(&source, &[]);
                 stdout.write_all(&result.stdout)?;
                 stderr.write_all(&result.stderr)?;
@@ -107,5 +108,20 @@ mod tests {
             2
         );
         assert!(!stderr.is_empty());
+    }
+
+    #[test]
+    fn expands_abbreviations_before_interactive_execution() {
+        let mut shell = Shell::default();
+        assert_eq!(shell.run("abbr -a p printf", &[]).status, 0);
+        let mut input = Cursor::new(b"p expanded\n");
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        assert_eq!(
+            run_interactive(&mut shell, &mut input, &mut stdout, &mut stderr, false).unwrap(),
+            0
+        );
+        assert_eq!(stdout, b"expanded");
+        assert!(stderr.is_empty());
     }
 }

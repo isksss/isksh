@@ -131,7 +131,7 @@ fn interactive_mode_loads_iskrc() {
     let rc = directory.path().join(".iskrc");
     std::fs::write(
         &rc,
-        "export FROM_ISKRC=loaded\nalias configured='printf alias-loaded'\nPS1='isk> '\n",
+        "export FROM_ISKRC=loaded\nalias configured='printf alias-loaded'\nabbr -a short 'printf abbr-loaded'\nPS1='isk> '\n",
     )
     .unwrap();
     let mut child = isksh()
@@ -146,13 +146,14 @@ fn interactive_mode_loads_iskrc() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"printf '%s:' \"$FROM_ISKRC\"; configured\nexit\n")
+        .write_all(b"printf '%s:' \"$FROM_ISKRC\"; configured; short\nexit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.starts_with("isk> "));
     assert!(stdout.contains("loaded:alias-loaded"));
+    assert!(stdout.contains("abbr-loaded"));
 }
 
 #[test]

@@ -43,6 +43,7 @@ Running `isksh` without arguments starts interactive mode when standard input is
 - POSIX parameter, command, arithmetic, field-splitting, and pathname expansion
 - Interactive editing, history, completion, prompt expansion, and `Ctrl+R` search
 - Common Bash features including arrays, `[[ ... ]]`, process substitution, aliases, and frequently used built-ins
+- Interactive command abbreviations with fish-style `abbr -a NAME EXPANSION`
 - Bash-style initialization for Starship, mise, zoxide, Atuin, and fzf
 - Native terminal handoff for Vim, Neovim, and other full-screen applications
 - UTF-8 scripts with LF or CRLF line endings
