@@ -1,52 +1,25 @@
 # isksh
 
 [![CI](https://github.com/isksss/isksh/actions/workflows/ci.yml/badge.svg)](https://github.com/isksss/isksh/actions/workflows/ci.yml)
+[![crates.io](https://img.shields.io/crates/v/isksh.svg)](https://crates.io/crates/isksh)
 
-## インストール
+[日本語](README.ja.md)
 
-Rust/Cargoが利用できる環境ではcrates.ioからインストールできます。
+`isksh` is a cross-platform shell written in Rust. It targets the POSIX.1-2024 Shell Command Language and supports practical Bash syntax used by common dotfiles and command-line tools.
+
+The project is under active development and is not yet fully POSIX- or Bash-compatible. See [POSIX-COMPATIBILITY.md](POSIX-COMPATIBILITY.md) for known differences.
+
+## Install
+
+With Rust and Cargo:
 
 ```console
 cargo install isksh --locked
 ```
 
-追加ランタイムを必要としない静的バイナリは[GitHub Releases](https://github.com/isksss/isksh/releases)から取得できます。ソースからのクロスプラットフォームビルドと検証には、リポジトリのDocker開発環境を使用してください。
+Standalone release binaries are available from [GitHub Releases](https://github.com/isksss/isksh/releases).
 
-`isksh`はRust製のクロスプラットフォームシェルです。Windows、macOS、Linuxで動作する単体バイナリを提供し、POSIX.1-2024 Shell Command Languageとの互換性を目標にしています。
-
-現在はMVP開発段階です。POSIXおよびBashとの完全互換を保証するものではありません。詳細は[POSIX対応表](POSIX-COMPATIBILITY.md)を参照してください。
-
-## 対象プラットフォーム
-
-| OS | アーキテクチャ | 検証範囲 | 配布形式 |
-|---|---|---|---|
-| Linux | x86_64 / aarch64 | ビルド・実行・テスト | musl完全静的ELF |
-| Windows 11 | x86_64 | ビルド・実機実行 | 静的GNU CRTを使用するEXE |
-| macOS | x86_64 / aarch64 | `cargo check` | 将来のmacOS CIでリンク確認予定 |
-
-WindowsバイナリはWindows標準システムDLLを利用します。macOSではOS標準ライブラリまで含めた完全静的リンクは行いません。
-
-## 主な機能
-
-- 単純コマンド、変数代入、終了ステータス、位置・特殊パラメータ
-- 単一引用、二重引用、エスケープ
-- パラメータ展開、コマンド置換、算術展開、フィールド分割、パス名展開
-- リダイレクト、here-document、パイプライン、リスト、`&&`、`||`
-- 外部コマンド間の並列OSパイプ、`PIPESTATUS`、`set -o pipefail`
-- 非同期バックグラウンドジョブ、`$!`、`jobs`、`wait`
-- `if`、`case`、`for`、`while`、`until`、グループ、サブシェル、関数
-- POSIX系built-inと、対話モードに必要なシェル状態管理
-- `PS1`、`PS2`、複数行入力、履歴、補完、履歴検索、`exit`、EOFを扱う対話シェル
-- 対話中の外部コマンドへ端末を直接引き渡すTTY実行
-- Bash形式のプロンプトエスケープ、プロンプト内の変数・コマンド・算術展開、`PROMPT_COMMAND`
-- `.iskrc`による起動設定
-- 添字配列・連想配列、`[[ ... ]]`、プロセス置換などの主要Bash拡張
-- `source`、`declare`、`typeset`、`local`、`shopt`、`type`、`mapfile`、`readarray`
-- `builtin`、`help`、`let`、`pushd`、`popd`、`dirs`、`cd -`、`read -r/-a`、`printf -v`
-
-完全なジョブ制御とUnixシグナル処理は未対応です。`grep`、`sed`、`awk`などの外部ユーティリティは内包せず、実行環境の`PATH`から呼び出します。
-
-## 使用方法
+## Usage
 
 ```console
 isksh SCRIPT [ARG...]
@@ -55,176 +28,50 @@ isksh -s [ARG...]
 isksh -i
 ```
 
-例：
+Running `isksh` without arguments starts interactive mode when standard input is a terminal; otherwise it reads a script from standard input.
 
-```sh
-isksh -c 'name=world; printf "hello %s\n" "$name"'
-isksh script.sh first second
-printf 'echo hello\n' | isksh -s
-isksh -i
-```
+## Highlights
 
-引数なしで標準入力が端末の場合、または`-i`を指定した場合は対話モードになります。スクリプトと変数はUTF-8として扱い、非UTF-8入力はエラーになります。LFとCRLFの両方を受理します。
+- Commands, pipelines, redirections, here-documents, functions, loops, conditionals, and background jobs
+- POSIX parameter, command, arithmetic, field-splitting, and pathname expansion
+- Interactive editing, history, completion, prompt expansion, and `Ctrl+R` search
+- Common Bash features including arrays, `[[ ... ]]`, process substitution, aliases, and frequently used built-ins
+- Bash-style initialization for Starship, mise, zoxide, Atuin, and fzf
+- Native terminal handoff for Vim, Neovim, and other full-screen applications
+- UTF-8 scripts with LF or CRLF line endings
 
-## 起動設定
+Interactive startup reads the first available file below:
 
-対話モードでは次の優先順で設定ファイルを選びます。
-
-1. `ISKSH_RC`で指定したパス
+1. `ISKSH_RC`
 2. `$XDG_CONFIG_HOME/isksh/.iskrc`
 3. `$HOME/.config/isksh/.iskrc`
-4. Windowsでは`$USERPROFILE/.config/isksh/.iskrc`
+4. `$HOME/.bashrc` as a compatibility fallback
 
-上記の`.iskrc`が存在しない場合は、dotfilesとの互換性のため`$HOME/.bashrc`を読み込みます。`ISKSH_RC`を設定した場合は`.bashrc`へフォールバックせず、空文字列にすると読み込みを無効化できます。
+## Platforms
 
-```sh
-export EDITOR=vim
-PS1='isksh> '
-alias ll='ls -la'
-
-paths=(src tests scripts)
-
-greet() {
-    local name=${1:-world}
-    if [[ $name != '' ]]; then
-        printf 'hello %s\n' "$name"
-    fi
-}
-```
-
-`.bashrc`で利用される一般的な構文を可能な範囲で受理しますが、Bash固有機能は部分互換です。配列スライス、多次元配列、`declare`の高度な属性、拡張globなどは未対応です。
-
-プロセス置換`<(...)`と`>(...)`は全対象OSで動かすため一時ファイルを使用して直列実行します。BashのFIFOまたは`/dev/fd`を使う非同期実行とはタイミングが異なります。
-
-## Vim・Neovim・Starship
-
-対話モードから起動した単独の外部コマンドは、標準入力・標準出力・標準エラーと端末機能を直接引き継ぎます。そのため、`vim`と`nvim`はWindows/Linuxのどちらでも通常の全画面UIで利用できます。
-
-```sh
-vim README.md
-nvim README.md
-```
-
-パイプライン、リダイレクト、コマンド置換内では、シェルが入出力を接続または捕捉します。
-
-Starshipは`.iskrc`へ次を追加します。この方式はStarshipのプロンプトコマンドを直接使用するため、Windows/Linuxで同じ設定を利用できます。
-
-```sh
-PS1='$(starship prompt --status=$?)'
-PS2='$(starship prompt --continuation)'
-```
-
-`PS1`と`PS2`では、Bash形式の`\u`、`\h`、`\H`、`\w`、`\W`、`\s`、`\v`、`\V`、`\j`、`\n`、`\r`、`\e`、`\$`、`\nnn`、`\[`、`\]`を解釈した後、変数・コマンド・算術展開を行います。`PROMPT_COMMAND`もプライマリプロンプトの直前に実行します。
-
-Starship公式のBash初期化形式も利用できます。
-
-```sh
-eval "$(starship init bash)"
-```
-
-生成されたBashスクリプトを検出した場合、isksh向けの`PS1`・`PS2`設定へ変換します。コマンド実行時間、右プロンプト、DEBUG trapを利用するpreexec処理など、Bash固有フックに依存する一部機能は対象外です。
-
-## dotfilesツール互換性
-
-[isksss/dotfiles](https://github.com/isksss/dotfiles)の`mise.toml`に掲載されたCLI/TUIは、通常の外部コマンドとしてPATH検索、引数・環境変数・終了コード伝播、パイプ、リダイレクト、対話端末の継承を利用できます。`.exe`、`.com`、`.cmd`、`.bat`を含むWindowsの探索規則にも対応します。
-
-Bash向け初期化は次の形式をiskshの対話機能へ変換します。
-
-| ツール | 初期化 | iskshでの動作 |
+| Platform | Architectures | Support |
 |---|---|---|
-| mise | `eval "$(mise activate bash)"` | `MISE_SHELL`とプロンプト時の`hook-env`更新 |
-| Starship | `eval "$(starship init bash)"` | `PS1`・`PS2`プロンプト |
-| zoxide | `eval "$(zoxide init bash)"` | `z`・`zi`とディレクトリ登録 |
-| Atuin | `eval "$(atuin init bash)"` | 初期化を受理し、iskshの永続履歴と`Ctrl+R`を使用 |
-| fzf | `source <(fzf --bash)` | 初期化を受理し、iskshのTab補完と`Ctrl+R`を使用 |
+| Linux | x86_64, aarch64 | Tested; fully static musl binaries |
+| Windows 11 | x86_64 | Tested; static GNU CRT, Windows system DLLs only |
+| macOS | x86_64, aarch64 | Cross-target compile checks only |
 
-Atuin/fzfのBash Readline専用widgetはRust製ラインエディタへ直接登録せず、同等操作のisksh標準機能へ置き換えます。各ツール本体、Neovim、lazygit、lazydocker、yazi、zellijなどの全画面UIは端末を直接継承します。
+## Development
 
-## 対話履歴と補完
-
-対話端末ではカーソル移動、編集、Tabによるコマンド・パス補完、上下キーによる履歴、`Ctrl+R`による逆方向履歴検索を利用できます。履歴は次の優先順で保存します。
-
-1. `ISKSH_HISTORY`
-2. `$XDG_STATE_HOME/isksh/history`
-3. `$HOME/.local/state/isksh/history`
-4. Windowsでは`$LOCALAPPDATA/isksh/history`
-
-Unixではフォアグラウンドの外部コマンド・パイプラインへ端末のプロセスグループを移し、`Ctrl+C`後もシェルを継続します。Windowsではコンソール制御ハンドラーにより、フォアグラウンド子プロセス実行中の`Ctrl+C`でシェル自身が終了しないようにします。
-
-## ジョブ、パイプ、ディスクリプタ
-
-- 外部コマンドだけで構成されたパイプラインはOSパイプで並列実行します。
-- built-inや関数を含むパイプラインは、現時点では内部バッファを経由します。
-- `&`は非同期実行し、`$!`にはiskshのジョブIDを設定します。これはOSのPIDとは限りません。
-- `jobs`で状態を表示し、`wait`または`wait %ID`で完了を待機できます。
-- `exec 3>file`、`exec 4<file`、`>&3`、`<&4`などの永続ディスクリプタを利用できます。
-- `trap`は`EXIT`、`INT`、`TERM`、`DEBUG`の登録・表示・解除に対応します。OSシグナルから任意のtrapを非同期実行する機能は段階実装です。
-
-## Windows固有の動作
-
-- `PATH`と`PATHEXT`を使用してコマンドを探索します。
-- `.exe`と`.com`は直接起動します。
-- `.cmd`と`.bat`は`cmd.exe`経由で起動します。
-- PowerShellスクリプトは自動実行しません。
-- パス区切りには`/`を推奨します。`\`を含むパスは引用してください。
-
-## 開発環境
-
-ホストに必要なのはDockerです。Rust、mise、Clippy、rustfmt、クロスコンパイル用ツールはDebian 13ベースの開発コンテナへ導入されます。
+Development is containerized; Rust does not need to be installed on the host.
 
 ```console
 docker compose build dev
-docker compose run --rm dev mise run build
-docker compose run --rm dev mise run test
-docker compose run --rm dev mise run coverage
 docker compose run --rm dev mise run check-all
 ```
 
-Dev Containerからも同じイメージを利用できます。
-
-利用可能なmiseタスク：
-
-| タスク | 内容 |
-|---|---|
-| `build` | 開発ビルド |
-| `build-release` | Linux・Windows向けリリース成果物の生成 |
-| `test` | Rustテストとdash差分テスト |
-| `coverage` | 本体ライブラリの行カバレッジ100%を検証 |
-| `lint` | Clippyを警告ゼロで実行 |
-| `fmt-check` | rustfmt差分を検査 |
-| `check-targets` | 全対象ターゲットをコンパイル検査 |
-| `verify-static` | Linux・Windows成果物の動的依存を検査 |
-| `check-all` | 上記の品質検査を一括実行 |
-
-## リリース成果物
-
-```console
-docker compose run --rm dev mise run build-release
-```
-
-`dist/`へ次のファイルを生成します。
-
-- `isksh-linux-x86_64`
-- `isksh-linux-aarch64`
-- `isksh-windows-x86_64.exe`
-- 各バイナリの`.sha256`チェックサム
-
-Windowsホストでの実行確認：
+`check-all` runs formatting, Clippy, tests, 100% line-coverage enforcement, cross-target checks, release builds, and static dependency verification. Windows host behavior is tested with:
 
 ```powershell
 .\scripts\windows-smoke.ps1
 ```
 
-`vX.Y.Z`形式のタグをpushするとGitHub Actionsが全検査とWindowsスモークテストを実行します。成功後、Trusted Publishingでcrates.ioへ公開し、その後にバイナリとSHA-256チェックサムをGitHub Releaseへ公開します。タグのバージョンは`Cargo.toml`のpackage versionと一致している必要があります。
+Pushing a `vX.Y.Z` tag matching the Cargo package version publishes the crate through crates.io Trusted Publishing, then creates the GitHub Release.
 
-## コントリビューション
+## License
 
-[CONTRIBUTING.md](CONTRIBUTING.md)を確認し、変更を提出する前に次を実行してください。
-
-```console
-docker compose run --rm dev mise run check-all
-```
-
-## ライセンス
-
-MIT LicenseまたはApache License 2.0のいずれかを選択できます。
+Licensed under either [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE).
