@@ -20,7 +20,7 @@ run = "cargo test --locked && bash scripts/differential.sh"
 
 [tasks.coverage]
 description = "Require 100% line coverage for the production library"
-run = "cargo llvm-cov --locked --lib --fail-under-lines 100"
+run = "cargo llvm-cov --locked --lib --fail-under-lines 100 --show-missing-lines -- --test-threads=1"
 
 [tasks.lint]
 description = "Run Clippy with warnings denied"
