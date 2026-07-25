@@ -19,6 +19,13 @@ cargo install isksh --locked
 
 Standalone release binaries are available from [GitHub Releases](https://github.com/isksss/isksh/releases).
 
+With [aqua](https://aquaproj.github.io/), after the package is available in the Standard Registry:
+
+```console
+aqua g -i isksss/isksh
+aqua install
+```
+
 ## Usage
 
 ```console

@@ -19,6 +19,13 @@ cargo install isksh --locked
 
 単体配布バイナリは[GitHub Releases](https://github.com/isksss/isksh/releases)から取得できます。
 
+[aqua](https://aquaproj.github.io/) Standard Registryへの登録後は、次の方法でも導入できます。
+
+```console
+aqua g -i isksss/isksh
+aqua install
+```
+
 ## 使用方法
 
 ```console

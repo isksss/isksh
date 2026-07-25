@@ -119,3 +119,44 @@ jobs:
             --verify-tag \
             --generate-notes \
             --title "isksh $GITHUB_REF_NAME"
+
+  aqua-smoke-linux:
+    name: Install release with aqua on Linux
+    needs: publish-release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install aqua
+        uses: aquaproj/aqua-installer@v4.0.5
+        with:
+          aqua_version: v2.62.1
+          enable_aqua_install: "false"
+
+      - name: Install and run isksh through aqua
+        run: bash scripts/aqua-smoke.sh "$GITHUB_REF_NAME"
+
+  aqua-smoke-windows:
+    name: Install release with aqua on Windows
+    needs: publish-release
+    runs-on: windows-2025
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install aqua
+        uses: aquaproj/aqua-installer@v4.0.5
+        with:
+          aqua_version: v2.62.1
+          enable_aqua_install: "false"
+
+      - name: Install and run isksh through aqua
+        shell: pwsh
+        run: ./scripts/aqua-smoke.ps1 -Version $env:GITHUB_REF_NAME

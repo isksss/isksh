@@ -1,0 +1,12 @@
+registries:
+  - name: local
+    type: local
+    path: registry.yaml
+
+checksum:
+  enabled: true
+  require_checksum: true
+  supported_envs:
+    - all
+
+packages:
