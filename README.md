@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/isksss/isksh/actions/workflows/ci.yml/badge.svg)](https://github.com/isksss/isksh/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/isksh.svg)](https://crates.io/crates/isksh)
+[![aqua](https://img.shields.io/github/v/release/isksss/isksh?label=aqua&color=2e9afe)](https://github.com/aquaproj/aqua-registry/blob/main/pkgs/isksss/isksh/registry.yaml)
 
 [日本語](README.ja.md)
 
@@ -19,7 +20,7 @@ cargo install isksh --locked
 
 Standalone release binaries are available from [GitHub Releases](https://github.com/isksss/isksh/releases).
 
-With [aqua](https://aquaproj.github.io/), after the package is available in the Standard Registry:
+With [aqua](https://aquaproj.github.io/) from the Standard Registry:
 
 ```console
 aqua g -i isksss/isksh

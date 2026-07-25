@@ -2,6 +2,7 @@
 
 [![CI](https://github.com/isksss/isksh/actions/workflows/ci.yml/badge.svg)](https://github.com/isksss/isksh/actions/workflows/ci.yml)
 [![crates.io](https://img.shields.io/crates/v/isksh.svg)](https://crates.io/crates/isksh)
+[![aqua](https://img.shields.io/github/v/release/isksss/isksh?label=aqua&color=2e9afe)](https://github.com/aquaproj/aqua-registry/blob/main/pkgs/isksss/isksh/registry.yaml)
 
 [English](README.md)
 
@@ -19,7 +20,7 @@ cargo install isksh --locked
 
 単体配布バイナリは[GitHub Releases](https://github.com/isksss/isksh/releases)から取得できます。
 
-[aqua](https://aquaproj.github.io/) Standard Registryへの登録後は、次の方法でも導入できます。
+[aqua](https://aquaproj.github.io/) Standard Registryから、次の方法でも導入できます。
 
 ```console
 aqua g -i isksss/isksh
