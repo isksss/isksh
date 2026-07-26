@@ -1,6 +1,6 @@
 [package]
 name = "isksh"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.97.1"
 description = "A portable POSIX-oriented shell written in Rust"
@@ -25,6 +25,7 @@ include = [
 ]
 
 [dependencies]
+chrono = { version = "0.4.42", default-features = false, features = ["clock"] }
 glob = "0.3.3"
 regex = "1.11.1"
 rustyline = "18.0.1"

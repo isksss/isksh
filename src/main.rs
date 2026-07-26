@@ -202,6 +202,7 @@ fn load_and_report_startup(
 struct ShellHelper {
     files: FilenameCompleter,
     commands: Vec<String>,
+    custom: Vec<String>,
 }
 
 struct AbbreviationHandler(Arc<RwLock<HashMap<String, String>>>);
@@ -276,6 +277,7 @@ impl Completer for ShellHelper {
             let candidates = self
                 .commands
                 .iter()
+                .chain(self.custom.iter())
                 .filter(|command| command.starts_with(prefix))
                 .map(|command| Pair {
                     display: command.clone(),
@@ -299,6 +301,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     editor.set_helper(Some(ShellHelper {
         files: FilenameCompleter::new(),
         commands: command_candidates(shell),
+        custom: shell.configured_completion_candidates(),
     }));
     let history = history_file();
     if let Some(parent) = history.parent() {
@@ -311,6 +314,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
         let prompt = shell.prompt(!source.is_empty());
         if let Some(helper) = editor.helper_mut() {
             helper.commands = command_candidates(shell);
+            helper.custom = shell.configured_completion_candidates();
         }
         if let Ok(mut configured) = abbreviations.write() {
             *configured = shell.configured_abbreviations();
@@ -323,7 +327,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
                     continue;
                 }
                 source = shell.expand_abbreviations(&source);
-                if !source.trim().is_empty() {
+                if !source.trim().is_empty() && shell.record_history(source.trim_end()) {
                     let _ = editor.add_history_entry(source.trim_end());
                 }
                 let result = shell.run(&source, &[]);

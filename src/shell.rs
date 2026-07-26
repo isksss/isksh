@@ -1,10 +1,13 @@
 use crate::ast::*;
 use crate::parser::parse;
+use chrono::Local;
 use glob::{MatchOptions, Pattern, glob_with};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(windows)]
@@ -68,6 +71,7 @@ struct LocalScope {
     variables: HashMap<String, Option<Variable>>,
     indexed_arrays: HashMap<String, Option<BTreeMap<usize, String>>>,
     associative_arrays: HashMap<String, Option<BTreeMap<String, String>>>,
+    shell_options: Option<HashSet<String>>,
 }
 
 impl ExecResult {
@@ -164,6 +168,8 @@ pub struct Shell {
     last_status: i32,
     functions: HashMap<String, Command>,
     aliases: HashMap<String, String>,
+    global_aliases: HashMap<String, String>,
+    suffix_aliases: HashMap<String, String>,
     abbreviations: HashMap<String, String>,
     indexed_arrays: HashMap<String, BTreeMap<usize, String>>,
     associative_arrays: HashMap<String, BTreeMap<String, String>>,
@@ -189,6 +195,21 @@ pub struct Shell {
     mode: ShellMode,
     precmd_hooks: Vec<String>,
     chpwd_hooks: Vec<String>,
+    preexec_hooks: Vec<String>,
+    periodic_hooks: Vec<String>,
+    zshaddhistory_hooks: Vec<String>,
+    zshexit_hooks: Vec<String>,
+    autoload_functions: HashSet<String>,
+    loaded_modules: HashSet<String>,
+    function_stack: Vec<String>,
+    function_modes: HashMap<String, ShellMode>,
+    traced_functions: HashSet<String>,
+    zstyles: BTreeMap<(String, String), Vec<String>>,
+    key_bindings: BTreeMap<(String, String), String>,
+    zle_widgets: BTreeMap<String, String>,
+    completion_definitions: BTreeMap<String, String>,
+    completion_candidates: Vec<String>,
+    zsh_hook_depth: usize,
 }
 
 impl Default for Shell {
@@ -233,6 +254,11 @@ impl Shell {
                 readonly: false,
             },
         );
+        let shell_options = if mode == ShellMode::Zsh {
+            HashSet::from(["nomatch".to_string()])
+        } else {
+            HashSet::new()
+        };
         Self {
             variables,
             positional: Vec::new(),
@@ -240,10 +266,12 @@ impl Shell {
             last_status: 0,
             functions: HashMap::new(),
             aliases: HashMap::new(),
+            global_aliases: HashMap::new(),
+            suffix_aliases: HashMap::new(),
             abbreviations: HashMap::new(),
             indexed_arrays: HashMap::new(),
             associative_arrays: HashMap::new(),
-            shell_options: HashSet::new(),
+            shell_options,
             pending_process_substitutions: Vec::new(),
             local_scopes: Vec::new(),
             expanding_aliases: Vec::new(),
@@ -265,6 +293,21 @@ impl Shell {
             mode,
             precmd_hooks: Vec::new(),
             chpwd_hooks: Vec::new(),
+            preexec_hooks: Vec::new(),
+            periodic_hooks: Vec::new(),
+            zshaddhistory_hooks: Vec::new(),
+            zshexit_hooks: Vec::new(),
+            autoload_functions: HashSet::new(),
+            loaded_modules: HashSet::new(),
+            function_stack: Vec::new(),
+            function_modes: HashMap::new(),
+            traced_functions: HashSet::new(),
+            zstyles: BTreeMap::new(),
+            key_bindings: BTreeMap::new(),
+            zle_widgets: BTreeMap::new(),
+            completion_definitions: BTreeMap::new(),
+            completion_candidates: Vec::new(),
+            zsh_hook_depth: 0,
         }
     }
 
@@ -279,6 +322,9 @@ impl Shell {
     /// shell environment.
     pub fn refresh_mode(&mut self) {
         self.mode = ShellMode::from_environment(self.value_of("ISKSH_MODE").as_deref());
+        if self.mode == ShellMode::Zsh {
+            self.shell_options.insert("nomatch".into());
+        }
         let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
     }
 
@@ -301,6 +347,7 @@ impl Shell {
             .keys()
             .chain(self.abbreviations.keys())
             .chain(self.functions.keys())
+            .chain(self.autoload_functions.iter())
             .cloned()
             .collect()
     }
@@ -308,6 +355,40 @@ impl Shell {
     /// Returns a copy of all configured interactive abbreviations.
     pub fn configured_abbreviations(&self) -> HashMap<String, String> {
         self.abbreviations.clone()
+    }
+
+    /// Returns completion candidates added by the zsh-compatible `compadd` built-in.
+    pub fn configured_completion_candidates(&self) -> Vec<String> {
+        self.completion_candidates.clone()
+    }
+
+    /// Applies zsh history options, runs history hooks, and reports whether to store the line.
+    pub fn record_history(&mut self, source: &str) -> bool {
+        if self.mode != ShellMode::Zsh {
+            return true;
+        }
+        if self.shell_options.contains("histignorespace")
+            && source.chars().next().is_some_and(char::is_whitespace)
+        {
+            return false;
+        }
+        let line = if self.shell_options.contains("histreduceblanks") {
+            source.split_whitespace().collect::<Vec<_>>().join(" ")
+        } else {
+            source.to_string()
+        };
+        if self.shell_options.contains("histignoredups")
+            && self.value_of("ZSH_LAST_HISTORY").as_deref() == Some(&line)
+        {
+            return false;
+        }
+        let _ = self.set_variable("ZSH_HISTORY_LINE", line.clone(), None, false);
+        let result = self.run_zsh_hooks(self.zshaddhistory_hooks.clone());
+        if result.status != 0 {
+            return false;
+        }
+        let _ = self.set_variable("ZSH_LAST_HISTORY", line, None, false);
+        true
     }
 
     /// Expands command-position abbreviations in interactive source text.
@@ -378,6 +459,50 @@ impl Shell {
         output
     }
 
+    fn expand_zsh_aliases(&self, source: &str) -> String {
+        let mut output = String::with_capacity(source.len());
+        let mut word = String::new();
+        let mut quote = None;
+        let mut escaped = false;
+        let flush = |word: &mut String, output: &mut String| {
+            if word.is_empty() {
+                return;
+            }
+            if let Some(expansion) = self.global_aliases.get(word) {
+                output.push_str(expansion);
+            } else {
+                output.push_str(word);
+            }
+            word.clear();
+        };
+        for character in source.chars() {
+            if escaped {
+                word.push(character);
+                escaped = false;
+            } else if let Some(delimiter) = quote {
+                word.push(character);
+                if character == delimiter {
+                    quote = None;
+                } else if delimiter == '"' && character == '\\' {
+                    escaped = true;
+                }
+            } else if matches!(character, '\'' | '"') {
+                word.push(character);
+                quote = Some(character);
+            } else if character == '\\' {
+                word.push(character);
+                escaped = true;
+            } else if character.is_whitespace() || ";|&()<>".contains(character) {
+                flush(&mut word, &mut output);
+                output.push(character);
+            } else {
+                word.push(character);
+            }
+        }
+        flush(&mut word, &mut output);
+        output
+    }
+
     /// Controls whether foreground external commands may use the terminal directly.
     pub fn set_interactive(&mut self, interactive: bool) {
         self.terminal_io = interactive;
@@ -403,11 +528,10 @@ impl Shell {
         let saved_status = self.last_status;
         let mut prefix = String::new();
         if !continuation && self.mode == ShellMode::Zsh {
-            for hook in self.precmd_hooks.clone() {
-                self.last_status = saved_status;
-                let result = self.run(&hook, &[]);
-                prefix.push_str(&String::from_utf8_lossy(&result.stdout));
-            }
+            let result = self.run_zsh_hooks(self.periodic_hooks.clone());
+            prefix.push_str(&String::from_utf8_lossy(&result.stdout));
+            let result = self.run_zsh_hooks(self.precmd_hooks.clone());
+            prefix.push_str(&String::from_utf8_lossy(&result.stdout));
         }
         self.last_status = saved_status;
         let names = match (self.mode, continuation) {
@@ -443,13 +567,28 @@ impl Shell {
         } else {
             self.expand_prompt_escapes(&value)
         };
-        prefix.push_str(
-            &self
-                .expand_here_document(&escaped)
-                .unwrap_or_else(|_| escaped.clone()),
-        );
+        let expanded = if self.mode == ShellMode::Bash || self.shell_options.contains("promptsubst")
+        {
+            self.expand_here_document(&escaped)
+                .unwrap_or_else(|_| escaped.clone())
+        } else {
+            escaped
+        };
+        prefix.push_str(&expanded);
         self.last_status = saved_status;
         prefix
+    }
+
+    /// Expands the zsh-compatible right prompt (`RPROMPT` or `RPS1`).
+    pub fn right_prompt(&self) -> String {
+        if self.mode != ShellMode::Zsh {
+            return String::new();
+        }
+        let value = self
+            .value_of("RPROMPT")
+            .or_else(|| self.value_of("RPS1"))
+            .unwrap_or_default();
+        self.expand_zsh_prompt_escapes(&value, self.last_status)
     }
 
     /// Takes the exit status requested by an executed `exit` built-in.
@@ -472,6 +611,13 @@ impl Shell {
                 stderr: result.stderr,
             };
         }
+        let expanded_source;
+        let source = if self.mode == ShellMode::Zsh {
+            expanded_source = normalize_zsh_function_syntax(&self.expand_zsh_aliases(source));
+            expanded_source.as_str()
+        } else {
+            source
+        };
         let script = match parse(source) {
             Ok(script) => script,
             Err(error) => {
@@ -488,6 +634,11 @@ impl Shell {
                 let mut trap = self.run_trap("EXIT");
                 result.stdout.append(&mut trap.stdout);
                 result.stderr.append(&mut trap.stderr);
+                if self.mode == ShellMode::Zsh {
+                    let mut hooks = self.run_zsh_hooks(self.zshexit_hooks.clone());
+                    result.stdout.append(&mut hooks.stdout);
+                    result.stderr.append(&mut hooks.stderr);
+                }
                 self.exit_status = Some(status);
                 status
             }
@@ -777,6 +928,9 @@ impl Shell {
         match command {
             Command::Simple(command) => {
                 let mut result = self.run_trap("DEBUG");
+                if self.mode == ShellMode::Zsh && self.zsh_hook_depth == 0 {
+                    result.append(self.run_zsh_hooks(self.preexec_hooks.clone()));
+                }
                 result.append(self.execute_simple(command, input));
                 result
             }
@@ -817,9 +971,20 @@ impl Shell {
             }
             Command::Function { name, body } => {
                 self.functions.insert(name.clone(), (**body).clone());
+                self.function_modes.insert(name.clone(), self.mode);
                 ExecResult::status(0)
             }
         }
+    }
+
+    fn run_zsh_hooks(&mut self, hooks: Vec<String>) -> ExecResult {
+        let mut output = ExecResult::status(0);
+        self.zsh_hook_depth += 1;
+        for hook in hooks {
+            output.append(self.execute_eval(&[hook], &[]));
+        }
+        self.zsh_hook_depth -= 1;
+        output
     }
 
     fn execute_loop(
@@ -948,6 +1113,7 @@ impl Shell {
             }
             self.associative_arrays.remove(name);
             self.indexed_arrays.insert(name.clone(), values);
+            self.sync_zsh_tied_array(name);
         }
         let mut assignments = Vec::new();
         for (name, word) in &command.assignments {
@@ -1069,6 +1235,27 @@ impl Shell {
             self.expanding_aliases.pop();
             return self.apply_redirections(command, &command_input, result);
         }
+        if self.mode == ShellMode::Zsh
+            && assignments.is_empty()
+            && let Some((_, suffix)) = name.rsplit_once('.')
+            && let Some(replacement) = self.suffix_aliases.get(suffix).cloned()
+        {
+            let mut source = format!("{replacement} {}", shell_quote(&name));
+            for argument in &words {
+                source.push(' ');
+                source.push_str(&shell_quote(argument));
+            }
+            let result = self.execute_eval(&[source], &command_input);
+            return self.apply_redirections(command, &command_input, result);
+        }
+        if self.mode == ShellMode::Zsh
+            && assignments.is_empty()
+            && words.is_empty()
+            && self.shell_options.contains("autocd")
+            && self.resolve_path(&name).is_dir()
+        {
+            return self.builtin_cd(&[name]);
+        }
         let is_special = is_special_builtin(&name);
         let has_temporary_assignments = !assignments.is_empty();
         let saved_variables = if is_special || !has_temporary_assignments {
@@ -1094,8 +1281,14 @@ impl Shell {
         }
         let previous_terminal_io = self.terminal_io;
         self.terminal_io &= command.redirections.is_empty() && command_input.is_empty();
+        if self.mode == ShellMode::Zsh && self.autoload_functions.contains(&name) {
+            let loaded = self.load_autoload_function(&name);
+            if loaded.status != 0 {
+                return loaded;
+            }
+        }
         let mut result = if let Some(function) = self.functions.get(&name).cloned() {
-            self.execute_function(&function, words, &command_input)
+            self.execute_function(&name, &function, words, &command_input)
         } else if is_builtin(&name) {
             self.execute_builtin(&name, &words, &command_input)
         } else {
@@ -1235,20 +1428,41 @@ impl Shell {
 
     fn execute_function(
         &mut self,
+        name: &str,
         body: &Command,
         arguments: Vec<String>,
         input: &[u8],
     ) -> ExecResult {
         let old_positional = std::mem::replace(&mut self.positional, arguments);
+        let old_mode = self.mode;
+        if let Some(mode) = self.function_modes.get(name).copied() {
+            self.mode = mode;
+        }
         self.function_depth += 1;
-        self.local_scopes.push(LocalScope::default());
+        self.function_stack.push(name.to_string());
+        let shell_options = self
+            .shell_options
+            .contains("localoptions")
+            .then(|| self.shell_options.clone());
+        self.local_scopes.push(LocalScope {
+            shell_options,
+            ..LocalScope::default()
+        });
         let mut result = self.execute_command(body, input);
+        if self.traced_functions.contains(name) {
+            result.stderr.splice(0..0, format!("+{name}\n").bytes());
+        }
         let scope = self.local_scopes.pop().expect("function scope exists");
         restore_map(&mut self.variables, scope.variables);
         restore_map(&mut self.indexed_arrays, scope.indexed_arrays);
         restore_map(&mut self.associative_arrays, scope.associative_arrays);
+        if let Some(options) = scope.shell_options {
+            self.shell_options = options;
+        }
+        self.function_stack.pop();
         self.function_depth -= 1;
         self.positional = old_positional;
+        self.mode = old_mode;
         if let Flow::Return(status) = result.flow {
             result.status = status;
             result.flow = Flow::None;
@@ -1337,7 +1551,7 @@ impl Shell {
                     ..ExecResult::status(0)
                 }
             }
-            "cd" => self.builtin_cd(args),
+            "cd" | "chdir" => self.builtin_cd(args),
             "pushd" => self.builtin_pushd(args),
             "popd" => self.builtin_popd(args),
             "dirs" => self.builtin_dirs(args),
@@ -1363,8 +1577,23 @@ impl Shell {
             "setopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, true),
             "unsetopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, false),
             "emulate" if self.mode == ShellMode::Zsh => self.builtin_emulate(args),
-            "whence" if self.mode == ShellMode::Zsh => self.builtin_whence(args),
-            "autoload" | "zmodload" if self.mode == ShellMode::Zsh => ExecResult::status(0),
+            "whence" | "which" | "where" if self.mode == ShellMode::Zsh => {
+                self.builtin_whence(args)
+            }
+            "autoload" if self.mode == ShellMode::Zsh => self.builtin_autoload(args),
+            "zmodload" if self.mode == ShellMode::Zsh => self.builtin_zmodload(args),
+            "functions" if self.mode == ShellMode::Zsh => self.builtin_functions(args),
+            "zstyle" if self.mode == ShellMode::Zsh => self.builtin_zstyle(args),
+            "bindkey" if self.mode == ShellMode::Zsh => self.builtin_bindkey(args),
+            "zle" if self.mode == ShellMode::Zsh => self.builtin_zle(args),
+            "vared" if self.mode == ShellMode::Zsh => self.builtin_vared(args, input),
+            "compinit" if self.mode == ShellMode::Zsh => ExecResult::status(0),
+            "compdef" if self.mode == ShellMode::Zsh => self.builtin_compdef(args),
+            "compadd" if self.mode == ShellMode::Zsh => self.builtin_compadd(args),
+            "compset" if self.mode == ShellMode::Zsh => self.builtin_compset(args),
+            "integer" | "float" | "private" if self.mode == ShellMode::Zsh => {
+                self.builtin_declare("typeset", args)
+            }
             "add-zsh-hook" if self.mode == ShellMode::Zsh => self.builtin_add_zsh_hook(args),
             "unfunction" if self.mode == ShellMode::Zsh => self.builtin_unfunction(args),
             "type" => self.builtin_type(args),
@@ -1424,6 +1653,20 @@ impl Shell {
         if args.len() > 1 {
             return ExecResult::error(1, "isksh: cd: too many arguments");
         }
+        if let Some(argument) = args.first()
+            && let Some(index) = directory_stack_index(argument, self.directory_stack.len() + 1)
+        {
+            let paths = std::iter::once(&self.cwd)
+                .chain(self.directory_stack.iter())
+                .cloned()
+                .collect::<Vec<_>>();
+            let target = &paths[index];
+            let mut result = self.change_directory(&target.to_string_lossy());
+            if result.status == 0 {
+                result.stdout = format!("{}\n", self.cwd.display()).into_bytes();
+            }
+            return result;
+        }
         let print_directory = args.first().map(String::as_str) == Some("-");
         let target = if print_directory {
             let Some(previous) = self.value_of("OLDPWD") else {
@@ -1436,7 +1679,14 @@ impl Shell {
                 .or_else(|| self.value_of("HOME"))
                 .unwrap_or(".".into())
         };
+        let previous = self.cwd.clone();
         let mut result = self.change_directory(&target);
+        if result.status == 0
+            && self.mode == ShellMode::Zsh
+            && self.shell_options.contains("autopushd")
+        {
+            self.push_directory(previous);
+        }
         if result.status == 0 && print_directory {
             result.stdout = format!("{}\n", self.cwd.display()).into_bytes();
         }
@@ -1471,6 +1721,10 @@ impl Shell {
         let mut line_mode = false;
         let mut nul_mode = false;
         let mut format = None;
+        let mut array = None;
+        let mut columns = None;
+        let mut pattern = None;
+        let mut sort = 0i8;
         let mut index = 0;
         while let Some(option) = args.get(index).map(String::as_str) {
             match option {
@@ -1487,6 +1741,33 @@ impl Shell {
                             'P' => prompt = true,
                             'l' => line_mode = true,
                             'N' => nul_mode = true,
+                            'b' | 'D' | 'i' | 'p' | 's' | 'S' | 'z' => {}
+                            'o' => sort = 1,
+                            'O' => sort = -1,
+                            'a' | 'm' | 'C' | 'c' => {
+                                let attached = flags.collect::<String>();
+                                let value = if attached.is_empty() {
+                                    index += 1;
+                                    let Some(value) = args.get(index) else {
+                                        return ExecResult::error(
+                                            2,
+                                            format!("isksh: print: -{flag} requires an argument"),
+                                        );
+                                    };
+                                    value.clone()
+                                } else {
+                                    attached
+                                };
+                                match flag {
+                                    'a' => array = Some(value),
+                                    'm' => pattern = Some(value),
+                                    _ => {
+                                        columns =
+                                            value.parse::<usize>().ok().filter(|value| *value > 0)
+                                    }
+                                }
+                                break;
+                            }
                             'f' => {
                                 let attached = flags.collect::<String>();
                                 if !attached.is_empty() {
@@ -1521,6 +1802,23 @@ impl Shell {
             values.extend_from_slice(&args[index..]);
             return builtin_printf(&values);
         }
+        let mut values = if let Some(name) = array {
+            self.array_values(&name)
+        } else {
+            args[index..].to_vec()
+        };
+        if let Some(pattern) = pattern {
+            let Ok(pattern) = Pattern::new(&pattern) else {
+                return ExecResult::error(1, "isksh: print: invalid pattern");
+            };
+            values.retain(|value| pattern.matches(value));
+        }
+        if sort != 0 {
+            values.sort();
+            if sort < 0 {
+                values.reverse();
+            }
+        }
         let separator = if nul_mode {
             "\0"
         } else if line_mode {
@@ -1528,7 +1826,15 @@ impl Shell {
         } else {
             " "
         };
-        let value = args[index..].join(separator);
+        let value = if let Some(columns) = columns {
+            values
+                .chunks(columns)
+                .map(|row| row.join(" "))
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            values.join(separator)
+        };
         let value = if prompt {
             self.expand_zsh_prompt_escapes(&value, self.last_status)
         } else if raw {
@@ -1549,23 +1855,20 @@ impl Shell {
     }
 
     fn builtin_setopt(&mut self, args: &[String], enabled: bool) -> ExecResult {
-        for option in args {
-            let mut normalized = option.to_ascii_lowercase().replace('_', "");
-            let inverted = if matches!(normalized.as_str(), "nomatch" | "notify") {
-                None
-            } else {
-                normalized.strip_prefix("no").map(ToOwned::to_owned)
+        if args.is_empty() {
+            let mut options: Vec<_> = self.shell_options.iter().cloned().collect();
+            options.sort();
+            return ExecResult {
+                stdout: options.join("\n").into_bytes(),
+                ..ExecResult::status(0)
             };
-            if inverted
-                .as_deref()
-                .is_some_and(|name| name.starts_with("no") && !matches!(name, "nomatch" | "notify"))
-            {
+        }
+        for option in args {
+            let raw = option.to_ascii_lowercase().replace('_', "");
+            let (normalized, is_inverted) = normalize_zsh_option(option);
+            if raw.starts_with("nono") && !matches!(normalized.as_str(), "nomatch" | "notify") {
                 let command = if enabled { "setopt" } else { "unsetopt" };
                 return ExecResult::error(1, format!("isksh: {command}: no such option: {option}"));
-            }
-            let is_inverted = inverted.is_some();
-            if let Some(name) = inverted {
-                normalized = name;
             }
             if enabled != is_inverted {
                 self.shell_options.insert(normalized);
@@ -1578,9 +1881,25 @@ impl Shell {
 
     fn builtin_emulate(&mut self, args: &[String]) -> ExecResult {
         let mut shell = None;
-        for argument in args {
+        let mut command = None;
+        let mut local = false;
+        let mut reset = false;
+        let mut index = 0;
+        while let Some(argument) = args.get(index) {
             match argument.as_str() {
-                "-L" | "-R" | "-LR" | "-RL" => {}
+                "-L" => local = true,
+                "-R" => reset = true,
+                "-LR" | "-RL" => {
+                    local = true;
+                    reset = true;
+                }
+                "-c" => {
+                    index += 1;
+                    let Some(value) = args.get(index) else {
+                        return ExecResult::error(2, "isksh: emulate: -c requires a command");
+                    };
+                    command = Some(value.clone());
+                }
                 value if !value.starts_with('-') && shell.is_none() => shell = Some(value),
                 value => {
                     return ExecResult::error(
@@ -1589,6 +1908,7 @@ impl Shell {
                     );
                 }
             }
+            index += 1;
         }
         let Some(shell) = shell else {
             return ExecResult {
@@ -1596,31 +1916,73 @@ impl Shell {
                 ..ExecResult::status(0)
             };
         };
+        let saved_mode = self.mode;
+        let saved_options = self.shell_options.clone();
         self.mode = match shell {
             "sh" | "ksh" | "csh" => ShellMode::Bash,
             _ => ShellMode::Zsh,
         };
+        if reset {
+            self.shell_options.clear();
+            if self.mode == ShellMode::Zsh {
+                self.shell_options.insert("nomatch".into());
+            }
+        }
         let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
-        ExecResult::status(0)
+        let had_command = command.is_some();
+        let result = command.map_or_else(
+            || ExecResult::status(0),
+            |source| {
+                let result = self.run(&source, &[]);
+                ExecResult {
+                    status: result.status,
+                    stdout: result.stdout,
+                    stderr: result.stderr,
+                    flow: Flow::None,
+                }
+            },
+        );
+        if local || had_command {
+            self.mode = saved_mode;
+            self.shell_options = saved_options;
+            let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
+        }
+        result
     }
 
     fn builtin_whence(&self, args: &[String]) -> ExecResult {
         let mut verbose = false;
         let mut word = false;
+        let mut all = false;
+        let mut external_only = false;
+        let mut function_only = false;
+        let mut pattern_mode = false;
+        let mut path_only = false;
         let mut index = 0;
         while let Some(argument) = args.get(index) {
             match argument.as_str() {
-                "-v" => verbose = true,
-                "-w" => word = true,
                 "--" => {
                     index += 1;
                     break;
                 }
                 value if value.starts_with('-') => {
-                    return ExecResult::error(
-                        2,
-                        format!("isksh: whence: unsupported option: {value}"),
-                    );
+                    for flag in value[1..].chars() {
+                        match flag {
+                            'v' => verbose = true,
+                            'w' => word = true,
+                            'a' => all = true,
+                            'p' | 'x' => external_only = true,
+                            'f' => function_only = true,
+                            'm' => pattern_mode = true,
+                            'c' | 's' | 'S' => path_only = true,
+                            _ => {
+                                return ExecResult::error(
+                                    2,
+                                    format!("isksh: whence: unsupported option: -{flag}"),
+                                );
+                            }
+                        }
+                    }
                 }
                 _ => break,
             }
@@ -1628,33 +1990,67 @@ impl Shell {
         }
         let mut status = 0;
         let mut output = String::new();
-        for name in &args[index..] {
+        let requested: Vec<String> = if pattern_mode {
+            let mut names = self.configured_command_names();
+            names.extend(BUILTIN_NAMES.iter().map(|name| (*name).to_string()));
+            names.sort();
+            names.dedup();
+            let patterns: Vec<_> = args[index..]
+                .iter()
+                .filter_map(|value| Pattern::new(value).ok())
+                .collect();
+            names.retain(|name| patterns.iter().any(|pattern| pattern.matches(name)));
+            names
+        } else {
+            args[index..].to_vec()
+        };
+        for name in &requested {
+            let external = self.resolve_command_file(name);
             let (kind, detail) = if let Some(alias) = self.aliases.get(name) {
-                ("alias", format!("{name} is an alias for {alias}"))
-            } else if self.functions.contains_key(name) {
-                ("function", format!("{name} is a shell function"))
-            } else if is_builtin(name) {
-                ("builtin", format!("{name} is a shell builtin"))
-            } else {
-                let path = self.resolve_command_file(name);
-                if path.is_file() {
-                    ("command", path.to_string_lossy().into_owned())
+                if external_only || function_only {
+                    ("none", format!("{name} not found"))
                 } else {
-                    status = 1;
+                    ("alias", format!("{name} is an alias for {alias}"))
+                }
+            } else if self.functions.contains_key(name) {
+                if external_only {
+                    ("none", format!("{name} not found"))
+                } else {
+                    ("function", format!("{name} is a shell function"))
+                }
+            } else if is_builtin(name) {
+                if external_only || function_only {
+                    ("none", format!("{name} not found"))
+                } else {
+                    ("builtin", format!("{name} is a shell builtin"))
+                }
+            } else {
+                if external.is_file() && !function_only {
+                    ("command", external.to_string_lossy().into_owned())
+                } else {
                     ("none", format!("{name} not found"))
                 }
             };
+            if kind == "none" {
+                status = 1;
+            }
             if word {
                 output.push_str(&format!("{name}: {kind}\n"));
+            } else if path_only && kind == "command" {
+                output.push_str(&format!("{}\n", external.display()));
             } else if verbose || kind != "none" {
                 output.push_str(&detail);
                 output.push('\n');
+            }
+            if all && kind != "command" && external.is_file() {
+                output.push_str(&format!("{}\n", external.display()));
             }
         }
         ExecResult {
             status,
             stdout: output.into_bytes(),
-            ..ExecResult::status(0)
+            stderr: Vec::new(),
+            flow: Flow::None,
         }
     }
 
@@ -1670,6 +2066,10 @@ impl Shell {
         let hooks = match event.as_str() {
             "precmd" => &mut self.precmd_hooks,
             "chpwd" => &mut self.chpwd_hooks,
+            "preexec" => &mut self.preexec_hooks,
+            "periodic" => &mut self.periodic_hooks,
+            "zshaddhistory" => &mut self.zshaddhistory_hooks,
+            "zshexit" => &mut self.zshexit_hooks,
             _ => {
                 return ExecResult::error(
                     2,
@@ -1695,15 +2095,398 @@ impl Shell {
         ExecResult::status(status)
     }
 
+    fn builtin_autoload(&mut self, args: &[String]) -> ExecResult {
+        let mut load_now = false;
+        let mut names = Vec::new();
+        for argument in args {
+            if argument == "+X" {
+                load_now = true;
+            } else if argument.starts_with(['-', '+']) {
+                continue;
+            } else {
+                names.push(argument.clone());
+            }
+        }
+        if names.is_empty() {
+            let mut names = self.autoload_functions.iter().cloned().collect::<Vec<_>>();
+            names.sort();
+            return ExecResult {
+                stdout: names.join("\n").into_bytes(),
+                ..ExecResult::status(0)
+            };
+        }
+        for name in names {
+            self.autoload_functions.insert(name.clone());
+            if load_now {
+                let result = self.load_autoload_function(&name);
+                if result.status != 0 {
+                    return result;
+                }
+            }
+        }
+        ExecResult::status(0)
+    }
+
+    fn load_autoload_function(&mut self, name: &str) -> ExecResult {
+        let search = self
+            .indexed_arrays
+            .get("fpath")
+            .map(|values| values.values().cloned().collect::<Vec<_>>())
+            .unwrap_or_else(|| {
+                self.value_of("FPATH")
+                    .unwrap_or_default()
+                    .split(if cfg!(windows) { ';' } else { ':' })
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect()
+            });
+        let path = search
+            .into_iter()
+            .map(|directory| self.resolve_path(&directory).join(name))
+            .find(|path| path.is_file());
+        let Some(path) = path else {
+            return ExecResult::error(1, format!("isksh: {name}: autoload function not found"));
+        };
+        let source = match fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) => return ExecResult::error(1, format!("isksh: {name}: {error}")),
+        };
+        let result = self.execute_eval(&[format!("{name}() {{\n{source}\n}}")], &[]);
+        if result.status == 0 {
+            self.autoload_functions.remove(name);
+        }
+        result
+    }
+
+    fn builtin_zmodload(&mut self, args: &[String]) -> ExecResult {
+        if args.is_empty() || args.iter().any(|arg| arg == "-L") {
+            let mut modules = self.loaded_modules.iter().cloned().collect::<Vec<_>>();
+            modules.sort();
+            let stdout = modules
+                .into_iter()
+                .map(|module| format!("zmodload {module}\n"))
+                .collect::<String>()
+                .into_bytes();
+            return ExecResult {
+                stdout,
+                ..ExecResult::status(0)
+            };
+        }
+        let unload = args.first().map(String::as_str) == Some("-u");
+        for module in args.iter().skip(usize::from(unload)) {
+            if module.starts_with('-') {
+                continue;
+            }
+            if unload {
+                self.loaded_modules.remove(module);
+            } else {
+                self.loaded_modules.insert(module.clone());
+            }
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_functions(&mut self, args: &[String]) -> ExecResult {
+        let trace = args
+            .iter()
+            .any(|argument| argument.starts_with('-') && argument[1..].contains('t'));
+        let untrace = args
+            .iter()
+            .any(|argument| argument.starts_with('+') && argument[1..].contains('t'));
+        let mut names = args
+            .iter()
+            .filter(|argument| !argument.starts_with(['-', '+']))
+            .cloned()
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            names.extend(self.functions.keys().cloned());
+            names.extend(self.autoload_functions.iter().cloned());
+            names.sort();
+        }
+        if trace || untrace {
+            for name in &names {
+                if untrace {
+                    self.traced_functions.remove(name);
+                } else {
+                    self.traced_functions.insert(name.clone());
+                }
+            }
+        }
+        let mut status = 0;
+        let mut output = String::new();
+        for name in names {
+            if self.functions.contains_key(&name) {
+                output.push_str(&format!("{name} () {{ ... }}\n"));
+            } else if self.autoload_functions.contains(&name) {
+                output.push_str(&format!("{name} () {{ # undefined }}\n"));
+            } else {
+                status = 1;
+            }
+        }
+        ExecResult {
+            status,
+            stdout: output.into_bytes(),
+            stderr: Vec::new(),
+            flow: Flow::None,
+        }
+    }
+
+    fn builtin_zstyle(&mut self, args: &[String]) -> ExecResult {
+        if args.first().map(String::as_str) == Some("-d") {
+            if let (Some(pattern), Some(style)) = (args.get(1), args.get(2)) {
+                self.zstyles.remove(&(pattern.clone(), style.clone()));
+            }
+            return ExecResult::status(0);
+        }
+        if let Some(query) = args.first().map(String::as_str)
+            && matches!(query, "-s" | "-a" | "-t")
+        {
+            let (Some(pattern), Some(style)) = (args.get(1), args.get(2)) else {
+                return ExecResult::status(1);
+            };
+            let values = self.zstyles.get(&(pattern.clone(), style.clone()));
+            if query == "-t" {
+                return ExecResult::status(i32::from(values.is_none()));
+            }
+            let Some(name) = args.get(3) else {
+                return ExecResult::status(1);
+            };
+            let Some(values) = values.cloned() else {
+                return ExecResult::status(1);
+            };
+            if query == "-a" {
+                self.indexed_arrays.insert(
+                    name.clone(),
+                    values.into_iter().enumerate().collect::<BTreeMap<_, _>>(),
+                );
+            } else {
+                let _ = self.set_variable(name, values.join(" "), None, false);
+            }
+            return ExecResult::status(0);
+        }
+        let (Some(pattern), Some(style)) = (args.first(), args.get(1)) else {
+            return ExecResult::error(2, "isksh: zstyle: expected PATTERN STYLE [VALUE ...]");
+        };
+        self.zstyles.insert(
+            (pattern.clone(), style.clone()),
+            args.get(2..).unwrap_or_default().to_vec(),
+        );
+        ExecResult::status(0)
+    }
+
+    fn builtin_bindkey(&mut self, args: &[String]) -> ExecResult {
+        if args.is_empty() || args.first().map(String::as_str) == Some("-L") {
+            let stdout = self
+                .key_bindings
+                .iter()
+                .map(|((keymap, key), widget)| format!("bindkey -M {keymap} {key} {widget}\n"))
+                .collect::<String>()
+                .into_bytes();
+            return ExecResult {
+                stdout,
+                ..ExecResult::status(0)
+            };
+        }
+        if matches!(args.first().map(String::as_str), Some("-e" | "-v")) {
+            return ExecResult::status(0);
+        }
+        if matches!(args.first().map(String::as_str), Some("-A" | "-N")) {
+            let Some(target) = args.get(1) else {
+                return ExecResult::error(2, "isksh: bindkey: keymap name required");
+            };
+            let source = args.get(2).cloned().unwrap_or_else(|| "main".into());
+            let copied: Vec<_> = self
+                .key_bindings
+                .iter()
+                .filter(|((keymap, _), _)| keymap == &source)
+                .map(|((_, key), widget)| (key.clone(), widget.clone()))
+                .collect();
+            for (key, widget) in copied {
+                self.key_bindings.insert((target.clone(), key), widget);
+            }
+            return ExecResult::status(0);
+        }
+        if args.first().map(String::as_str) == Some("-D") {
+            for keymap in &args[1..] {
+                self.key_bindings
+                    .retain(|(binding, _), _| binding != keymap);
+            }
+            return ExecResult::status(0);
+        }
+        let (keymap, operands) = match args {
+            [flag] if flag == "-M" => {
+                return ExecResult::error(2, "isksh: bindkey: -M requires a keymap");
+            }
+            [flag, keymap, operands @ ..] if flag == "-M" => (keymap.clone(), operands),
+            _ => ("main".to_string(), args),
+        };
+        let Some((key, values)) = operands.split_first() else {
+            return ExecResult::status(0);
+        };
+        if values.is_empty() {
+            return match self.key_bindings.get(&(keymap, key.clone())) {
+                None => ExecResult::status(1),
+                Some(widget) => ExecResult {
+                    stdout: format!("{widget}\n").into_bytes(),
+                    ..ExecResult::status(0)
+                },
+            };
+        }
+        self.key_bindings
+            .insert((keymap, key.clone()), values[0].clone());
+        ExecResult::status(0)
+    }
+
+    fn builtin_zle(&mut self, args: &[String]) -> ExecResult {
+        match args.first().map(String::as_str) {
+            Some("-N") => {
+                let Some(widget) = args.get(1) else {
+                    return ExecResult::error(2, "isksh: zle: -N requires a widget");
+                };
+                let function = args.get(2).cloned().unwrap_or_else(|| widget.clone());
+                self.zle_widgets.insert(widget.clone(), function);
+                ExecResult::status(0)
+            }
+            Some("-D") => {
+                for widget in &args[1..] {
+                    self.zle_widgets.remove(widget);
+                }
+                ExecResult::status(0)
+            }
+            Some("-l") => ExecResult {
+                stdout: self
+                    .zle_widgets
+                    .keys()
+                    .map(|widget| format!("{widget}\n"))
+                    .collect::<String>()
+                    .into_bytes(),
+                ..ExecResult::status(0)
+            },
+            Some("-R") | Some("-M") => ExecResult::status(0),
+            Some(widget) => {
+                let Some(function) = self.zle_widgets.get(widget).cloned() else {
+                    return ExecResult::error(1, format!("isksh: zle: no such widget: {widget}"));
+                };
+                let Some(body) = self.functions.get(&function).cloned() else {
+                    return ExecResult::error(
+                        1,
+                        format!("isksh: zle: no such function: {function}"),
+                    );
+                };
+                self.execute_function(&function, &body, args[1..].to_vec(), &[])
+            }
+            None => ExecResult::status(0),
+        }
+    }
+
+    fn builtin_vared(&mut self, args: &[String], input: &[u8]) -> ExecResult {
+        let Some(name) = args.iter().find(|argument| !argument.starts_with('-')) else {
+            return ExecResult::error(2, "isksh: vared: variable name required");
+        };
+        let value = String::from_utf8_lossy(input)
+            .lines()
+            .next()
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| self.value_of(name).unwrap_or_default());
+        match self.set_variable(name, value, None, false) {
+            Ok(()) => ExecResult::status(0),
+            Err(message) => ExecResult::error(1, message),
+        }
+    }
+
+    fn builtin_compdef(&mut self, args: &[String]) -> ExecResult {
+        let Some((function, commands)) = args.split_first() else {
+            return ExecResult::status(1);
+        };
+        for command in commands {
+            self.completion_definitions
+                .insert(command.clone(), function.clone());
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_compadd(&mut self, args: &[String]) -> ExecResult {
+        let mut options = true;
+        let mut skip = false;
+        for argument in args {
+            if skip {
+                skip = false;
+                continue;
+            }
+            if argument == "--" {
+                options = false;
+                continue;
+            }
+            if options && matches!(argument.as_str(), "-M" | "-J" | "-V" | "-X" | "-P" | "-S") {
+                skip = true;
+                continue;
+            }
+            if options && argument.starts_with('-') {
+                continue;
+            }
+            if !self.completion_candidates.contains(argument) {
+                self.completion_candidates.push(argument.clone());
+            }
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_compset(&mut self, args: &[String]) -> ExecResult {
+        let Some(option) = args.first().map(String::as_str) else {
+            return ExecResult::status(1);
+        };
+        let amount = args
+            .get(1)
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(0);
+        let buffer = self.value_of("BUFFER").unwrap_or_default();
+        let characters: Vec<_> = buffer.chars().collect();
+        let split = amount.min(characters.len());
+        match option {
+            "-p" => {
+                let _ =
+                    self.set_variable("PREFIX", characters[..split].iter().collect(), None, false);
+            }
+            "-s" => {
+                let _ = self.set_variable(
+                    "SUFFIX",
+                    characters[characters.len().saturating_sub(split)..]
+                        .iter()
+                        .collect(),
+                    None,
+                    false,
+                );
+            }
+            _ => return ExecResult::error(2, "isksh: compset: unsupported option"),
+        }
+        ExecResult::status(0)
+    }
+
     fn builtin_pushd(&mut self, args: &[String]) -> ExecResult {
         if args.len() > 1 {
             return ExecResult::error(1, "isksh: pushd: too many arguments");
         }
         if let Some(target) = args.first() {
+            if let Some(index) = directory_stack_index(target, self.directory_stack.len() + 1) {
+                if index == 0 {
+                    return ExecResult {
+                        stdout: self.directory_listing(false, false).into_bytes(),
+                        ..ExecResult::status(0)
+                    };
+                }
+                let target = self.directory_stack.remove(index - 1);
+                let current = self.cwd.clone();
+                let mut result = self.change_directory(&target.to_string_lossy());
+                if result.status == 0 {
+                    self.push_directory(current);
+                    result.stdout = self.directory_listing(false, false).into_bytes();
+                }
+                return result;
+            }
             let previous = self.cwd.clone();
             let mut result = self.change_directory(target);
             if result.status == 0 {
-                self.directory_stack.insert(0, previous);
+                self.push_directory(previous);
                 result.stdout = self.directory_listing(false, false).into_bytes();
             }
             return result;
@@ -1720,7 +2503,37 @@ impl Shell {
         result
     }
 
+    fn push_directory(&mut self, path: PathBuf) {
+        if self.mode == ShellMode::Zsh && self.shell_options.contains("pushdignoredups") {
+            self.directory_stack.retain(|existing| existing != &path);
+        }
+        self.directory_stack.insert(0, path);
+    }
+
     fn builtin_popd(&mut self, args: &[String]) -> ExecResult {
+        if args.len() > 1 {
+            return ExecResult::error(1, "isksh: popd: unsupported argument");
+        }
+        if let Some(argument) = args.first()
+            && let Some(index) = directory_stack_index(argument, self.directory_stack.len() + 1)
+        {
+            if index == 0 {
+                let Some(target) = self.directory_stack.first().cloned() else {
+                    return ExecResult::error(1, "isksh: popd: directory stack empty");
+                };
+                let mut result = self.change_directory(&target.to_string_lossy());
+                if result.status == 0 {
+                    self.directory_stack.remove(0);
+                    result.stdout = self.directory_listing(false, false).into_bytes();
+                }
+                return result;
+            }
+            self.directory_stack.remove(index - 1);
+            return ExecResult {
+                stdout: self.directory_listing(false, false).into_bytes(),
+                ..ExecResult::status(0)
+            };
+        }
         if !args.is_empty() {
             return ExecResult::error(1, "isksh: popd: unsupported argument");
         }
@@ -1739,6 +2552,7 @@ impl Shell {
         let mut per_line = false;
         let mut indexed = false;
         let mut clear = false;
+        let mut selected = None;
         for argument in args {
             match argument.as_str() {
                 "-c" => {
@@ -1750,12 +2564,22 @@ impl Shell {
                     per_line = true;
                     indexed = true;
                 }
+                value if directory_stack_index(value, self.directory_stack.len() + 1).is_some() => {
+                    selected = directory_stack_index(value, self.directory_stack.len() + 1);
+                }
                 _ => return ExecResult::error(1, "isksh: dirs: unsupported argument"),
             }
         }
         ExecResult {
             stdout: if clear {
                 Vec::new()
+            } else if let Some(index) = selected {
+                let paths = std::iter::once(&self.cwd)
+                    .chain(self.directory_stack.iter())
+                    .collect::<Vec<_>>();
+                paths.get(index).map_or_else(Vec::new, |path| {
+                    format!("{}\n", path.display()).into_bytes()
+                })
             } else {
                 self.directory_listing(per_line, indexed).into_bytes()
             },
@@ -1826,11 +2650,17 @@ impl Shell {
         if self.trap_depth != 0 {
             return ExecResult::status(0);
         }
-        let Some(action) = self.traps.get(signal).cloned() else {
-            return ExecResult::status(0);
-        };
         self.trap_depth += 1;
-        let result = self.execute_eval(&[action], &[]);
+        let result = if let Some(action) = self.traps.get(signal).cloned() {
+            self.execute_eval(&[action], &[])
+        } else {
+            let function_name = format!("TRAP{}", signal.trim_start_matches("SIG"));
+            let Some(function) = self.functions.get(&function_name).cloned() else {
+                self.trap_depth -= 1;
+                return ExecResult::status(0);
+            };
+            self.execute_function(&function_name, &function, Vec::new(), &[])
+        };
         self.trap_depth -= 1;
         result
     }
@@ -1957,6 +2787,12 @@ impl Shell {
         let mut associative = false;
         let mut print = false;
         let mut global = false;
+        let mut exported = false;
+        let mut readonly = false;
+        let mut integer = false;
+        let mut lowercase = false;
+        let mut uppercase = false;
+        let mut width = None;
         let mut index = 0;
         while let Some(option) = args.get(index).filter(|value| value.starts_with('-')) {
             for flag in option[1..].chars() {
@@ -1965,6 +2801,16 @@ impl Shell {
                     'A' => associative = true,
                     'p' => print = true,
                     'g' => global = true,
+                    'x' => exported = true,
+                    'r' => readonly = true,
+                    'i' | 'F' | 'E' => integer = true,
+                    'l' => lowercase = true,
+                    'u' => uppercase = true,
+                    'L' | 'R' | 'Z' => {
+                        width = option[2..].parse::<usize>().ok();
+                        break;
+                    }
+                    't' | 'T' | 'U' | 'h' | 'H' => {}
                     _ => {
                         return ExecResult::error(
                             2,
@@ -2025,10 +2871,37 @@ impl Shell {
             } else if indexed {
                 self.associative_arrays.remove(name);
                 self.indexed_arrays.entry(name.to_string()).or_default();
-            } else if let Some(value) = value
-                && let Err(message) = self.set_variable(name, value.to_string(), None, false)
-            {
-                return ExecResult::error(1, message);
+            } else if let Some(value) = value {
+                let mut value = value.to_string();
+                if integer {
+                    value = match self.evaluate_arithmetic(&value) {
+                        Ok(value) => value.to_string(),
+                        Err(message) => return ExecResult::error(1, message),
+                    };
+                }
+                if lowercase {
+                    value.make_ascii_lowercase();
+                }
+                if uppercase {
+                    value.make_ascii_uppercase();
+                }
+                if let Some(width) = width {
+                    value = format!("{value:>width$}");
+                }
+                if let Err(message) = self.set_variable(name, value, Some(exported), false) {
+                    return ExecResult::error(1, message);
+                }
+                if readonly && let Some(variable) = self.variables.get_mut(name) {
+                    variable.readonly = true;
+                }
+            } else if exported || readonly {
+                let value = self.value_of(name).unwrap_or_default();
+                if let Err(message) = self.set_variable(name, value, Some(exported), false) {
+                    return ExecResult::error(1, message);
+                }
+                if readonly && let Some(variable) = self.variables.get_mut(name) {
+                    variable.readonly = true;
+                }
             }
         }
         ExecResult {
@@ -2165,7 +3038,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
-    fn builtin_double_bracket(&self, args: &[String]) -> ExecResult {
+    fn builtin_double_bracket(&mut self, args: &[String]) -> ExecResult {
         if args.last().map(String::as_str) != Some("]]") {
             return ExecResult::error(2, "isksh: [[: missing ]]");
         }
@@ -2757,12 +3630,56 @@ impl Shell {
     }
 
     fn builtin_alias(&mut self, args: &[String]) -> ExecResult {
-        if args.is_empty() {
-            let mut aliases: Vec<_> = self.aliases.iter().collect();
+        let mut global = false;
+        let mut suffix = false;
+        let mut list_form = false;
+        let mut index = 0;
+        while let Some(argument) = args.get(index) {
+            match argument.as_str() {
+                "-g" => global = true,
+                "-s" => suffix = true,
+                "-r" => {}
+                "-L" => list_form = true,
+                "--" | "-" => {
+                    index += 1;
+                    break;
+                }
+                value if value.starts_with('-') => {
+                    return ExecResult::error(
+                        2,
+                        format!("isksh: alias: unsupported option: {value}"),
+                    );
+                }
+                _ => break,
+            }
+            index += 1;
+        }
+        let aliases = if global {
+            &mut self.global_aliases
+        } else if suffix {
+            &mut self.suffix_aliases
+        } else {
+            &mut self.aliases
+        };
+        if args[index..].is_empty() {
+            let mut aliases: Vec<_> = aliases.iter().collect();
             aliases.sort_by_key(|(name, _)| *name);
             let stdout = aliases
                 .into_iter()
-                .map(|(name, value)| format!("alias {name}='{}'\n", value.replace('\'', "'\\''")))
+                .map(|(name, value)| {
+                    let prefix = if global {
+                        "alias -g"
+                    } else if suffix {
+                        "alias -s"
+                    } else {
+                        "alias"
+                    };
+                    if list_form {
+                        format!("{prefix} {name}='{}'\n", value.replace('\'', "'\\''"))
+                    } else {
+                        format!("{name}='{}'\n", value.replace('\'', "'\\''"))
+                    }
+                })
                 .collect::<String>()
                 .into_bytes();
             return ExecResult {
@@ -2770,10 +3687,10 @@ impl Shell {
                 ..ExecResult::status(0)
             };
         }
-        for argument in args {
+        for argument in &args[index..] {
             if let Some((name, value)) = argument.split_once('=') {
-                self.aliases.insert(name.to_string(), value.to_string());
-            } else if !self.aliases.contains_key(argument) {
+                aliases.insert(name.to_string(), value.to_string());
+            } else if !aliases.contains_key(argument) {
                 return ExecResult::error(1, format!("isksh: alias: {argument}: not found"));
             }
         }
@@ -2781,8 +3698,16 @@ impl Shell {
     }
 
     fn builtin_unalias(&mut self, args: &[String]) -> ExecResult {
-        for name in args {
+        if args.first().map(String::as_str) == Some("-a") {
+            self.aliases.clear();
+            self.global_aliases.clear();
+            self.suffix_aliases.clear();
+            return ExecResult::status(0);
+        }
+        for name in args.iter().filter(|name| !name.starts_with('-')) {
             self.aliases.remove(name);
+            self.global_aliases.remove(name);
+            self.suffix_aliases.remove(name);
         }
         ExecResult::status(0)
     }
@@ -2890,7 +3815,13 @@ impl Shell {
         allow_split: bool,
         allow_glob: bool,
     ) -> Result<Vec<String>, String> {
-        if matches!(word.parts.as_slice(), [WordPart::Parameter { expression, quoted: true }] if expression == "@")
+        if let [
+            WordPart::Parameter {
+                expression,
+                quoted: true,
+            },
+        ] = word.parts.as_slice()
+            && expression == "@"
         {
             return Ok(self.positional.clone());
         }
@@ -2946,9 +3877,12 @@ impl Shell {
                     if result.status != 0 && !result.stderr.is_empty() {
                         // Command substitution preserves stdout even when the command fails.
                     }
-                    let output = String::from_utf8(result.stdout).map_err(|_| {
-                        "command substitution produced non-UTF-8 output".to_string()
-                    })?;
+                    let output = match String::from_utf8(result.stdout) {
+                        Ok(output) => output,
+                        Err(_) => {
+                            return Err("command substitution produced non-UTF-8 output".into());
+                        }
+                    };
                     value.push_str(output.trim_end_matches('\n'));
                     split |= !quoted;
                     globbable |= !quoted;
@@ -3001,15 +3935,34 @@ impl Shell {
                 expanded.push(field);
                 continue;
             }
-            if !field.contains(['*', '?', '[']) {
+            let extended =
+                self.mode == ShellMode::Zsh && self.shell_options.contains("extendedglob");
+            let (include, exclude) = if extended {
+                if let Some(pattern) = field.strip_prefix('^') {
+                    ("*".to_string(), Some(pattern.to_string()))
+                } else if let Some((include, exclude)) = field.split_once('~') {
+                    (include.to_string(), Some(exclude.to_string()))
+                } else {
+                    (field.clone(), None)
+                }
+            } else {
+                (field.clone(), None)
+            };
+            if !include.contains(['*', '?', '[']) {
                 expanded.push(field);
                 continue;
             }
-            let absolute_pattern = self.resolve_path(&field).to_string_lossy().into_owned();
+            let absolute_pattern = self.resolve_path(&include).to_string_lossy().into_owned();
+            let exclude = exclude
+                .as_deref()
+                .map(Pattern::new)
+                .transpose()
+                .map_err(|error| error.to_string())?;
             let options = MatchOptions {
                 case_sensitive: !cfg!(windows),
                 require_literal_separator: true,
-                require_literal_leading_dot: !self.shell_options.contains("dotglob"),
+                require_literal_leading_dot: !self.shell_options.contains("dotglob")
+                    && !self.shell_options.contains("globdots"),
             };
             let mut matches = glob_with(&absolute_pattern, options)
                 .map_err(|error| error.to_string())?
@@ -3020,9 +3973,17 @@ impl Shell {
                         .to_string_lossy()
                         .replace('\\', "/")
                 })
+                .filter(|path| {
+                    !exclude
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.matches(path))
+                })
                 .collect::<Vec<_>>();
             matches.sort();
             if matches.is_empty() {
+                if self.mode == ShellMode::Zsh && self.shell_options.contains("nomatch") {
+                    return Err(format!("no matches found: {field}"));
+                }
                 if !self.shell_options.contains("nullglob") {
                     expanded.push(field);
                 }
@@ -3291,6 +4252,63 @@ impl Shell {
                 break;
             };
             index += 1;
+            if code == '(' {
+                let start = index;
+                let mut depth = 1usize;
+                while index < chars.len() && depth > 0 {
+                    depth += usize::from(chars[index] == '(');
+                    depth = depth.saturating_sub(usize::from(chars[index] == ')'));
+                    index += 1;
+                }
+                if depth != 0 {
+                    continue;
+                }
+                let expression: String = chars[start..index - 1].iter().collect();
+                let Some((test, alternatives)) = expression.split_once('.') else {
+                    continue;
+                };
+                let mut parts = alternatives.splitn(2, '.');
+                let yes = parts.next().unwrap_or_default();
+                let no = parts.next().unwrap_or_default();
+                let passes = match test.chars().last().unwrap_or('?') {
+                    '?' => status == 0,
+                    'j' => match self.background_jobs.lock() {
+                        Ok(jobs) => !jobs.is_empty(),
+                        Err(_) => false,
+                    },
+                    '#' => username.eq_ignore_ascii_case("root"),
+                    'L' => match self.value_of("SHLVL") {
+                        Some(value) => value != "0",
+                        None => false,
+                    },
+                    _ => false,
+                };
+                output.push_str(
+                    &self.expand_zsh_prompt_escapes(if passes { yes } else { no }, status),
+                );
+                continue;
+            }
+            if code.is_ascii_digit() {
+                let mut digits = code.to_string();
+                while chars.get(index).is_some_and(char::is_ascii_digit) {
+                    digits.push(chars[index]);
+                    index += 1;
+                }
+                if chars
+                    .get(index)
+                    .is_some_and(|value| matches!(value, '~' | 'd'))
+                {
+                    index += 1;
+                    let count = digits.parse::<usize>().unwrap_or(0);
+                    let components: Vec<_> = display_cwd.split(['/', '\\']).collect();
+                    let start = components.len().saturating_sub(count);
+                    output.push_str(&components[start..].join(std::path::MAIN_SEPARATOR_STR));
+                    continue;
+                }
+                output.push('%');
+                output.push_str(&digits);
+                continue;
+            }
             match code {
                 '%' => output.push('%'),
                 'n' => output.push_str(&username),
@@ -3303,10 +4321,45 @@ impl Shell {
                     '%'
                 }),
                 '?' => output.push_str(&status.to_string()),
+                'j' => {
+                    let count = match self.background_jobs.lock() {
+                        Ok(jobs) => jobs.len(),
+                        Err(_) => 0,
+                    };
+                    output.push_str(&count.to_string());
+                }
+                'L' => output.push_str(&self.value_of("SHLVL").unwrap_or_else(|| "1".into())),
+                'N' => output.push_str(&self.name),
+                'i' => output.push_str(&self.prompt_number.to_string()),
+                '_' => output.push_str(self.function_stack.last().map_or("", String::as_str)),
+                'D' => {
+                    let format = if chars.get(index) == Some(&'{') {
+                        index += 1;
+                        let start = index;
+                        while index < chars.len() && chars[index] != '}' {
+                            index += 1;
+                        }
+                        let format: String = chars[start..index].iter().collect();
+                        index += usize::from(index < chars.len());
+                        format
+                    } else {
+                        "%y-%m-%d".into()
+                    };
+                    output.push_str(&Local::now().format(&format).to_string());
+                }
+                'T' => output.push_str(&Local::now().format("%H:%M").to_string()),
+                't' | '@' => output.push_str(&Local::now().format("%l:%M%p").to_string()),
+                '*' => output.push_str(&Local::now().format("%H:%M:%S").to_string()),
+                'E' => output.push_str("\x1b[K"),
                 'f' => output.push_str("\x1b[39m"),
                 'k' => output.push_str("\x1b[49m"),
                 'B' => output.push_str("\x1b[1m"),
                 'b' => output.push_str("\x1b[22m"),
+                'S' => output.push_str("\x1b[7m"),
+                's' => output.push_str("\x1b[27m"),
+                'U' => output.push_str("\x1b[4m"),
+                'u' => output.push_str("\x1b[24m"),
+                'G' => {}
                 'F' | 'K' if chars.get(index) == Some(&'{') => {
                     index += 1;
                     let start = index;
@@ -3545,6 +4598,16 @@ impl Shell {
                 self.positional.get(index - 1).cloned()
             };
         }
+        if self.mode == ShellMode::Zsh {
+            match name {
+                "path" => return Some(self.zsh_path_values("PATH").join(" ")),
+                "fpath" => return Some(self.zsh_path_values("FPATH").join(" ")),
+                "funcstack" => return Some(self.function_stack.join(" ")),
+                "pipestatus" => return Some(self.array_values("PIPESTATUS").join(" ")),
+                "signals" => return Some(ZSH_SIGNALS.join(" ")),
+                _ => {}
+            }
+        }
         self.value_of(name)
     }
 
@@ -3601,6 +4664,7 @@ impl Shell {
         if let Some((name, subscript)) = parse_array_reference(target) {
             if let Some(values) = self.associative_arrays.get_mut(name) {
                 values.insert(subscript.to_string(), value);
+                self.sync_zsh_tied_array(name);
                 return Ok(());
             }
             let index = self
@@ -3610,6 +4674,7 @@ impl Shell {
                 .entry(name.to_string())
                 .or_default()
                 .insert(index, value);
+            self.sync_zsh_tied_array(name);
             Ok(())
         } else {
             self.set_variable(target, value, exported, false)
@@ -3617,6 +4682,56 @@ impl Shell {
     }
 
     fn array_value(&self, name: &str, subscript: &str) -> Option<String> {
+        if self.mode == ShellMode::Zsh {
+            match name {
+                "functions" => {
+                    return self
+                        .functions
+                        .contains_key(subscript)
+                        .then(|| format!("{subscript} () {{ ... }}"));
+                }
+                "builtins" => return is_builtin(subscript).then(|| "defined".to_string()),
+                "commands" => {
+                    let path = self.resolve_command_file(subscript);
+                    return path.is_file().then(|| path.to_string_lossy().into_owned());
+                }
+                "options" => {
+                    let option = normalize_zsh_option(subscript).0;
+                    return Some(if self.shell_options.contains(&option) {
+                        "on".into()
+                    } else {
+                        "off".into()
+                    });
+                }
+                "jobstates" => {
+                    let id = subscript.trim_start_matches('%').parse::<u32>().ok()?;
+                    return self
+                        .background_jobs
+                        .lock()
+                        .ok()?
+                        .contains_key(&id)
+                        .then(|| "running".into());
+                }
+                "path" => return self.zsh_array_element(self.zsh_path_values("PATH"), subscript),
+                "fpath" => {
+                    return self.zsh_array_element(self.zsh_path_values("FPATH"), subscript);
+                }
+                "funcstack" => {
+                    return self.zsh_array_element(self.function_stack.clone(), subscript);
+                }
+                "pipestatus" => return self.array_value("PIPESTATUS", subscript),
+                "signals" => {
+                    return self.zsh_array_element(
+                        ZSH_SIGNALS
+                            .iter()
+                            .map(|value| (*value).to_string())
+                            .collect(),
+                        subscript,
+                    );
+                }
+                _ => {}
+            }
+        }
         if let Some(values) = self.associative_arrays.get(name) {
             let key = subscript
                 .strip_prefix('$')
@@ -3634,22 +4749,68 @@ impl Shell {
 
     fn array_index(&self, subscript: &str) -> Option<usize> {
         let value = self.evaluate_arithmetic(subscript).ok()?;
-        usize::try_from(value).ok()
+        if self.mode == ShellMode::Zsh {
+            usize::try_from(if value == 0 { 0 } else { value.checked_sub(1)? }).ok()
+        } else {
+            usize::try_from(value).ok()
+        }
     }
 
     fn array_values(&self, name: &str) -> Vec<String> {
-        self.indexed_arrays
-            .get(name)
-            .map(|values| values.values().cloned().collect())
-            .or_else(|| {
-                self.associative_arrays
-                    .get(name)
-                    .map(|values| values.values().cloned().collect())
-            })
-            .unwrap_or_default()
+        if self.mode == ShellMode::Zsh {
+            match name {
+                "path" => return self.zsh_path_values("PATH"),
+                "fpath" => return self.zsh_path_values("FPATH"),
+                "funcstack" => return self.function_stack.clone(),
+                "pipestatus" => return self.array_values("PIPESTATUS"),
+                "signals" => {
+                    return ZSH_SIGNALS
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect();
+                }
+                "functions" => return self.functions.keys().cloned().collect(),
+                "builtins" => {
+                    return BUILTIN_NAMES
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect();
+                }
+                "options" => return self.shell_options.iter().cloned().collect(),
+                _ => {}
+            }
+        }
+        if let Some(values) = self.indexed_arrays.get(name) {
+            return values.values().cloned().collect();
+        }
+        if let Some(values) = self.associative_arrays.get(name) {
+            return values.values().cloned().collect();
+        }
+        Vec::new()
     }
 
     fn array_keys(&self, name: &str) -> Vec<String> {
+        if self.mode == ShellMode::Zsh {
+            match name {
+                "functions" => return self.functions.keys().cloned().collect(),
+                "builtins" => {
+                    return BUILTIN_NAMES
+                        .iter()
+                        .map(|value| (*value).to_string())
+                        .collect();
+                }
+                "options" => return self.shell_options.iter().cloned().collect(),
+                "commands" => return self.command_names_from_path(),
+                "jobstates" => {
+                    return self
+                        .background_jobs
+                        .lock()
+                        .map(|jobs| jobs.keys().map(|id| id.to_string()).collect())
+                        .unwrap_or_default();
+                }
+                _ => {}
+            }
+        }
         self.indexed_arrays
             .get(name)
             .map(|values| values.keys().map(ToString::to_string).collect())
@@ -3659,6 +4820,65 @@ impl Shell {
                     .map(|values| values.keys().cloned().collect())
             })
             .unwrap_or_default()
+    }
+
+    fn zsh_path_values(&self, variable: &str) -> Vec<String> {
+        let array = variable.to_ascii_lowercase();
+        self.indexed_arrays
+            .get(&array)
+            .map(|values| values.values().cloned().collect())
+            .unwrap_or_else(|| {
+                self.value_of(variable)
+                    .unwrap_or_default()
+                    .split(if cfg!(windows) { ';' } else { ':' })
+                    .map(ToOwned::to_owned)
+                    .collect()
+            })
+    }
+
+    fn zsh_array_element(&self, values: Vec<String>, subscript: &str) -> Option<String> {
+        let index = self.evaluate_arithmetic(subscript).ok()?;
+        let index = if index < 0 {
+            i64::try_from(values.len()).ok()?.checked_add(index)?
+        } else {
+            index.checked_sub(1)?
+        };
+        values.get(usize::try_from(index).ok()?).cloned()
+    }
+
+    fn sync_zsh_tied_array(&mut self, name: &str) {
+        if self.mode != ShellMode::Zsh || !matches!(name, "path" | "fpath") {
+            return;
+        }
+        let variable = name.to_ascii_uppercase();
+        let separator = if cfg!(windows) { ";" } else { ":" };
+        let value = self
+            .indexed_arrays
+            .get(name)
+            .map(|values| values.values().cloned().collect::<Vec<_>>().join(separator))
+            .unwrap_or_default();
+        let _ = self.set_variable(&variable, value, Some(true), false);
+    }
+
+    fn command_names_from_path(&self) -> Vec<String> {
+        let mut names = HashSet::new();
+        for directory in self.zsh_path_values("PATH") {
+            if let Ok(entries) = fs::read_dir(self.resolve_path(&directory)) {
+                for entry in entries.flatten() {
+                    if !entry.path().is_file() {
+                        continue;
+                    }
+                    let file_name = entry.file_name();
+                    let Some(name) = file_name.to_str() else {
+                        continue;
+                    };
+                    names.insert(name.to_string());
+                }
+            }
+        }
+        let mut names = names.into_iter().collect::<Vec<_>>();
+        names.sort();
+        names
     }
 
     fn finish_process_substitutions(&mut self) -> ExecResult {
@@ -3721,7 +4941,7 @@ fn format_array_declaration<'a>(
     format!("{prefix} {name}=({entries})\n")
 }
 
-fn evaluate_conditional(tokens: &[String], shell: &Shell) -> Result<bool, String> {
+fn evaluate_conditional(tokens: &[String], shell: &mut Shell) -> Result<bool, String> {
     if tokens.is_empty() {
         return Err("expression required".into());
     }
@@ -3750,32 +4970,71 @@ fn evaluate_conditional(tokens: &[String], shell: &Shell) -> Result<bool, String
             "-f" => shell.resolve_path(value).is_file(),
             "-d" => shell.resolve_path(value).is_dir(),
             "-r" => fs::File::open(shell.resolve_path(value)).is_ok(),
+            "-w" => fs::OpenOptions::new()
+                .write(true)
+                .open(shell.resolve_path(value))
+                .is_ok(),
+            "-x" => is_executable_file(&shell.resolve_path(value)),
+            "-s" => match fs::metadata(shell.resolve_path(value)) {
+                Ok(meta) => meta.len() > 0,
+                Err(_) => false,
+            },
+            "-L" | "-h" => match fs::symlink_metadata(shell.resolve_path(value)) {
+                Ok(meta) => meta.file_type().is_symlink(),
+                Err(_) => false,
+            },
+            "-p" => path_has_unix_type(&shell.resolve_path(value), true),
+            "-S" => path_has_unix_type(&shell.resolve_path(value), false),
+            "-o" => {
+                let (name, inverted) = normalize_zsh_option(value);
+                shell.shell_options.contains(&name) != inverted
+            }
             "-v" => {
-                shell.value_of(value).is_some()
-                    || parse_array_reference(value)
-                        .is_some_and(|(name, key)| shell.array_value(name, key).is_some())
+                if shell.value_of(value).is_some() {
+                    true
+                } else if let Some((name, key)) = parse_array_reference(value) {
+                    shell.array_value(name, key).is_some()
+                } else {
+                    false
+                }
             }
             _ => return Err(format!("unknown unary operator: {operator}")),
         }),
         [left, operator, right] => match operator.as_str() {
-            "=" | "==" => Pattern::new(right)
-                .map(|pattern| pattern.matches(left))
-                .map_err(|error| error.to_string()),
-            "!=" => Pattern::new(right)
-                .map(|pattern| !pattern.matches(left))
-                .map_err(|error| error.to_string()),
-            "=~" => Regex::new(right)
-                .map(|regex| regex.is_match(left))
-                .map_err(|error| error.to_string()),
+            "=" | "==" => match Pattern::new(right) {
+                Ok(pattern) => Ok(pattern.matches(left)),
+                Err(error) => Err(error.to_string()),
+            },
+            "!=" => match Pattern::new(right) {
+                Ok(pattern) => Ok(!pattern.matches(left)),
+                Err(error) => Err(error.to_string()),
+            },
+            "=~" => {
+                let regex = match Regex::new(right) {
+                    Ok(regex) => regex,
+                    Err(error) => return Err(error.to_string()),
+                };
+                let Some(captures) = regex.captures(left) else {
+                    return Ok(false);
+                };
+                let mut values = BTreeMap::new();
+                for (index, value) in captures.iter().skip(1).enumerate() {
+                    let value = match value {
+                        Some(value) => value.as_str(),
+                        None => "",
+                    };
+                    values.insert(index, value.to_string());
+                }
+                shell.indexed_arrays.insert("match".into(), values);
+                let matched = captures.get(0).expect("regex capture zero").as_str();
+                let _ = shell.set_variable("MATCH", matched.into(), None, false);
+                Ok(true)
+            }
             "<" => Ok(left < right),
             ">" => Ok(left > right),
             "-eq" | "-ne" | "-lt" | "-le" | "-gt" | "-ge" => {
-                let left = left
-                    .parse::<i64>()
-                    .map_err(|_| "integer expression expected".to_string())?;
-                let right = right
-                    .parse::<i64>()
-                    .map_err(|_| "integer expression expected".to_string())?;
+                let left = conditional_integer(left)?;
+                let right = conditional_integer(right)?;
                 Ok(match operator.as_str() {
                     "-eq" => left == right,
                     "-ne" => left != right,
@@ -3785,9 +5044,45 @@ fn evaluate_conditional(tokens: &[String], shell: &Shell) -> Result<bool, String
                     _ => left >= right,
                 })
             }
+            "-nt" | "-ot" => {
+                let left = path_modified_time(&shell.resolve_path(left))?;
+                let right = path_modified_time(&shell.resolve_path(right))?;
+                Ok(if operator == "-nt" {
+                    left > right
+                } else {
+                    left < right
+                })
+            }
+            "-ef" => {
+                let left = canonical_conditional_path(&shell.resolve_path(left))?;
+                let right = canonical_conditional_path(&shell.resolve_path(right))?;
+                Ok(left == right)
+            }
             _ => Err(format!("unknown binary operator: {operator}")),
         },
         _ => Err("invalid conditional expression".into()),
+    }
+}
+
+fn conditional_integer(value: &str) -> Result<i64, String> {
+    match value.parse() {
+        Ok(value) => Ok(value),
+        Err(_) => Err("integer expression expected".into()),
+    }
+}
+
+fn path_modified_time(path: &Path) -> Result<std::time::SystemTime, String> {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(metadata.modified().unwrap_or(std::time::UNIX_EPOCH))
+}
+
+fn canonical_conditional_path(path: &Path) -> Result<PathBuf, String> {
+    match fs::canonicalize(path) {
+        Ok(path) => Ok(path),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -3802,6 +5097,41 @@ fn conditional_operator(tokens: &[String], expected: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+        && path
+            .extension()
+            .and_then(|value| value.to_str())
+            .is_some_and(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "exe" | "com" | "bat" | "cmd"
+                )
+            })
+}
+
+#[cfg(unix)]
+fn path_has_unix_type(path: &Path, fifo: bool) -> bool {
+    fs::metadata(path).is_ok_and(|meta| {
+        if fifo {
+            meta.file_type().is_fifo()
+        } else {
+            meta.file_type().is_socket()
+        }
+    })
+}
+
+#[cfg(windows)]
+fn path_has_unix_type(_: &Path, _: bool) -> bool {
+    false
 }
 
 fn finish_external(name: &str, output: std::io::Result<std::process::Output>) -> ExecResult {
@@ -3859,11 +5189,17 @@ const BUILTIN_NAMES: &[&str] = &[
     "alias",
     "add-zsh-hook",
     "autoload",
+    "bindkey",
     "break",
     "builtin",
     "cd",
+    "chdir",
     "command",
     "continue",
+    "compadd",
+    "compdef",
+    "compinit",
+    "compset",
     "declare",
     "dirs",
     "echo",
@@ -3873,15 +5209,19 @@ const BUILTIN_NAMES: &[&str] = &[
     "exit",
     "export",
     "false",
+    "float",
+    "functions",
     "getopts",
     "hash",
     "help",
     "jobs",
     "let",
+    "integer",
     "local",
     "mapfile",
     "popd",
     "print",
+    "private",
     "printf",
     "pushd",
     "pwd",
@@ -3907,8 +5247,62 @@ const BUILTIN_NAMES: &[&str] = &[
     "unsetopt",
     "wait",
     "whence",
+    "where",
+    "which",
+    "vared",
+    "zle",
     "zmodload",
+    "zstyle",
 ];
+
+const ZSH_SIGNALS: &[&str] = &[
+    "EXIT", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV",
+    "USR2", "PIPE", "ALRM", "TERM", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU",
+];
+
+fn normalize_zsh_function_syntax(source: &str) -> String {
+    let named = Regex::new(
+        r"(?s)\bfunction\s+([A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\(\s*\))?\s*\{([^{}]*)\}",
+    )
+    .expect("valid zsh function regex");
+    let expanded = named.replace_all(source, |captures: &regex::Captures<'_>| {
+        captures[1]
+            .split_whitespace()
+            .map(|name| format!("{name}() {{{}}}", &captures[2]))
+            .collect::<Vec<_>>()
+            .join("; ")
+    });
+    let anonymous = Regex::new(r"(?s)(^|[;\n])\s*\(\s*\)\s*\{([^{}]*)\}\s*([^;\n]*)")
+        .expect("valid anonymous function regex");
+    anonymous
+        .replace_all(&expanded, |captures: &regex::Captures<'_>| {
+            format!(
+                "{} __isksh_anonymous() {{{}}}; __isksh_anonymous {}; unfunction __isksh_anonymous",
+                &captures[1], &captures[2], &captures[3]
+            )
+        })
+        .into_owned()
+}
+
+fn directory_stack_index(value: &str, length: usize) -> Option<usize> {
+    let (direction, digits) = value.split_at_checked(1)?;
+    let index = digits.parse::<usize>().ok()?;
+    match direction {
+        "+" if index < length => Some(index),
+        "-" if index < length => Some(length - index - 1),
+        _ => None,
+    }
+}
+
+fn normalize_zsh_option(option: &str) -> (String, bool) {
+    let normalized = option.to_ascii_lowercase().replace('_', "");
+    if matches!(normalized.as_str(), "nomatch" | "notify") {
+        return (normalized, false);
+    }
+    normalized
+        .strip_prefix("no")
+        .map_or((normalized.clone(), false), |name| (name.to_string(), true))
+}
 
 fn decode_echo_escapes(value: &str) -> String {
     value
@@ -4305,12 +5699,118 @@ impl<'a> ArithmeticParser<'a> {
     }
 
     fn parse(mut self) -> Result<i64, String> {
-        let value = self.expression()?;
+        let value = self.conditional()?;
         self.whitespace();
         if self.index == self.chars.len() {
             Ok(value)
         } else {
             Err("invalid arithmetic expression".into())
+        }
+    }
+
+    fn conditional(&mut self) -> Result<i64, String> {
+        let condition = self.logical_or()?;
+        self.whitespace();
+        if !self.consume('?') {
+            return Ok(condition);
+        }
+        let yes = self.conditional()?;
+        self.whitespace();
+        if !self.consume(':') {
+            return Err("missing ':' in conditional expression".into());
+        }
+        let no = self.conditional()?;
+        Ok(if condition != 0 { yes } else { no })
+    }
+
+    fn logical_or(&mut self) -> Result<i64, String> {
+        let mut value = self.logical_and()?;
+        while self.consume_str("||") {
+            let right = self.logical_and()?;
+            value = i64::from(value != 0 || right != 0);
+        }
+        Ok(value)
+    }
+
+    fn logical_and(&mut self) -> Result<i64, String> {
+        let mut value = self.bit_or()?;
+        while self.consume_str("&&") {
+            let right = self.bit_or()?;
+            value = i64::from(value != 0 && right != 0);
+        }
+        Ok(value)
+    }
+
+    fn bit_or(&mut self) -> Result<i64, String> {
+        let mut value = self.bit_xor()?;
+        loop {
+            self.whitespace();
+            if self.starts_with("||") || !self.consume('|') {
+                return Ok(value);
+            }
+            value |= self.bit_xor()?;
+        }
+    }
+
+    fn bit_xor(&mut self) -> Result<i64, String> {
+        let mut value = self.bit_and()?;
+        while self.consume_str("^") {
+            value ^= self.bit_and()?;
+        }
+        Ok(value)
+    }
+
+    fn bit_and(&mut self) -> Result<i64, String> {
+        let mut value = self.equality()?;
+        loop {
+            self.whitespace();
+            if self.starts_with("&&") || !self.consume('&') {
+                return Ok(value);
+            }
+            value &= self.equality()?;
+        }
+    }
+
+    fn equality(&mut self) -> Result<i64, String> {
+        let mut value = self.comparison()?;
+        loop {
+            if self.consume_str("==") {
+                value = i64::from(value == self.comparison()?);
+            } else if self.consume_str("!=") {
+                value = i64::from(value != self.comparison()?);
+            } else {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn comparison(&mut self) -> Result<i64, String> {
+        let mut value = self.shift()?;
+        loop {
+            if self.consume_str("<=") {
+                value = i64::from(value <= self.shift()?);
+            } else if self.consume_str(">=") {
+                value = i64::from(value >= self.shift()?);
+            } else if self.consume_str("<") {
+                value = i64::from(value < self.shift()?);
+            } else if self.consume_str(">") {
+                value = i64::from(value > self.shift()?);
+            } else {
+                return Ok(value);
+            }
+        }
+    }
+
+    fn shift(&mut self) -> Result<i64, String> {
+        let mut value = self.expression()?;
+        loop {
+            if self.consume_str("<<") {
+                value = value.wrapping_shl(self.expression()? as u32);
+            } else if self.consume_str(">>") {
+                value = value.wrapping_shr(self.expression()? as u32);
+            } else {
+                return Ok(value);
+            }
         }
     }
 
@@ -4329,19 +5829,19 @@ impl<'a> ArithmeticParser<'a> {
     }
 
     fn term(&mut self) -> Result<i64, String> {
-        let mut value = self.factor()?;
+        let mut value = self.power()?;
         loop {
             self.whitespace();
             if self.consume('*') {
-                value = value.wrapping_mul(self.factor()?);
+                value = value.wrapping_mul(self.power()?);
             } else if self.consume('/') {
-                let right = self.factor()?;
+                let right = self.power()?;
                 if right == 0 {
                     return Err("division by zero".into());
                 }
                 value /= right;
             } else if self.consume('%') {
-                let right = self.factor()?;
+                let right = self.power()?;
                 if right == 0 {
                     return Err("division by zero".into());
                 }
@@ -4349,6 +5849,16 @@ impl<'a> ArithmeticParser<'a> {
             } else {
                 return Ok(value);
             }
+        }
+    }
+
+    fn power(&mut self) -> Result<i64, String> {
+        let value = self.factor()?;
+        if self.consume_str("**") {
+            let exponent = u32::try_from(self.power()?).map_err(|_| "negative exponent")?;
+            Ok(value.wrapping_pow(exponent))
+        } else {
+            Ok(value)
         }
     }
 
@@ -4374,8 +5884,14 @@ impl<'a> ArithmeticParser<'a> {
         if self.consume('+') {
             return self.factor();
         }
+        if self.consume('!') {
+            return Ok(i64::from(self.factor()? == 0));
+        }
+        if self.consume('~') {
+            return Ok(!self.factor()?);
+        }
         if self.consume('(') {
-            let value = self.expression()?;
+            let value = self.conditional()?;
             self.whitespace();
             if !self.consume(')') {
                 return Err("missing ')' in arithmetic expression".into());
@@ -4385,7 +5901,7 @@ impl<'a> ArithmeticParser<'a> {
         let start = self.index;
         while self
             .peek()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '#'))
         {
             self.index += 1;
         }
@@ -4393,7 +5909,21 @@ impl<'a> ArithmeticParser<'a> {
             return Err("expected arithmetic operand".into());
         }
         let token: String = self.chars[start..self.index].iter().collect();
-        if let Ok(value) = token.parse() {
+        if let Some((base, digits)) = token.split_once('#') {
+            let base = match base.parse::<u32>() {
+                Ok(base) => base,
+                Err(_) => return Err("invalid arithmetic base".into()),
+            };
+            match i64::from_str_radix(digits, base) {
+                Ok(value) => Ok(value),
+                Err(_) => Err("invalid arithmetic constant".into()),
+            }
+        } else if let Some(hex) = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+        {
+            i64::from_str_radix(hex, 16).map_err(|_| "invalid arithmetic constant".into())
+        } else if let Ok(value) = token.parse() {
             Ok(value)
         } else {
             Ok(self
@@ -4415,6 +5945,21 @@ impl<'a> ArithmeticParser<'a> {
     fn consume(&mut self, expected: char) -> bool {
         if self.peek() == Some(expected) {
             self.index += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn starts_with(&mut self, expected: &str) -> bool {
+        self.whitespace();
+        let expected = expected.chars().collect::<Vec<_>>();
+        self.chars[self.index..].starts_with(&expected)
+    }
+
+    fn consume_str(&mut self, expected: &str) -> bool {
+        if self.starts_with(expected) {
+            self.index += expected.chars().count();
             true
         } else {
             false
@@ -5867,7 +7412,7 @@ mod tests {
             .unwrap()
             .contains("shell builtin")
         );
-        assert_eq!(shell.run("whence -x print", &[]).status, 2);
+        assert_eq!(shell.run("whence -x print", &[]).status, 1);
 
         assert_eq!(shell.run("emulate", &[]).stdout, b"zsh\n");
         assert_eq!(shell.run("emulate -LR zsh", &[]).status, 0);
@@ -6272,5 +7817,650 @@ mod tests {
         assert!(!shell.run("abbr --help", &[]).stdout.is_empty());
         assert_eq!(shell.run("abbr -e -- --dash c zz", &[]).status, 0);
         assert!(shell.run("abbr --list", &[]).stdout.is_empty());
+    }
+
+    #[test]
+    fn supports_extended_zsh_runtime_compatibility() {
+        let mut shell = Shell::default();
+        shell.run("ISKSH_MODE=zsh", &[]);
+        shell.refresh_mode();
+
+        assert_eq!(
+            shell
+                .run(
+                    "setopt AUTO_CD AUTO_PUSHD EXTENDED_GLOB PROMPT_SUBST LOCAL_OPTIONS",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert!(
+            String::from_utf8(shell.run("setopt", &[]).stdout)
+                .unwrap()
+                .contains("autocd")
+        );
+        assert_eq!(shell.run("unsetopt NO_AUTO_CD", &[]).status, 0);
+        assert_ne!(shell.run("setopt NONO_BAD", &[]).status, 0);
+
+        shell.run("PATH=/one:/two; FPATH=/functions:/more", &[]);
+        assert_eq!(
+            shell.run("print -r -- ${path[1]}:${fpath[2]}", &[]).stdout,
+            b"/one:/more\n"
+        );
+        shell.run("path=(/bin /usr/bin); fpath=(/tmp /opt)", &[]);
+        assert!(shell.value_of("PATH").unwrap().contains("/bin"));
+        assert!(shell.array_keys("builtins").contains(&"print".to_string()));
+        assert!(!shell.array_keys("commands").is_empty());
+        assert_eq!(
+            shell.array_value("options", "autopushd").as_deref(),
+            Some("on")
+        );
+        assert!(shell.array_values("signals").contains(&"INT".to_string()));
+        assert!(shell.array_values("functions").is_empty());
+
+        shell.run("alias -g G='world'; alias -s txt='print suffix'", &[]);
+        assert_eq!(shell.run("print hello G", &[]).stdout, b"hello world\n");
+        assert_eq!(shell.run("sample.txt", &[]).stdout, b"suffix sample.txt\n");
+        assert!(
+            String::from_utf8(shell.run("alias -g -L", &[]).stdout)
+                .unwrap()
+                .contains("alias -g")
+        );
+        assert_eq!(shell.run("unalias G txt", &[]).status, 0);
+
+        shell.run(
+            "function first second { print function; }; functions -t first; first",
+            &[],
+        );
+        assert!(shell.functions.contains_key("second"));
+        assert!(shell.traced_functions.contains("first"));
+        assert_eq!(shell.run("functions +t first", &[]).status, 0);
+        assert!(!shell.traced_functions.contains("first"));
+        assert_eq!(
+            shell.run("() { print anonymous; }", &[]).stdout,
+            b"anonymous\n"
+        );
+
+        shell.run("events=''; pre() { events=${events}p; }; hist() { events=${events}h; }; bye() { events=${events}x; }; add-zsh-hook preexec pre; add-zsh-hook zshaddhistory hist; add-zsh-hook zshexit bye", &[]);
+        assert!(shell.record_history("print history"));
+        assert!(shell.value_of("events").unwrap().contains('h'));
+        shell.run("exit 0", &[]);
+        assert!(shell.value_of("events").unwrap().contains('x'));
+
+        assert_eq!(
+            shell
+                .evaluate_arithmetic("2 ** 3 + (8 >> 1) + (1 ? 2 : 9) | 1")
+                .unwrap(),
+            15
+        );
+        assert_eq!(shell.evaluate_arithmetic("16#ff").unwrap(), 255);
+        assert_eq!(shell.evaluate_arithmetic("!0 && ~0 != 0 || 0").unwrap(), 1);
+        assert_eq!(
+            shell.run("[[ abc123 =~ '([a-z]+)([0-9]+)' ]]", &[]).status,
+            0
+        );
+        assert_eq!(shell.value_of("MATCH").as_deref(), Some("abc123"));
+        assert_eq!(shell.array_value("match", "1").as_deref(), Some("abc"));
+        assert_eq!(shell.run("[[ -o AUTO_PUSHD ]]", &[]).status, 0);
+
+        shell
+            .set_variable("SHLVL", "2".into(), None, false)
+            .unwrap();
+        let prompt = shell
+            .expand_zsh_prompt_escapes("%(?.ok.bad):%j:%L:%N:%i:%D{%Y}:%T:%*:%Sx%s:%Uy%u:%E", 0);
+        assert!(prompt.starts_with("ok:0:2:isksh:"));
+        assert!(prompt.contains("\x1b[7mx\x1b[27m"));
+        shell
+            .set_variable("RPROMPT", "right:%?".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.right_prompt(), "right:0");
+
+        assert_eq!(shell.run("zstyle ':completion:*' matcher-list 'm:{a-z}={A-Z}'; zstyle -s ':completion:*' matcher-list MATCHER", &[]).status, 0);
+        assert!(shell.value_of("MATCHER").is_some());
+        assert_eq!(
+            shell
+                .run(
+                    "compinit; compdef _files edit; compadd -J files -- alpha beta; compset -p 2",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert_eq!(shell.configured_completion_candidates(), ["alpha", "beta"]);
+        shell.run("widget() { BUFFER=changed; region_highlight=(one two); }; zle -N custom widget; bindkey -M main '^X' custom", &[]);
+        assert_eq!(shell.run("zle custom", &[]).status, 0);
+        assert_eq!(shell.value_of("BUFFER").as_deref(), Some("changed"));
+        assert_eq!(shell.run("bindkey -M main '^X'", &[]).stdout, b"custom\n");
+        assert_eq!(shell.run("vared VALUE", b"edited\n").status, 0);
+        assert_eq!(shell.value_of("VALUE").as_deref(), Some("edited"));
+
+        assert_eq!(
+            shell.run("items=(c a b); print -o -a items", &[]).stdout,
+            b"a b c\n"
+        );
+        assert_eq!(shell.run("print -m 'a*' aa bb", &[]).stdout, b"aa\n");
+        assert_eq!(
+            shell
+                .run(
+                    "typeset -iu NUMBER=2+3; typeset -l LOWER=ABC; typeset -u UPPER=abc",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert_eq!(shell.value_of("NUMBER").as_deref(), Some("5"));
+        assert_eq!(shell.value_of("LOWER").as_deref(), Some("abc"));
+        assert_eq!(shell.value_of("UPPER").as_deref(), Some("ABC"));
+        assert_eq!(
+            shell.run("whence -w print", &[]).stdout,
+            b"print: builtin\n"
+        );
+        assert_eq!(shell.run("whence -m 'pri*'", &[]).status, 0);
+        shell.run("TRAPINT() { TRAPPED=yes; }", &[]);
+        assert_eq!(shell.run_trap("INT").status, 0);
+        assert_eq!(shell.value_of("TRAPPED").as_deref(), Some("yes"));
+    }
+
+    #[test]
+    fn covers_extended_zsh_compatibility_errors_and_variants() {
+        let mut shell = Shell::default();
+        shell.run("ISKSH_MODE=zsh", &[]);
+        shell.refresh_mode();
+        assert!(shell.record_history(" hidden"));
+        shell.run(
+            "setopt HIST_IGNORE_SPACE HIST_IGNORE_DUPS HIST_REDUCE_BLANKS",
+            &[],
+        );
+        assert!(!shell.record_history(" hidden"));
+        assert!(shell.record_history("print   one"));
+        assert!(!shell.record_history("print   one"));
+
+        assert_ne!(shell.run("autoload +X missing", &[]).status, 0);
+        assert_eq!(shell.run("autoload -Uz name; autoload", &[]).status, 0);
+        assert_eq!(
+            shell
+                .run(
+                    "zmodload zsh/complist; zmodload -L; zmodload -u zsh/complist",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert_ne!(shell.builtin_functions(&["absent".into()]).status, 0);
+        assert_eq!(shell.run("zstyle -t ':x' missing", &[]).status, 1);
+        assert_eq!(shell.run("zstyle -d ':x' style", &[]).status, 0);
+        assert_ne!(shell.run("bindkey -M", &[]).status, 0);
+        assert_eq!(
+            shell
+                .run("bindkey -e; bindkey -N copy main; bindkey -D copy", &[])
+                .status,
+            0
+        );
+        assert_ne!(shell.run("zle missing", &[]).status, 0);
+        assert_eq!(shell.run("zle -l; zle -D missing; zle -R", &[]).status, 0);
+        assert_ne!(shell.run("compset -x 1", &[]).status, 0);
+        assert_eq!(shell.run("BUFFER=abcd; compset -s 2", &[]).status, 0);
+        assert_eq!(shell.value_of("SUFFIX").as_deref(), Some("cd"));
+        assert_ne!(shell.run("print -m '[' a", &[]).status, 0);
+        assert_ne!(shell.run("print -a", &[]).status, 0);
+        assert_ne!(shell.run("whence -q print", &[]).status, 0);
+        assert_ne!(shell.run("emulate -c", &[]).status, 0);
+        assert_eq!(
+            shell.run("emulate -LR zsh -c 'print local'", &[]).stdout,
+            b"local\n"
+        );
+        assert_ne!(shell.run("[[ -o MISSING ]]", &[]).status, 0);
+        assert_ne!(shell.run("[[ file -nt missing ]]", &[]).status, 0);
+        assert_eq!(directory_stack_index("+0", 1), Some(0));
+        assert_eq!(directory_stack_index("-0", 1), Some(0));
+        assert_eq!(directory_stack_index("+2", 1), None);
+    }
+
+    #[test]
+    fn covers_remaining_zsh_compatibility_paths() {
+        // SAFETY: the coverage task runs this module with one test thread.
+        unsafe { std::env::set_var("ISKSH_MODE", "zsh") };
+        let mut shell = Shell::default();
+        unsafe { std::env::remove_var("ISKSH_MODE") };
+        assert_eq!(shell.mode(), ShellMode::Zsh);
+        let mut bash = shell.clone();
+        bash.mode = ShellMode::Bash;
+        assert!(bash.record_history("plain"));
+        assert!(bash.right_prompt().is_empty());
+        shell.variables.remove("RPROMPT");
+        shell
+            .set_variable("RPS1", "alternate".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.right_prompt(), "alternate");
+        shell.variables.remove("RPS1");
+        assert!(shell.right_prompt().is_empty());
+        shell.global_aliases.insert("Q".into(), "quoted".into());
+        assert!(
+            shell
+                .expand_zsh_aliases("print \"a\\\"Q\" \\Q")
+                .contains("Q")
+        );
+        shell.zshaddhistory_hooks.push("false".into());
+        assert!(!shell.record_history("rejected"));
+        shell.zshaddhistory_hooks.clear();
+
+        let root = tempfile::tempdir().unwrap();
+        let functions = root.path().join("functions");
+        fs::create_dir(&functions).unwrap();
+        fs::write(functions.join("loaded"), "print autoloaded $1").unwrap();
+        shell
+            .set_variable(
+                "FPATH",
+                functions.to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            shell.run("autoload -Uz loaded; loaded value", &[]).stdout,
+            b"autoloaded value\n"
+        );
+        assert!(!shell.autoload_functions.contains("loaded"));
+        assert_eq!(shell.run("functions", &[]).status, 0);
+        shell.autoload_functions.insert("placeholder".into());
+        assert!(
+            String::from_utf8(shell.run("functions placeholder", &[]).stdout)
+                .unwrap()
+                .contains("undefined")
+        );
+        assert_eq!(shell.run("autoload +X loaded", &[]).status, 0);
+        shell.indexed_arrays.insert(
+            "fpath".into(),
+            [(0, functions.to_string_lossy().into_owned())]
+                .into_iter()
+                .collect(),
+        );
+        fs::write(functions.join("indexed_load"), "print indexed").unwrap();
+        assert_eq!(
+            shell.run("autoload indexed_load; indexed_load", &[]).stdout,
+            b"indexed\n"
+        );
+        assert_ne!(
+            shell
+                .run("autoload absent_autoload; absent_autoload", &[])
+                .status,
+            0
+        );
+        fs::write(functions.join("unreadable"), [0xff]).unwrap();
+        let _ = shell.run("autoload +X unreadable", &[]);
+        assert_eq!(shell.run("zmodload -f ignored zsh/example", &[]).status, 0);
+
+        let folder = root.path().join("folder");
+        let other = root.path().join("other");
+        fs::create_dir(&folder).unwrap();
+        fs::create_dir(&other).unwrap();
+        shell.cwd = root.path().to_path_buf();
+        shell.shell_options.insert("autocd".into());
+        shell.shell_options.insert("autopushd".into());
+        assert_eq!(shell.run("folder", &[]).status, 0);
+        assert_eq!(shell.cwd, folder.canonicalize().unwrap());
+        assert_eq!(shell.builtin_cd(&["+1".into()]).status, 0);
+        shell.cwd = root.path().to_path_buf();
+        shell.directory_stack = vec![folder.clone(), other.clone()];
+        assert_eq!(shell.builtin_pushd(&["+0".into()]).status, 0);
+        assert_eq!(shell.builtin_pushd(&["+2".into()]).status, 0);
+        assert_eq!(shell.builtin_dirs(&["-1".into()]).status, 0);
+        assert_eq!(shell.builtin_popd(&["+1".into()]).status, 0);
+        shell.directory_stack = vec![folder.clone()];
+        assert_eq!(shell.builtin_popd(&["+0".into()]).status, 0);
+        assert_ne!(shell.builtin_popd(&["+1".into(), "+2".into()]).status, 0);
+        shell.directory_stack.clear();
+        assert_ne!(shell.builtin_popd(&["+0".into()]).status, 0);
+        shell.shell_options.insert("pushdignoredups".into());
+        shell.directory_stack = vec![folder.clone()];
+        shell.push_directory(folder.clone());
+        assert_eq!(shell.directory_stack.len(), 1);
+
+        assert_eq!(shell.run("print -O c a b", &[]).stdout, b"c b a\n");
+        assert_eq!(shell.run("print -l a b", &[]).stdout, b"a\nb\n");
+        assert_eq!(shell.run("print -N a b", &[]).stdout, b"a\0b\0");
+        assert_eq!(shell.run("print -C2 a b c", &[]).stdout, b"a b\nc\n");
+        assert_eq!(shell.run("print -c 2 a b c", &[]).stdout, b"a b\nc\n");
+        assert_eq!(shell.run("print -bDispSz value", &[]).status, 0);
+        assert_ne!(shell.run("print -C", &[]).status, 0);
+
+        shell.run("alias normal='print normal'; named() { :; }", &[]);
+        let external_normal = root.path().join("normal");
+        fs::write(&external_normal, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            let mut permissions = fs::metadata(&external_normal).unwrap().permissions();
+            permissions.set_mode(0o700);
+            fs::set_permissions(&external_normal, permissions).unwrap();
+        }
+        let old_path = shell.value_of("PATH").unwrap_or_default();
+        shell
+            .set_variable(
+                "PATH",
+                format!(
+                    "{}{}{}",
+                    root.path().display(),
+                    if cfg!(windows) { ";" } else { ":" },
+                    old_path
+                ),
+                None,
+                false,
+            )
+            .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid = root.path().join(std::ffi::OsString::from_vec(vec![0xff]));
+            fs::write(&invalid, "x").unwrap();
+            let _ = shell.command_names_from_path();
+            fs::remove_file(invalid).unwrap();
+        }
+        let configured_path = shell.value_of("PATH").unwrap();
+        shell
+            .set_variable(
+                "PATH",
+                root.path()
+                    .join("absent-path")
+                    .to_string_lossy()
+                    .into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        assert!(shell.command_names_from_path().is_empty());
+        shell
+            .set_variable("PATH", configured_path, None, false)
+            .unwrap();
+        shell
+            .suffix_aliases
+            .insert("suffix".into(), "print suffix".into());
+        assert!(
+            String::from_utf8(shell.run("alias -s -L", &[]).stdout)
+                .unwrap()
+                .contains("alias -s")
+        );
+        assert_eq!(
+            shell.run("thing.suffix extra argument", &[]).stdout,
+            b"suffix thing.suffix extra argument\n"
+        );
+        assert_eq!(shell.run("whence -pf normal", &[]).status, 1);
+        assert_eq!(shell.run("whence -p named", &[]).status, 1);
+        assert_eq!(shell.run("whence -f named", &[]).status, 0);
+        assert_eq!(shell.run("whence -c sh", &[]).status, 0);
+        assert_eq!(shell.run("whence -a print", &[]).status, 0);
+        assert_eq!(shell.run("whence -a normal", &[]).status, 0);
+        assert_eq!(shell.run("whence -S sh", &[]).status, 0);
+
+        assert_eq!(
+            shell
+                .run(
+                    "zstyle ':x' list one two; zstyle -a ':x' list STYLE_ARRAY",
+                    &[]
+                )
+                .status,
+            0
+        );
+        assert_eq!(shell.array_values("STYLE_ARRAY"), ["one", "two"]);
+        assert_eq!(shell.run("zstyle -s ':none' value TARGET", &[]).status, 1);
+        assert_eq!(shell.run("zstyle -s ':x' list", &[]).status, 1);
+        assert_eq!(shell.run("zstyle -s", &[]).status, 1);
+        assert_ne!(shell.run("zstyle", &[]).status, 0);
+        shell.run("bindkey -M main key widget", &[]);
+        assert!(
+            String::from_utf8(shell.run("bindkey -L", &[]).stdout)
+                .unwrap()
+                .contains("widget")
+        );
+        assert_eq!(shell.run("bindkey -A copy", &[]).status, 0);
+        assert_eq!(shell.run("bindkey -D copy", &[]).status, 0);
+        assert_ne!(shell.run("bindkey -A", &[]).status, 0);
+        assert_eq!(shell.run("bindkey -M empty", &[]).status, 0);
+        assert_eq!(
+            shell.builtin_bindkey(&["-M".into(), "main".into()]).status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_bindkey(&["-M".into(), "main".into(), "direct".into(), "widget".into()])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_bindkey(&["direct2".into(), "widget".into()])
+                .status,
+            0
+        );
+        assert_eq!(shell.run("bindkey -M main absent", &[]).status, 1);
+        assert_ne!(shell.run("zle -N", &[]).status, 0);
+        shell.run("default_widget() { :; }; zle -N default_widget", &[]);
+        assert!(
+            String::from_utf8(shell.run("zle -l", &[]).stdout)
+                .unwrap()
+                .contains("default_widget")
+        );
+        shell.zle_widgets.insert("broken".into(), "absent".into());
+        assert_ne!(shell.run("zle broken", &[]).status, 0);
+        assert_eq!(shell.run("zle", &[]).status, 0);
+        assert_ne!(shell.run("vared", &[]).status, 0);
+        shell
+            .set_variable("CURRENT", "kept".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.builtin_vared(&["CURRENT".into()], b"").status, 0);
+        shell.run("typeset -r LOCKED=value", &[]);
+        assert_ne!(shell.builtin_vared(&["LOCKED".into()], b"new\n").status, 0);
+        assert_eq!(shell.run("compdef", &[]).status, 1);
+        assert_eq!(
+            shell.run("compadd -M matcher -P pre -- gamma", &[]).status,
+            0
+        );
+        assert_eq!(shell.run("compadd -M", &[]).status, 0);
+        assert_eq!(shell.run("compadd gamma", &[]).status, 0);
+        assert_eq!(shell.run("compadd -q", &[]).status, 0);
+        assert_eq!(shell.run("compset", &[]).status, 1);
+
+        assert_eq!(
+            shell
+                .run("integer INT=3+4; float FLOAT=5; private PRIVATE=x", &[])
+                .status,
+            0
+        );
+        assert_eq!(shell.run("typeset -x EXPORTED=value; typeset -r READONLY; typeset -L5 PAD=x; typeset -th META=y", &[]).status, 0);
+        assert_eq!(shell.value_of("PAD").as_deref(), Some("    x"));
+        assert_ne!(shell.run("typeset -i BAD=invalid+", &[]).status, 0);
+        assert_ne!(shell.run("typeset -r LOCKED=again", &[]).status, 0);
+        assert_ne!(shell.run("typeset -x LOCKED", &[]).status, 0);
+        assert_eq!(shell.run("typeset -r FRESH", &[]).status, 0);
+        assert_eq!(shell.run("typeset -x NEW_EXPORT", &[]).status, 0);
+        assert_eq!(shell.run("typeset PLAIN", &[]).status, 0);
+        assert_eq!(shell.run("alias -- normal", &[]).status, 0);
+        assert_ne!(shell.run("alias -x", &[]).status, 0);
+        assert_eq!(shell.run("unalias -a", &[]).status, 0);
+
+        fs::write(root.path().join("keep.txt"), "x").unwrap();
+        fs::write(root.path().join("skip.log"), "x").unwrap();
+        shell.cwd = root.path().to_path_buf();
+        shell.shell_options.insert("extendedglob".into());
+        assert_eq!(shell.run("print ^*.log", &[]).status, 0);
+        assert_eq!(shell.run("print *~*.log", &[]).status, 0);
+        assert_ne!(shell.run("print *.missing", &[]).status, 0);
+        assert_ne!(shell.run("print *~[", &[]).status, 0);
+
+        shell
+            .set_variable("USER", "root".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("SHLVL", "0".into(), None, false)
+            .unwrap();
+        shell.function_stack.push("inside".into());
+        let prompt = shell.expand_zsh_prompt_escapes(
+            "%(#.root.user)%(L.high.low)%(x.y.n)%(broken):%12~:%12x:%_:%D:%t:%@:%G",
+            1,
+        );
+        assert!(prompt.contains("rootlow"));
+        assert!(prompt.contains("inside"));
+        assert_eq!(shell.expand_zsh_prompt_escapes("%(", 0), "");
+        shell.variables.remove("SHLVL");
+        assert!(shell.expand_zsh_prompt_escapes("%(L.y.n)", 0).contains('n'));
+        assert_eq!(shell.expand_zsh_prompt_escapes("%L", 0), "1");
+
+        shell.run("shown() { :; }", &[]);
+        assert!(shell.array_value("functions", "shown").is_some());
+        assert_eq!(
+            shell.array_value("builtins", "print").as_deref(),
+            Some("defined")
+        );
+        assert!(
+            shell
+                .array_values("functions")
+                .contains(&"shown".to_string())
+        );
+        assert!(
+            shell
+                .array_values("builtins")
+                .contains(&"print".to_string())
+        );
+        assert!(shell.array_value("commands", "sh").is_some());
+        assert_eq!(
+            shell.array_value("options", "missing").as_deref(),
+            Some("off")
+        );
+        assert_eq!(
+            shell
+                .zsh_array_element(vec!["a".into(), "b".into()], "-1")
+                .as_deref(),
+            Some("b")
+        );
+        assert_eq!(
+            shell.array_value("funcstack", "1").as_deref(),
+            Some("inside")
+        );
+        assert_eq!(shell.array_value("signals", "1").as_deref(), Some("EXIT"));
+        assert!(shell.array_keys("unknown").is_empty());
+        assert!(shell.array_values("unknown").is_empty());
+        shell.indexed_arrays.insert(
+            "ordinary".into(),
+            [(0, "value".into())].into_iter().collect(),
+        );
+        assert_eq!(shell.array_values("ordinary"), ["value"]);
+        shell.associative_arrays.insert(
+            "mapping".into(),
+            [("key".into(), "mapped".into())].into_iter().collect(),
+        );
+        assert_eq!(shell.array_values("mapping"), ["mapped"]);
+        let job = std::thread::spawn(|| ExecResult::status(0));
+        shell.background_jobs.lock().unwrap().insert(77, job);
+        assert!(shell.expand_zsh_prompt_escapes("%(j.y.n)", 0).contains('y'));
+        assert_eq!(
+            shell.array_value("jobstates", "%77").as_deref(),
+            Some("running")
+        );
+        assert!(shell.array_keys("jobstates").contains(&"77".to_string()));
+        let _ = shell.builtin_wait(&["77".into()]);
+
+        let poisoned = shell.background_jobs.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoned.lock().unwrap();
+            panic!("poison jobs lock for prompt fallback");
+        })
+        .join();
+        assert!(shell.expand_zsh_prompt_escapes("%(j.y.n)", 0).contains('n'));
+        assert_eq!(shell.expand_zsh_prompt_escapes("%j", 0), "0");
+
+        let file = root.path().join("file");
+        fs::write(&file, "data").unwrap();
+        #[cfg(unix)]
+        let link = {
+            let link = root.path().join("link");
+            std::os::unix::fs::symlink(&file, &link).unwrap();
+            assert_eq!(
+                shell
+                    .builtin_double_bracket(&[
+                        "-L".into(),
+                        link.to_string_lossy().into_owned(),
+                        "]]".into()
+                    ])
+                    .status,
+                0
+            );
+            link
+        };
+        assert_eq!(
+            shell
+                .builtin_double_bracket(&[
+                    "-w".into(),
+                    file.to_string_lossy().into_owned(),
+                    "]]".into()
+                ])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_double_bracket(&[
+                    "-s".into(),
+                    file.to_string_lossy().into_owned(),
+                    "]]".into()
+                ])
+                .status,
+            0
+        );
+        assert_eq!(
+            shell
+                .builtin_double_bracket(&[
+                    "-x".into(),
+                    external_normal.to_string_lossy().into_owned(),
+                    "]]".into()
+                ])
+                .status,
+            0
+        );
+        assert_eq!(shell.run("[[ -s absent-file ]]", &[]).status, 1);
+        assert_eq!(shell.run("[[ -L absent-file ]]", &[]).status, 1);
+        shell
+            .set_variable("VISIBLE", "yes".into(), None, false)
+            .unwrap();
+        assert_eq!(shell.run("[[ -v VISIBLE ]]", &[]).status, 0);
+        assert_eq!(shell.run("[[ -v ABSENT ]]", &[]).status, 1);
+        assert_eq!(shell.run("[[ nope =~ '[0-9]+' ]]", &[]).status, 1);
+        assert_eq!(shell.run("[[ y =~ '(x)?y' ]]", &[]).status, 0);
+        assert_eq!(shell.run("[[ file -ef file ]]", &[]).status, 0);
+        assert_ne!(shell.run("[[ absent-file -ef file ]]", &[]).status, 0);
+        assert_ne!(shell.run("[[ bad -eq 1 ]]", &[]).status, 0);
+        assert_ne!(shell.run("[[ 1 -eq bad ]]", &[]).status, 0);
+        assert_eq!(shell.run("[[ file -nt file ]]", &[]).status, 1);
+        assert_eq!(shell.run("[[ file -ot file ]]", &[]).status, 1);
+        assert_ne!(shell.run("[[ -q value ]]", &[]).status, 0);
+        assert_ne!(shell.run("[[ a -unknown b ]]", &[]).status, 0);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::net::UnixListener;
+            let fifo = root.path().join("fifo");
+            nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRUSR).unwrap();
+            assert!(path_has_unix_type(&fifo, true));
+            let socket = root.path().join("socket");
+            let _listener = UnixListener::bind(&socket).unwrap();
+            assert!(path_has_unix_type(&socket, false));
+            let _ = link;
+        }
+
+        assert_eq!(shell.evaluate_arithmetic("5 ^ 3 & 7").unwrap(), 6);
+        assert_eq!(
+            shell
+                .evaluate_arithmetic("2 <= 2 && 3 >= 2 && 1 < 2 && 2 > 1")
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            shell
+                .evaluate_arithmetic("1 == 1 && 1 != 2 && (8 << 1) == 16")
+                .unwrap(),
+            1
+        );
+        assert!(shell.evaluate_arithmetic("1 ? 2").is_err());
+        assert!(shell.evaluate_arithmetic("0xGG").is_err());
+        assert!(shell.evaluate_arithmetic("bad#1").is_err());
+        assert!(shell.evaluate_arithmetic("16#zz").is_err());
     }
 }
