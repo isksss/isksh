@@ -71,7 +71,7 @@ isksh 自身的帮助、普通消息和诊断支持英语、日语和简体中�
 |---|---|---|
 | Linux | x86_64、aarch64 | 已测试；完全静态的 musl 二进制文件 |
 | Windows 11 | x86_64 | 已测试；静态 GNU CRT，仅依赖 Windows 系统 DLL |
-| macOS | x86_64、aarch64 | 已在原生运行器上测试；支持发布二进制文件和 aqua 安装 |
+| macOS | aarch64 | 仅支持Apple Silicon；Intel Mac的最后支持版本为v0.5.0 |
 
 ## 开发
 

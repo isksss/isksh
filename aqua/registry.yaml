@@ -27,4 +27,4 @@ packages:
     supported_envs:
       - linux
       - windows/amd64
-      - darwin
+      - darwin/arm64

@@ -71,7 +71,7 @@ The compatibility layer includes practical subsets of `autoload`, `functions`, `
 |---|---|---|
 | Linux | x86_64, aarch64 | Tested; fully static musl binaries |
 | Windows 11 | x86_64 | Tested; static GNU CRT, Windows system DLLs only |
-| macOS | x86_64, aarch64 | Tested on native runners; release binaries and aqua installation |
+| macOS | aarch64 | Apple Silicon only; Intel Mac support ended with v0.5.0 |
 
 ## Development
 

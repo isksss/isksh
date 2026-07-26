@@ -33,7 +33,7 @@ docker compose run --rm dev mise run <task>
 
 - `Cargo.toml`または`Cargo.lock`を変更する操作も原則としてコンテナ内で実行する。
 - Windows実機テストが必要な場合に限り、生成済みEXEをWindowsホストで実行する。
-- macOSは実機がないため、x86_64・aarch64両方の`cargo check`までを必須とする。
+- macOSは実機がないため、aarch64の`cargo check`までを必須とする。
 
 ## 必須検証
 
@@ -51,7 +51,7 @@ docker compose run --rm dev mise run check-all
 - 全Rustテスト成功
 - dashとのPOSIX差分テスト成功
 - 本体ライブラリの行カバレッジ100%
-- Linux x86_64/aarch64、Windows x86_64、macOS x86_64/aarch64のターゲット確認
+- Linux x86_64/aarch64、Windows x86_64、macOS aarch64のターゲット確認
 - Linux完全静的リンクとWindows依存DLLの検証
 
 Windows固有の実行処理を変更した場合は、Windowsホストで次も実行する。
@@ -75,7 +75,7 @@ Windows固有の実行処理を変更した場合は、Windowsホストで次も
 
 - C/C++共有ライブラリを要求するクレートを追加しない。
 - pure Rust、またはOS APIを直接使用するクレートを優先する。
-- 新規依存は静的リンク、Windows GNU、Linux musl、macOS両ターゲットで利用可能か確認する。
+- 新規依存は静的リンク、Windows GNU、Linux musl、macOS aarch64で利用可能か確認する。
 - 依存追加後は`Cargo.lock`を更新し、`check-targets`と`verify-static`を必ず実行する。
 
 ## プラットフォーム要件
@@ -94,14 +94,15 @@ Windows固有の実行処理を変更した場合は、Windowsホストで次も
 
 ### macOS
 
-- `x86_64-apple-darwin`と`aarch64-apple-darwin`の`cargo check`を維持する。
+- `aarch64-apple-darwin`の`cargo check`を維持する。
 - macOS標準ライブラリへの動的参照は許容する。
-- ローカルでは実機確認できないためクロスターゲット検査までとし、Release CIではIntel・Apple Siliconのネイティブランナーでビルドと実行確認を行う。
+- ローカルでは実機確認できないためクロスターゲット検査までとし、Release CIではApple Siliconのネイティブランナーでビルドと実行確認を行う。
+- Intel Macの公式対応はv0.5.0で終了し、以後はビルド、動作、配布を保証しない。
 
 ## 配布要件
 
 - リリース成果物はOS・アーキテクチャ別の単体バイナリとSHA-256チェックサムのみとする。
-- Linux x86_64・aarch64、Windows x86_64、macOS x86_64・aarch64の成果物をGitHub Releaseとaquaで配布する。
+- Linux x86_64・aarch64、Windows x86_64、macOS aarch64の成果物をGitHub Releaseとaquaで配布する。
 - 外部ユーティリティ、設定ファイル、追加ランタイムをバイナリへ同梱しない。
 - `dist/`の生成物をソース変更としてコミットしない。
 
