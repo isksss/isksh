@@ -34,6 +34,7 @@ isksh SCRIPT [ARG...]
 isksh -c COMMAND [NAME [ARG...]]
 isksh -s [ARG...]
 isksh -i
+isksh -l
 ```
 
 引数なしで標準入力が端末の場合は対話モードを開始し、それ以外では標準入力からスクリプトを読み込みます。
@@ -46,15 +47,17 @@ isksh -i
 - 配列、`[[ ... ]]`、プロセス置換、alias、主要built-inなどのBash機能
 - 対話コマンドを短縮するfish形式の`abbr -a NAME EXPANSION`
 - Starship、mise、zoxide、Atuin、fzfのBash形式初期化
+- プロンプトescape、`print`、option、`precmd`・`chpwd` hookのzsh互換モード
 - Vim、Neovimなどの全画面アプリへの端末引き渡し
 - UTF-8スクリプトとLF・CRLF改行
 
-対話モードでは、次の順で最初に見つかった設定を読み込みます。
+起動ファイルは`$XDG_CONFIG_HOME/isksh`（未設定時は`$HOME/.config/isksh`）配下だけを使用します。
 
-1. `ISKSH_RC`
-2. `$XDG_CONFIG_HOME/isksh/.iskrc`
-3. `$HOME/.config/isksh/.iskrc`
-4. 互換用フォールバックの`$HOME/.bashrc`
+1. すべての起動で`.iskenv`
+2. login shell（`-l`、`--login`、`-il`、`-li`）で`.iskprofile`
+3. interactive shellで`.iskrc`
+
+`ISKSH_MODE`の既定値は`bash`です。プロセス環境または`.iskenv`で`ISKSH_MODE=zsh`を設定すると、後続の起動ファイルでzsh互換モードが有効になります。不明な値は`bash`へフォールバックします。
 
 ## 対応環境
 

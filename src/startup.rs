@@ -4,45 +4,38 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-pub fn startup_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").or(std::env::var_os("USERPROFILE"));
-    startup_file_from(
-        std::env::var_os("ISKSH_RC"),
-        std::env::var_os("XDG_CONFIG_HOME"),
-        home,
-    )
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupFiles {
+    pub env: PathBuf,
+    pub profile: PathBuf,
+    pub rc: PathBuf,
 }
 
-pub fn bash_startup_file() -> Option<PathBuf> {
-    bash_startup_file_from(
-        std::env::var_os("ISKSH_RC").is_some(),
+pub fn startup_files() -> Option<StartupFiles> {
+    startup_files_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
         std::env::var_os("HOME").or(std::env::var_os("USERPROFILE")),
     )
 }
 
-fn bash_startup_file_from(override_present: bool, home: Option<OsString>) -> Option<PathBuf> {
-    if override_present {
-        return None;
-    }
-    home.filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .map(|path| path.join(".bashrc"))
-}
-
-fn startup_file_from(
-    override_path: Option<OsString>,
+fn startup_files_from(
     config_home: Option<OsString>,
     home: Option<OsString>,
-) -> Option<PathBuf> {
-    if let Some(path) = override_path {
-        return (!path.is_empty()).then(|| PathBuf::from(path));
-    }
-    if let Some(path) = config_home.filter(|path| !path.is_empty()) {
-        return Some(PathBuf::from(path).join("isksh").join(".iskrc"));
-    }
-    home.filter(|path| !path.is_empty())
+) -> Option<StartupFiles> {
+    let config = config_home
+        .filter(|path| !path.is_empty())
         .map(PathBuf::from)
-        .map(|path| path.join(".config").join("isksh").join(".iskrc"))
+        .or_else(|| {
+            home.filter(|path| !path.is_empty())
+                .map(PathBuf::from)
+                .map(|path| path.join(".config"))
+        })?
+        .join("isksh");
+    Some(StartupFiles {
+        env: config.join(".iskenv"),
+        profile: config.join(".iskprofile"),
+        rc: config.join(".iskrc"),
+    })
 }
 
 pub fn load_startup_file(shell: &mut Shell, path: &Path) -> io::Result<Option<RunResult>> {
@@ -69,40 +62,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn resolves_override_xdg_home_and_disabled_paths() {
-        let _ = startup_file();
-        let _ = bash_startup_file();
+    fn resolves_xdg_home_and_missing_paths() {
+        let _ = startup_files();
         assert_eq!(
-            startup_file_from(Some("custom.rc".into()), None, None),
-            Some(PathBuf::from("custom.rc"))
+            startup_files_from(Some("config".into()), None),
+            Some(StartupFiles {
+                env: PathBuf::from("config/isksh/.iskenv"),
+                profile: PathBuf::from("config/isksh/.iskprofile"),
+                rc: PathBuf::from("config/isksh/.iskrc"),
+            })
         );
         assert_eq!(
-            startup_file_from(None, Some("config".into()), None),
-            Some(PathBuf::from("config/isksh/.iskrc"))
+            startup_files_from(None, Some("home".into())),
+            Some(StartupFiles {
+                env: PathBuf::from("home/.config/isksh/.iskenv"),
+                profile: PathBuf::from("home/.config/isksh/.iskprofile"),
+                rc: PathBuf::from("home/.config/isksh/.iskrc"),
+            })
         );
-        assert_eq!(
-            startup_file_from(None, None, Some("home".into())),
-            Some(PathBuf::from("home/.config/isksh/.iskrc"))
-        );
-        assert_eq!(startup_file_from(Some(OsString::new()), None, None), None);
-        assert_eq!(startup_file_from(None, None, None), None);
-        assert_eq!(bash_startup_file_from(true, Some("home".into())), None);
-        assert_eq!(
-            bash_startup_file_from(false, Some("home".into())),
-            Some(PathBuf::from("home/.bashrc"))
-        );
-        assert_eq!(bash_startup_file_from(false, Some(OsString::new())), None);
-        assert_eq!(bash_startup_file_from(false, None), None);
+        assert_eq!(startup_files_from(Some(OsString::new()), None), None);
+        assert_eq!(startup_files_from(None, None), None);
     }
 
     #[test]
-    fn loads_supported_bashrc_style_syntax_and_handles_errors() {
+    fn loads_supported_configuration_and_handles_errors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(".iskrc");
         fs::write(
             &path,
             concat!(
-                "# bashrc-style configuration\n",
+                "# shell configuration\n",
                 "export ISKSH_TEST=configured\n",
                 "alias greet='printf configured'\n",
                 "prompt_name() { printf '%s' \"$ISKSH_TEST\"; }\n",

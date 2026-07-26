@@ -1,4 +1,4 @@
-use isksh::{Shell, bash_startup_file, load_startup_file, run_interactive, startup_file};
+use isksh::{Shell, load_startup_file, run_interactive, startup_files};
 use rustyline::Movement;
 use rustyline::Word;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -29,8 +29,9 @@ fn main() {
 }
 
 fn run_cli() -> Result<i32, (i32, String)> {
-    let arguments = std::env::args_os()
-        .skip(1)
+    let mut raw_arguments = std::env::args_os();
+    let executable = raw_arguments.next().unwrap_or_default();
+    let arguments = raw_arguments
         .map(|argument| {
             argument
                 .into_string()
@@ -40,7 +41,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
 
     if arguments.first().map(String::as_str) == Some("--help") {
         println!(
-            "isksh {}\n\nUsage:\n  isksh SCRIPT [ARG...]\n  isksh -c COMMAND [NAME [ARG...]]\n  isksh -s [ARG...]\n  isksh -i\n",
+            "isksh {}\n\nUsage:\n  isksh [OPTION...] SCRIPT [ARG...]\n  isksh [OPTION...] -c COMMAND [NAME [ARG...]]\n  isksh [OPTION...] -s [ARG...]\n  isksh -i\n\nOptions:\n  -i            force interactive mode\n  -l, --login   start as a login shell\n",
             env!("CARGO_PKG_VERSION")
         );
         return Ok(0);
@@ -50,35 +51,57 @@ fn run_cli() -> Result<i32, (i32, String)> {
         return Ok(0);
     }
 
-    let force_interactive = arguments.as_slice() == ["-i"];
-    if force_interactive || arguments.is_empty() && io::stdin().is_terminal() {
-        let mut shell = Shell::new("isksh");
-        shell.set_interactive(io::stdin().is_terminal() && io::stdout().is_terminal());
+    let (force_interactive, login, arguments) = parse_shell_options(
+        arguments,
+        Path::new(&executable)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('-')),
+    )?;
+    let interactive = force_interactive || arguments.is_empty() && io::stdin().is_terminal();
+    let name = if arguments.first().map(String::as_str) == Some("-c") {
+        arguments.get(2).cloned().unwrap_or_else(|| "isksh".into())
+    } else if arguments.first().is_some_and(|path| !path.starts_with('-')) {
+        arguments[0].clone()
+    } else {
+        "isksh".into()
+    };
+    let mut shell = Shell::new(name);
+    shell.set_interactive(interactive && io::stdin().is_terminal() && io::stdout().is_terminal());
+    let mut startup_stdout = io::stdout();
+    let mut startup_stderr = io::stderr();
+    if let Some(files) = startup_files() {
+        load_and_report_startup(
+            &mut shell,
+            &files.env,
+            &mut startup_stdout,
+            &mut startup_stderr,
+        )?;
+        shell.refresh_mode();
+        if login {
+            load_and_report_startup(
+                &mut shell,
+                &files.profile,
+                &mut startup_stdout,
+                &mut startup_stderr,
+            )?;
+        }
+        if interactive {
+            load_and_report_startup(
+                &mut shell,
+                &files.rc,
+                &mut startup_stdout,
+                &mut startup_stderr,
+            )?;
+        }
+    }
+    if let Some(status) = shell.take_exit_status() {
+        return Ok(status);
+    }
+
+    if interactive && arguments.is_empty() {
         let mut reader = BufReader::new(io::stdin());
         let mut stdout = io::stdout();
         let mut stderr = io::stderr();
-        for path in startup_file().into_iter().chain(bash_startup_file()) {
-            match load_startup_file(&mut shell, &path) {
-                Ok(Some(result)) => {
-                    stdout
-                        .write_all(&result.stdout)
-                        .map_err(|error| (1, error.to_string()))?;
-                    stderr
-                        .write_all(&result.stderr)
-                        .map_err(|error| (1, error.to_string()))?;
-                    if let Some(status) = shell.take_exit_status() {
-                        return Ok(status);
-                    }
-                    break;
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    writeln!(stderr, "isksh: {}: {error}", path.display())
-                        .map_err(|error| (1, error.to_string()))?;
-                    break;
-                }
-            }
-        }
         if io::stdin().is_terminal() && io::stdout().is_terminal() {
             return run_line_editor(&mut shell).map_err(|error| (1, error.to_string()));
         }
@@ -86,19 +109,17 @@ fn run_cli() -> Result<i32, (i32, String)> {
             .map_err(|error| (1, error.to_string()));
     }
 
-    let (source, name, positional) = match arguments.first().map(String::as_str) {
+    let (source, positional) = match arguments.first().map(String::as_str) {
         Some("-c") => {
             let source = arguments
                 .get(1)
                 .cloned()
                 .ok_or_else(|| (2, "-c requires a command string".to_string()))?;
-            let name = arguments.get(2).cloned().unwrap_or_else(|| "isksh".into());
             let positional = arguments.get(3..).unwrap_or_default().to_vec();
-            (source, name, positional)
+            (source, positional)
         }
         Some("-s") => (
             read_stdin_utf8()?,
-            "isksh".into(),
             arguments.get(1..).unwrap_or_default().to_vec(),
         ),
         Some(path) if path.starts_with('-') => {
@@ -107,16 +128,11 @@ fn run_cli() -> Result<i32, (i32, String)> {
         Some(path) => {
             let source =
                 fs::read_to_string(path).map_err(|error| (126, format!("{path}: {error}")))?;
-            (
-                source,
-                path.to_string(),
-                arguments.get(1..).unwrap_or_default().to_vec(),
-            )
+            (source, arguments.get(1..).unwrap_or_default().to_vec())
         }
-        None => (read_stdin_utf8()?, "isksh".into(), Vec::new()),
+        None => (read_stdin_utf8()?, Vec::new()),
     };
 
-    let mut shell = Shell::new(name);
     shell.set_positional(positional);
     let result = shell.run(&source, &[]);
     io::stdout()
@@ -126,6 +142,61 @@ fn run_cli() -> Result<i32, (i32, String)> {
         .write_all(&result.stderr)
         .map_err(|error| (1, error.to_string()))?;
     Ok(result.status)
+}
+
+fn parse_shell_options(
+    arguments: Vec<String>,
+    login_from_argv0: bool,
+) -> Result<(bool, bool, Vec<String>), (i32, String)> {
+    let mut interactive = false;
+    let mut login = login_from_argv0;
+    let mut index = 0;
+    while let Some(argument) = arguments.get(index).map(String::as_str) {
+        match argument {
+            "--" => {
+                index += 1;
+                break;
+            }
+            "--login" => login = true,
+            "-c" | "-s" => break,
+            option if option.starts_with('-') && option.len() > 1 => {
+                for flag in option[1..].chars() {
+                    match flag {
+                        'i' => interactive = true,
+                        'l' => login = true,
+                        _ => return Err((2, format!("unknown option: {option}"))),
+                    }
+                }
+            }
+            _ => break,
+        }
+        index += 1;
+    }
+    Ok((interactive, login, arguments[index..].to_vec()))
+}
+
+fn load_and_report_startup(
+    shell: &mut Shell,
+    path: &Path,
+    stdout: &mut impl Write,
+    stderr: &mut impl Write,
+) -> Result<(), (i32, String)> {
+    match load_startup_file(shell, path) {
+        Ok(Some(result)) => {
+            stdout
+                .write_all(&result.stdout)
+                .map_err(|error| (1, error.to_string()))?;
+            stderr
+                .write_all(&result.stderr)
+                .map_err(|error| (1, error.to_string()))?;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            writeln!(stderr, "isksh: {}: {error}", path.display())
+                .map_err(|error| (1, error.to_string()))?;
+        }
+    }
+    Ok(())
 }
 
 struct ShellHelper {
@@ -280,9 +351,41 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
 fn command_candidates(shell: &Shell) -> Vec<String> {
     let mut commands = BTreeSet::from(
         [
-            "abbr", "alias", "builtin", "cd", "command", "dirs", "echo", "eval", "exec", "exit",
-            "export", "false", "help", "jobs", "let", "popd", "printf", "pushd", "pwd", "read",
-            "set", "source", "test", "trap", "true", "type", "unalias", "unset", "wait",
+            "abbr",
+            "add-zsh-hook",
+            "alias",
+            "autoload",
+            "builtin",
+            "cd",
+            "command",
+            "dirs",
+            "echo",
+            "eval",
+            "exec",
+            "exit",
+            "export",
+            "false",
+            "help",
+            "jobs",
+            "let",
+            "popd",
+            "print",
+            "printf",
+            "pushd",
+            "pwd",
+            "read",
+            "set",
+            "setopt",
+            "source",
+            "test",
+            "trap",
+            "true",
+            "type",
+            "unalias",
+            "unfunction",
+            "unset",
+            "unsetopt",
+            "wait",
         ]
         .map(str::to_string),
     );
@@ -351,7 +454,7 @@ fn read_stdin_utf8() -> Result<String, (i32, String)> {
 
 #[cfg(test)]
 mod tests {
-    use super::in_shell_quote;
+    use super::{in_shell_quote, parse_shell_options};
 
     #[test]
     fn identifies_open_shell_quotes() {
@@ -359,5 +462,22 @@ mod tests {
         assert!(in_shell_quote("echo \"open\\\" still open"));
         assert!(!in_shell_quote("echo 'closed'"));
         assert!(!in_shell_quote("echo escaped\\ space"));
+    }
+
+    #[test]
+    fn parses_login_and_interactive_options() {
+        assert_eq!(
+            parse_shell_options(vec!["-il".into()], false).unwrap(),
+            (true, true, Vec::new())
+        );
+        assert_eq!(
+            parse_shell_options(vec!["--login".into(), "-c".into(), "true".into()], false).unwrap(),
+            (false, true, vec!["-c".into(), "true".into()])
+        );
+        assert!(parse_shell_options(vec!["-x".into()], false).is_err());
+        assert_eq!(
+            parse_shell_options(Vec::new(), true).unwrap(),
+            (false, true, Vec::new())
+        );
     }
 }

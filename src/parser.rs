@@ -338,7 +338,7 @@ impl Parser {
             return None;
         };
         let name = word.as_plain_literal()?;
-        if !valid_name(name)
+        if !valid_function_name(name)
             || !matches!(
                 self.tokens.get(self.index + 1)?.kind,
                 TokenKind::Operator(Operator::LeftParen)
@@ -581,6 +581,12 @@ fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn valid_function_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
 fn split_assignment(word: &Word) -> Option<(String, Word)> {

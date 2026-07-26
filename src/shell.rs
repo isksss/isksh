@@ -113,6 +113,29 @@ pub enum InputState {
     Invalid(String),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShellMode {
+    #[default]
+    Bash,
+    Zsh,
+}
+
+impl ShellMode {
+    pub fn from_environment(value: Option<&str>) -> Self {
+        match value {
+            Some("zsh") => Self::Zsh,
+            _ => Self::Bash,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Bash => "bash",
+            Self::Zsh => "zsh",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Shell {
     variables: HashMap<String, Variable>,
@@ -143,6 +166,9 @@ pub struct Shell {
     command_hash: HashMap<String, String>,
     creation_mask: u32,
     directory_stack: Vec<PathBuf>,
+    mode: ShellMode,
+    precmd_hooks: Vec<String>,
+    chpwd_hooks: Vec<String>,
 }
 
 impl Default for Shell {
@@ -170,6 +196,15 @@ impl Shell {
             "PWD".into(),
             Variable {
                 value: cwd.to_string_lossy().into_owned(),
+                exported: true,
+                readonly: false,
+            },
+        );
+        let mode = ShellMode::from_environment(std::env::var("ISKSH_MODE").ok().as_deref());
+        variables.insert(
+            "ISKSH_MODE".into(),
+            Variable {
+                value: mode.as_str().into(),
                 exported: true,
                 readonly: false,
             },
@@ -203,7 +238,19 @@ impl Shell {
             command_hash: HashMap::new(),
             creation_mask: 0o022,
             directory_stack: Vec::new(),
+            mode,
+            precmd_hooks: Vec::new(),
+            chpwd_hooks: Vec::new(),
         }
+    }
+
+    pub fn mode(&self) -> ShellMode {
+        self.mode
+    }
+
+    pub fn refresh_mode(&mut self) {
+        self.mode = ShellMode::from_environment(self.value_of("ISKSH_MODE").as_deref());
+        let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
     }
 
     pub fn set_positional(&mut self, values: Vec<String>) {
@@ -312,7 +359,22 @@ impl Shell {
     }
 
     pub fn prompt(&mut self, continuation: bool) -> String {
-        let name = if continuation { "PS2" } else { "PS1" };
+        let saved_status = self.last_status;
+        let mut prefix = String::new();
+        if !continuation && self.mode == ShellMode::Zsh {
+            for hook in self.precmd_hooks.clone() {
+                self.last_status = saved_status;
+                let result = self.run(&hook, &[]);
+                prefix.push_str(&String::from_utf8_lossy(&result.stdout));
+            }
+        }
+        self.last_status = saved_status;
+        let names = match (self.mode, continuation) {
+            (ShellMode::Zsh, false) => ["PROMPT", "PS1"],
+            (ShellMode::Zsh, true) => ["PROMPT2", "PS2"],
+            (ShellMode::Bash, false) => ["PS1", "PS1"],
+            (ShellMode::Bash, true) => ["PS2", "PS2"],
+        };
         let default = || {
             if continuation {
                 "> ".to_string()
@@ -320,11 +382,9 @@ impl Shell {
                 "$ ".to_string()
             }
         };
-        let saved_status = self.last_status;
         if !continuation {
             self.prompt_number += 1;
         }
-        let mut prefix = String::new();
         if !continuation
             && let Some(command) = self.value_of("PROMPT_COMMAND")
             && !command.is_empty()
@@ -333,8 +393,15 @@ impl Shell {
             prefix.push_str(&String::from_utf8_lossy(&result.stdout));
         }
         self.last_status = saved_status;
-        let value = self.value_of(name).unwrap_or_else(default);
-        let escaped = self.expand_prompt_escapes(&value);
+        let value = self
+            .value_of(names[0])
+            .or_else(|| self.value_of(names[1]))
+            .unwrap_or_else(default);
+        let escaped = if self.mode == ShellMode::Zsh {
+            self.expand_zsh_prompt_escapes(&value, saved_status)
+        } else {
+            self.expand_prompt_escapes(&value)
+        };
         prefix.push_str(
             &self
                 .expand_here_document(&escaped)
@@ -1213,6 +1280,7 @@ impl Shell {
                 }
             }
             "printf" => self.builtin_printf(args),
+            "print" if self.mode == ShellMode::Zsh => self.builtin_print(args),
             "pwd" => {
                 let mut value = self.cwd.to_string_lossy().into_owned().into_bytes();
                 value.push(b'\n');
@@ -1244,6 +1312,11 @@ impl Shell {
             "." | "source" => self.builtin_dot(args, input),
             "declare" | "typeset" | "local" => self.builtin_declare(name, args),
             "shopt" => self.builtin_shopt(args),
+            "setopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, true),
+            "unsetopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, false),
+            "autoload" | "zmodload" if self.mode == ShellMode::Zsh => ExecResult::status(0),
+            "add-zsh-hook" if self.mode == ShellMode::Zsh => self.builtin_add_zsh_hook(args),
+            "unfunction" if self.mode == ShellMode::Zsh => self.builtin_unfunction(args),
             "type" => self.builtin_type(args),
             "mapfile" | "readarray" => self.builtin_mapfile(args, input),
             "[[" => self.builtin_double_bracket(args),
@@ -1329,11 +1402,113 @@ impl Shell {
                 let current = self.cwd.to_string_lossy().into_owned();
                 let _ = self.set_variable("OLDPWD", previous, Some(true), false);
                 let _ = self.set_variable("PWD", current, Some(true), false);
+                if self.mode == ShellMode::Zsh {
+                    for hook in self.chpwd_hooks.clone() {
+                        let _ = self.run(&hook, &[]);
+                    }
+                }
                 ExecResult::status(0)
             }
             Ok(_) => ExecResult::error(1, format!("isksh: cd: {target}: not a directory")),
             Err(error) => ExecResult::error(1, format!("isksh: cd: {target}: {error}")),
         }
+    }
+
+    fn builtin_print(&self, args: &[String]) -> ExecResult {
+        let mut newline = true;
+        let mut raw = false;
+        let mut prompt = false;
+        let mut index = 0;
+        while let Some(option) = args.get(index).map(String::as_str) {
+            match option {
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                _ if option.starts_with('-') => {
+                    for flag in option[1..].chars() {
+                        match flag {
+                            'n' => newline = false,
+                            'r' => raw = true,
+                            'P' => prompt = true,
+                            _ => {
+                                return ExecResult::error(
+                                    2,
+                                    format!("isksh: print: unsupported option: {option}"),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+            index += 1;
+        }
+        let value = args[index..].join(" ");
+        let value = if prompt {
+            self.expand_zsh_prompt_escapes(&value, self.last_status)
+        } else if raw {
+            value
+        } else {
+            decode_echo_escapes(&value)
+        };
+        let mut stdout = value.into_bytes();
+        if newline {
+            stdout.push(b'\n');
+        }
+        ExecResult {
+            stdout,
+            ..ExecResult::status(0)
+        }
+    }
+
+    fn builtin_setopt(&mut self, args: &[String], enabled: bool) -> ExecResult {
+        for option in args {
+            let normalized = option.to_ascii_lowercase().replace('_', "");
+            if enabled {
+                self.shell_options.insert(normalized);
+            } else {
+                self.shell_options.remove(&normalized);
+            }
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_add_zsh_hook(&mut self, args: &[String]) -> ExecResult {
+        let (remove, operands) = if args.first().map(String::as_str) == Some("-d") {
+            (true, &args[1..])
+        } else {
+            (false, args)
+        };
+        let [event, function] = operands else {
+            return ExecResult::error(2, "isksh: add-zsh-hook: expected EVENT FUNCTION");
+        };
+        let hooks = match event.as_str() {
+            "precmd" => &mut self.precmd_hooks,
+            "chpwd" => &mut self.chpwd_hooks,
+            _ => {
+                return ExecResult::error(
+                    2,
+                    format!("isksh: add-zsh-hook: unsupported hook: {event}"),
+                );
+            }
+        };
+        if remove {
+            hooks.retain(|hook| hook != function);
+        } else if !hooks.contains(function) {
+            hooks.push(function.clone());
+        }
+        ExecResult::status(0)
+    }
+
+    fn builtin_unfunction(&mut self, args: &[String]) -> ExecResult {
+        let mut status = 0;
+        for name in args {
+            if self.functions.remove(name).is_none() {
+                status = 1;
+            }
+        }
+        ExecResult::status(status)
     }
 
     fn builtin_pushd(&mut self, args: &[String]) -> ExecResult {
@@ -2635,6 +2810,10 @@ impl Shell {
         }
         let mut expanded = Vec::new();
         for field in fields {
+            if matches!(field.as_str(), "[" | "[[") {
+                expanded.push(field);
+                continue;
+            }
             if !field.contains(['*', '?', '[']) {
                 expanded.push(field);
                 continue;
@@ -2880,6 +3059,76 @@ impl Shell {
                 }
                 other => {
                     output.push('\\');
+                    output.push(other);
+                }
+            }
+        }
+        output
+    }
+
+    fn expand_zsh_prompt_escapes(&self, value: &str, status: i32) -> String {
+        let username = self
+            .value_of("USER")
+            .or_else(|| self.value_of("USERNAME"))
+            .unwrap_or_default();
+        let hostname = self
+            .value_of("HOSTNAME")
+            .or_else(|| self.value_of("COMPUTERNAME"))
+            .unwrap_or_default();
+        let cwd = self.cwd.to_string_lossy().into_owned();
+        let display_cwd = self
+            .value_of("HOME")
+            .or_else(|| self.value_of("USERPROFILE"))
+            .filter(|home| {
+                cwd == *home || cwd.starts_with(&format!("{home}{}", std::path::MAIN_SEPARATOR))
+            })
+            .map_or_else(|| cwd.clone(), |home| format!("~{}", &cwd[home.len()..]));
+        let chars: Vec<_> = value.chars().collect();
+        let mut output = String::new();
+        let mut index = 0;
+        while index < chars.len() {
+            if chars[index] != '%' {
+                output.push(chars[index]);
+                index += 1;
+                continue;
+            }
+            index += 1;
+            let Some(code) = chars.get(index).copied() else {
+                output.push('%');
+                break;
+            };
+            index += 1;
+            match code {
+                '%' => output.push('%'),
+                'n' => output.push_str(&username),
+                'm' => output.push_str(hostname.split('.').next().unwrap_or_default()),
+                'M' => output.push_str(&hostname),
+                '~' | 'd' => output.push_str(&display_cwd),
+                '#' => output.push(if username.eq_ignore_ascii_case("root") {
+                    '#'
+                } else {
+                    '%'
+                }),
+                '?' => output.push_str(&status.to_string()),
+                'f' => output.push_str("\x1b[39m"),
+                'k' => output.push_str("\x1b[49m"),
+                'B' => output.push_str("\x1b[1m"),
+                'b' => output.push_str("\x1b[22m"),
+                'F' | 'K' if chars.get(index) == Some(&'{') => {
+                    index += 1;
+                    let start = index;
+                    while index < chars.len() && chars[index] != '}' {
+                        index += 1;
+                    }
+                    let color: String = chars[start..index].iter().collect();
+                    if index < chars.len() {
+                        index += 1;
+                    }
+                    output.push_str(&zsh_color_escape(code == 'K', &color));
+                }
+                '{' | '}' => {}
+                other => {
+                    output.push('%');
                     output.push(other);
                 }
             }
@@ -3403,6 +3652,8 @@ const BUILTIN_NAMES: &[&str] = &[
     "[[",
     "abbr",
     "alias",
+    "add-zsh-hook",
+    "autoload",
     "break",
     "builtin",
     "cd",
@@ -3424,6 +3675,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "local",
     "mapfile",
     "popd",
+    "print",
     "printf",
     "pushd",
     "pwd",
@@ -3432,6 +3684,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "readonly",
     "return",
     "set",
+    "setopt",
     "shift",
     "shopt",
     "source",
@@ -3443,9 +3696,46 @@ const BUILTIN_NAMES: &[&str] = &[
     "typeset",
     "umask",
     "unalias",
+    "unfunction",
     "unset",
+    "unsetopt",
     "wait",
+    "zmodload",
 ];
+
+fn decode_echo_escapes(value: &str) -> String {
+    value
+        .replace("\\n", "\n")
+        .replace("\\r", "\r")
+        .replace("\\t", "\t")
+        .replace("\\\\", "\\")
+}
+
+fn zsh_color_escape(background: bool, color: &str) -> String {
+    let layer = if background { 48 } else { 38 };
+    if let Some(hex) = color.strip_prefix('#')
+        && hex.len() == 6
+        && let (Ok(red), Ok(green), Ok(blue)) = (
+            u8::from_str_radix(&hex[0..2], 16),
+            u8::from_str_radix(&hex[2..4], 16),
+            u8::from_str_radix(&hex[4..6], 16),
+        )
+    {
+        return format!("\x1b[{layer};2;{red};{green};{blue}m");
+    }
+    let code = match color {
+        "black" => 0,
+        "red" => 1,
+        "green" => 2,
+        "yellow" => 3,
+        "blue" => 4,
+        "magenta" => 5,
+        "cyan" => 6,
+        "white" => 7,
+        _ => return String::new(),
+    };
+    format!("\x1b[{}m", if background { 40 + code } else { 30 + code })
+}
 
 fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
@@ -3938,6 +4228,8 @@ mod tests {
     fn executes_function_with_positional_parameters() {
         let result = run("show() { printf '<%s>' \"$1\"; }; show ok");
         assert_eq!(result.stdout, b"<ok>");
+        let result = run("hyphen-name() { printf compatible; }; hyphen-name");
+        assert_eq!(result.stdout, b"compatible");
     }
 
     #[test]
@@ -4011,6 +4303,13 @@ mod tests {
         assert_ne!(shell.run("printf '%s' $((1 2))", &[]).status, 0);
         assert_ne!(shell.run("printf '%s' $((1 + (2))", &[]).status, 0);
         assert_ne!(shell.run("printf '%s' ${missing:?required}", &[]).status, 0);
+    }
+
+    #[test]
+    fn preserves_invalid_glob_literals_for_bracket_builtin() {
+        let mut shell = Shell::default();
+        assert_eq!(shell.run("[ -n value ]", &[]).status, 0);
+        assert_eq!(shell.run("printf '%s' '['", &[]).stdout, b"[");
     }
 
     #[test]
@@ -5149,6 +5448,151 @@ mod tests {
             .set_variable("PS2", "next> ".into(), None, false)
             .unwrap();
         assert_eq!(shell.prompt(true), "next> ");
+    }
+
+    #[test]
+    fn supports_zsh_mode_prompts_builtins_and_hooks() {
+        let mut shell = Shell::new("isksh");
+        shell.run("export ISKSH_MODE=zsh", &[]);
+        shell.refresh_mode();
+        assert_eq!(shell.mode(), ShellMode::Zsh);
+        shell
+            .set_variable("USER", "tester".into(), Some(true), false)
+            .unwrap();
+        shell
+            .set_variable("HOSTNAME", "host.example".into(), Some(true), false)
+            .unwrap();
+        shell.run(
+            "count=0; before_prompt() { count=$((count + 1)); }; add-zsh-hook precmd before_prompt; PROMPT='%F{green}%n:%~:%?:%#%f '",
+            &[],
+        );
+        let prompt = shell.prompt(false);
+        assert!(prompt.starts_with("\u{1b}[32m"));
+        assert!(prompt.ends_with("\u{1b}[39m "));
+        assert_eq!(shell.value_of("count").as_deref(), Some("1"));
+        shell.run("PROMPT2='%K{blue}>%k '", &[]);
+        assert_eq!(shell.prompt(true), "\u{1b}[44m>\u{1b}[49m ");
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().to_string_lossy().replace('\\', "/");
+        shell.run(
+            "changed=0; directory_changed() { changed=1; }; add-zsh-hook chpwd directory_changed",
+            &[],
+        );
+        assert_eq!(shell.run(&format!("cd '{}'", target), &[]).status, 0);
+        assert_eq!(shell.value_of("changed").as_deref(), Some("1"));
+        assert_eq!(shell.run("print -rn -- value", &[]).stdout, b"value");
+        assert_eq!(
+            shell.run("print 'a\\nb\\tc\\r\\\\'", &[]).stdout,
+            b"a\nb\tc\r\\\n"
+        );
+        assert!(shell.run("print -x value", &[]).status != 0);
+        assert_eq!(
+            shell.run("print -P -- '%F{#010203}x%f'", &[]).stdout,
+            b"\x1b[38;2;1;2;3mx\x1b[39m\n"
+        );
+        assert_eq!(shell.run("setopt prompt_subst", &[]).status, 0);
+        assert_eq!(shell.run("unsetopt prompt_subst", &[]).status, 0);
+        assert_eq!(shell.run("add-zsh-hook", &[]).status, 2);
+        assert_eq!(shell.run("add-zsh-hook unsupported hook", &[]).status, 2);
+        assert_eq!(
+            shell.run("add-zsh-hook precmd before_prompt", &[]).status,
+            0
+        );
+        assert_eq!(
+            shell
+                .run("add-zsh-hook -d precmd before_prompt", &[])
+                .status,
+            0
+        );
+        assert_eq!(shell.run("unfunction before_prompt", &[]).status, 0);
+        assert_eq!(shell.run("unfunction missing", &[]).status, 1);
+        assert_eq!(
+            shell
+                .run("autoload -Uz add-zsh-hook; zmodload zsh/datetime", &[])
+                .status,
+            0
+        );
+
+        shell
+            .set_variable("USER", "root".into(), Some(true), false)
+            .unwrap();
+        let escapes = shell.expand_zsh_prompt_escapes(
+            "plain%%:%n:%m:%M:%~:%d:%#:%?:%Bbold%b:%{hidden%}:%q:%F{red",
+            7,
+        );
+        assert!(escapes.contains("plain%:root:host:host.example:"));
+        assert!(escapes.contains(":#:7:\u{1b}[1mbold\u{1b}[22m:hidden:%q:"));
+        assert_eq!(shell.expand_zsh_prompt_escapes("trailing%", 0), "trailing%");
+
+        shell.variables.remove("USER");
+        shell.variables.remove("HOSTNAME");
+        shell.variables.remove("HOME");
+        shell
+            .set_variable("USERNAME", "fallback-user".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable("COMPUTERNAME", "fallback-host".into(), None, false)
+            .unwrap();
+        shell
+            .set_variable(
+                "USERPROFILE",
+                "/not-the-current-directory".into(),
+                None,
+                false,
+            )
+            .unwrap();
+        let fallback = shell.expand_zsh_prompt_escapes("%n:%M:%~", 0);
+        assert_eq!(
+            fallback,
+            format!("fallback-user:fallback-host:{}", shell.cwd.display())
+        );
+        shell
+            .set_variable(
+                "USERPROFILE",
+                shell.cwd.to_string_lossy().into_owned(),
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(shell.expand_zsh_prompt_escapes("%~", 0), "~");
+    }
+
+    #[test]
+    fn expands_every_supported_zsh_prompt_color() {
+        assert_eq!(decode_echo_escapes("a\\nb\\rc\\t\\\\"), "a\nb\rc\t\\");
+        assert_eq!(
+            zsh_color_escape(false, "#abcdef"),
+            "\u{1b}[38;2;171;205;239m"
+        );
+        assert_eq!(zsh_color_escape(true, "#010203"), "\u{1b}[48;2;1;2;3m");
+        assert_eq!(zsh_color_escape(false, "#invalid"), "");
+        assert_eq!(zsh_color_escape(false, "unknown"), "");
+        for (name, code) in [
+            ("black", 30),
+            ("red", 31),
+            ("green", 32),
+            ("yellow", 33),
+            ("blue", 34),
+            ("magenta", 35),
+            ("cyan", 36),
+            ("white", 37),
+        ] {
+            assert_eq!(zsh_color_escape(false, name), format!("\u{1b}[{code}m"));
+            assert_eq!(
+                zsh_color_escape(true, name),
+                format!("\u{1b}[{}m", code + 10)
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_mode_refreshes_to_bash() {
+        let mut shell = Shell::new("isksh");
+        shell.run("export ISKSH_MODE=unknown", &[]);
+        shell.refresh_mode();
+        assert_eq!(shell.mode(), ShellMode::Bash);
+        assert_eq!(shell.value_of("ISKSH_MODE").as_deref(), Some("bash"));
     }
 
     #[test]

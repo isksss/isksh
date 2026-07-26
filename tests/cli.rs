@@ -128,7 +128,9 @@ fn force_interactive_mode_reads_lines_and_exit() {
 #[test]
 fn interactive_mode_loads_iskrc() {
     let directory = tempfile::tempdir().unwrap();
-    let rc = directory.path().join(".iskrc");
+    let config = directory.path().join("isksh");
+    std::fs::create_dir(&config).unwrap();
+    let rc = config.join(".iskrc");
     std::fs::write(
         &rc,
         "export FROM_ISKRC=loaded\nalias configured='printf alias-loaded'\nabbr -a short 'printf abbr-loaded'\nPS1='isk> '\n",
@@ -136,7 +138,7 @@ fn interactive_mode_loads_iskrc() {
     .unwrap();
     let mut child = isksh()
         .arg("-i")
-        .env("ISKSH_RC", &rc)
+        .env("XDG_CONFIG_HOME", directory.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -157,17 +159,36 @@ fn interactive_mode_loads_iskrc() {
 }
 
 #[test]
-fn interactive_mode_falls_back_to_bashrc() {
+fn startup_files_follow_environment_login_and_interactive_rules() {
     let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config/isksh");
+    std::fs::create_dir_all(&config).unwrap();
     std::fs::write(
-        directory.path().join(".bashrc"),
-        "export FROM_BASHRC=loaded\nalias bash-configured='printf bashrc-loaded'\n",
+        config.join(".iskenv"),
+        "export ISKSH_MODE=zsh\nexport FROM_ISKENV=env\n",
     )
     .unwrap();
+    std::fs::write(config.join(".iskprofile"), "export FROM_PROFILE=profile\n").unwrap();
+    std::fs::write(
+        config.join(".iskrc"),
+        "export FROM_ISKRC=rc\nPROMPT='isk%# '",
+    )
+    .unwrap();
+
+    let login = isksh()
+        .args([
+            "-l",
+            "-c",
+            "print -r -- \"$ISKSH_MODE:$FROM_ISKENV:$FROM_PROFILE:${FROM_ISKRC:-none}\"",
+        ])
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(login.status.success());
+    assert_eq!(login.stdout, b"zsh:env:profile:none\n");
+
     let mut child = isksh()
-        .arg("-i")
-        .env_remove("ISKSH_RC")
-        .env("HOME", directory.path())
+        .arg("-il")
         .env("XDG_CONFIG_HOME", directory.path().join("config"))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -178,15 +199,33 @@ fn interactive_mode_falls_back_to_bashrc() {
         .stdin
         .take()
         .unwrap()
-        .write_all(b"printf '%s:' \"$FROM_BASHRC\"; bash-configured\nexit\n")
+        .write_all(b"printf '%s:%s:%s' \"$FROM_ISKENV\" \"$FROM_PROFILE\" \"$FROM_ISKRC\"\nexit\n")
         .unwrap();
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
     assert!(
         String::from_utf8(output.stdout)
             .unwrap()
-            .contains("loaded:bashrc-loaded")
+            .contains("env:profile:rc")
     );
+}
+
+#[test]
+fn invalid_mode_falls_back_to_bash_and_other_shell_rc_files_are_ignored() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config/isksh");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(config.join(".iskenv"), "export ISKSH_MODE=invalid\n").unwrap();
+    std::fs::write(directory.path().join(".bashrc"), "export LEAKED=bashrc\n").unwrap();
+    std::fs::write(directory.path().join(".zshrc"), "export LEAKED=zshrc\n").unwrap();
+    let output = isksh()
+        .args(["-c", "printf '%s:%s' \"$ISKSH_MODE\" \"${LEAKED:-none}\""])
+        .env("HOME", directory.path())
+        .env("XDG_CONFIG_HOME", directory.path().join("config"))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"bash:none");
 }
 
 #[cfg(unix)]

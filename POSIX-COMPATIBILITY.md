@@ -16,8 +16,9 @@
 | Built-in utilities | Partial | trap、umask、hash、exec永続リダイレクト、read、printfを含むMVP対象を実装 |
 | Job control | Partial | 非同期`&`、ジョブID、jobs、waitに対応。停止・再開・fg・bgは未対応 |
 | Interactive shell | Partial | PS1/PS2、PROMPT_COMMAND、履歴、補完、Ctrl+R、継続入力、外部コマンドのTTY・基本シグナル制御に対応 |
-| Startup configuration | Partial | `.config/isksh/.iskrc`を優先し、未配置時は`.bashrc`を読込 |
+| Startup configuration | Partial | `.config/isksh`配下の`.iskenv`、`.iskprofile`、`.iskrc`を起動種別に応じて読込 |
 | Bash extensions | Partial | 配列、`[[ ]]`、process substitution、PIPESTATUS、pipefail、ディレクトリスタック、`let`、`printf -v`、主要ツールのBash初期化変換を実装。高度な配列属性・拡張glob等は未対応 |
+| zsh compatibility mode | Partial | `ISKSH_MODE=zsh`でPROMPT escape、`print`、`setopt`、`precmd`・`chpwd` hookに対応。zshの完全な構文・completion system・module APIは未対応 |
 | Non-UTF-8 shell data | Not supported | 明示的エラー |
 
 WindowsではPOSIXシグナル、プロセスグループ、パス表現を完全には再現できません。`.cmd`と`.bat`は`cmd.exe`経由で実行し、PowerShellスクリプトは自動実行しません。
