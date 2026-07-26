@@ -77,6 +77,8 @@ The compatibility layer includes practical subsets of `autoload`, `functions`, `
 
 Development is containerized; Rust does not need to be installed on the host.
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development workflow and branch, commit, pull request, and release conventions.
+
 ```console
 docker compose build dev
 docker compose run --rm dev mise run check-all

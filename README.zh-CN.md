@@ -77,6 +77,8 @@ isksh 自身的帮助、普通消息和诊断支持英语、日语和简体中�
 
 开发环境已容器化，无需在主机上安装 Rust。
 
+开发流程以及分支、提交、Pull Request 和发布规范请参阅[CONTRIBUTING.md](CONTRIBUTING.md)。
+
 ```console
 docker compose build dev
 docker compose run --rm dev mise run check-all

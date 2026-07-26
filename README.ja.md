@@ -77,6 +77,8 @@ zshモードでは、引用符なしのscalar parameterを既定でfield分割�
 
 開発環境はコンテナ化されているため、ホストへのRust導入は不要です。
 
+開発手順とブランチ、コミット、Pull Request、リリースの規約は[CONTRIBUTING.md](CONTRIBUTING.md)を参照してください。
+
 ```console
 docker compose build dev
 docker compose run --rm dev mise run check-all
