@@ -66,9 +66,57 @@ jobs:
         shell: pwsh
         run: ./scripts/windows-smoke.ps1
 
+  macos-build:
+    name: Build and smoke-test macOS ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            artifact: isksh-macos-x86_64
+          - runner: macos-15
+            target: aarch64-apple-darwin
+            arch: aarch64
+            artifact: isksh-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install Rust with mise
+        uses: jdx/mise-action@v4
+        with:
+          install_args: rust
+
+      - name: Build and run macOS binary
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          ARTIFACT: ${{ matrix.artifact }}
+        run: |
+          mise exec -- cargo build --locked --release --target "$TARGET"
+          mkdir -p dist
+          artifact="dist/$ARTIFACT"
+          cp "target/$TARGET/release/isksh" "$artifact"
+          test "$("$artifact" -c 'printf macos-ok')" = macos-ok
+          shasum -a 256 "$artifact" > "$artifact.sha256"
+
+      - name: Upload macOS release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-macos-${{ matrix.arch }}-${{ github.ref_name }}
+          path: |
+            dist/${{ matrix.artifact }}
+            dist/${{ matrix.artifact }}.sha256
+          if-no-files-found: error
+          retention-days: 7
+
   publish-crate:
     name: Publish crate
-    needs: [build, windows-smoke]
+    needs: [build, windows-smoke, macos-build]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
@@ -93,7 +141,7 @@ jobs:
 
   publish-release:
     name: Publish GitHub Release
-    needs: [build, windows-smoke, publish-crate]
+    needs: [build, windows-smoke, macos-build, publish-crate]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
@@ -102,8 +150,9 @@ jobs:
       - name: Download release artifacts
         uses: actions/download-artifact@v8
         with:
-          name: release-${{ github.ref_name }}
+          pattern: release-*${{ github.ref_name }}
           path: dist
+          merge-multiple: true
 
       - name: Verify checksums
         shell: bash
@@ -160,3 +209,31 @@ jobs:
       - name: Install and run isksh through aqua
         shell: pwsh
         run: ./scripts/aqua-smoke.ps1 -Version $env:GITHUB_REF_NAME
+
+  aqua-smoke-macos:
+    name: Install release with aqua on macOS ${{ matrix.arch }}
+    needs: publish-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15-intel
+            arch: x86_64
+          - runner: macos-15
+            arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Install aqua
+        uses: aquaproj/aqua-installer@v4.0.5
+        with:
+          aqua_version: v2.62.1
+          enable_aqua_install: "false"
+
+      - name: Install and run isksh through aqua
+        run: bash scripts/aqua-smoke.sh "$GITHUB_REF_NAME"

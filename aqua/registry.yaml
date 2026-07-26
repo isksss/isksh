@@ -20,6 +20,11 @@ packages:
       - goos: linux
         replacements:
           arm64: aarch64
+      - goos: darwin
+        replacements:
+          darwin: macos
+          arm64: aarch64
     supported_envs:
       - linux
       - windows/amd64
+      - darwin

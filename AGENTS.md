@@ -95,11 +95,12 @@ Windows固有の実行処理を変更した場合は、Windowsホストで次も
 
 - `x86_64-apple-darwin`と`aarch64-apple-darwin`の`cargo check`を維持する。
 - macOS標準ライブラリへの動的参照は許容する。
-- 実機で確認していない動作を検証済みと記載しない。
+- ローカルでは実機確認できないためクロスターゲット検査までとし、Release CIではIntel・Apple Siliconのネイティブランナーでビルドと実行確認を行う。
 
 ## 配布要件
 
 - リリース成果物はOS・アーキテクチャ別の単体バイナリとSHA-256チェックサムのみとする。
+- Linux x86_64・aarch64、Windows x86_64、macOS x86_64・aarch64の成果物をGitHub Releaseとaquaで配布する。
 - 外部ユーティリティ、設定ファイル、追加ランタイムをバイナリへ同梱しない。
 - `dist/`の生成物をソース変更としてコミットしない。
 

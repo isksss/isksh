@@ -71,7 +71,7 @@ zshモードでは、引用符なしのscalar parameterを既定でfield分割�
 |---|---|---|
 | Linux | x86_64、aarch64 | テスト済み、musl完全静的バイナリ |
 | Windows 11 | x86_64 | テスト済み、静的GNU CRT、Windows標準DLLのみ使用 |
-| macOS | x86_64、aarch64 | クロスターゲットのコンパイル検査のみ |
+| macOS | x86_64、aarch64 | ネイティブランナーでテスト済み、配布バイナリとaqua導入に対応 |
 
 ## 開発
 
