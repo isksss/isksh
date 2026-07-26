@@ -17,6 +17,8 @@ docker compose run --rm dev mise run build
 
 作業前に`main`を最新化し、`type/short-summary`形式のブランチを作成します。`short-summary`には変更内容を表す英小文字のkebab-caseを使用してください。
 
+`main`へのcommitとpushは禁止します。すべての変更は作業ブランチへcommitし、PRを通して`main`へ取り込んでください。
+
 ```console
 git switch main
 git pull --ff-only
@@ -100,7 +102,8 @@ git push -u origin feat/zsh-autoload
 - PRタイトルにもコミットと同じ`[prefix] 日本語の要約`形式を使用します。
 - `.github/pull_request_template.md`の各項目を埋め、関連Issueがある場合は番号を記載します。
 - 変更内容、検証結果、互換性への影響、未検証事項を明記します。
-- CIをすべて成功させ、レビュー指摘を反映します。
+- 作業ブランチへ最新の`main`を取り込み、LinuxとWindowsの必須CIをすべて成功させます。
+- レビュー指摘を反映し、すべてのレビュー会話を解決します。
 - 承認後はsquash mergeし、squashコミットの件名をPRタイトルと一致させます。
 - マージ後は作業ブランチを削除します。
 
@@ -130,5 +133,7 @@ git push origin vX.Y.Z
 
 7. Release CIで、全OSのビルドと実行確認、crates.io公開、GitHub Release作成、Linux・Windows・macOSでのaqua導入確認がすべて成功するまで監視します。
 8. GitHub Releaseに各OS・アーキテクチャのバイナリとSHA-256チェックサムが揃っていることを確認します。
+
+`main`への直接pushは禁止しますが、リリースを開始する`vX.Y.Z`タグのpushは許可します。
 
 公開したタグは削除やforce更新をしません。公開後に問題が見つかった場合は、修正を`main`へ取り込み、次のpatch版としてリリースします。
