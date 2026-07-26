@@ -67,20 +67,8 @@ jobs:
         run: ./scripts/windows-smoke.ps1
 
   macos-build:
-    name: Build and smoke-test macOS ${{ matrix.arch }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
-            arch: x86_64
-            artifact: isksh-macos-x86_64
-          - runner: macos-15
-            target: aarch64-apple-darwin
-            arch: aarch64
-            artifact: isksh-macos-aarch64
-    runs-on: ${{ matrix.runner }}
+    name: Build and smoke-test macOS aarch64
+    runs-on: macos-15
     timeout-minutes: 30
     steps:
       - name: Check out repository
@@ -94,8 +82,8 @@ jobs:
       - name: Build and run macOS binary
         shell: bash
         env:
-          TARGET: ${{ matrix.target }}
-          ARTIFACT: ${{ matrix.artifact }}
+          TARGET: aarch64-apple-darwin
+          ARTIFACT: isksh-macos-aarch64
         run: |
           mise exec -- cargo build --locked --release --target "$TARGET"
           mkdir -p dist
@@ -107,10 +95,10 @@ jobs:
       - name: Upload macOS release artifact
         uses: actions/upload-artifact@v7
         with:
-          name: release-macos-${{ matrix.arch }}-${{ github.ref_name }}
+          name: release-macos-aarch64-${{ github.ref_name }}
           path: |
-            dist/${{ matrix.artifact }}
-            dist/${{ matrix.artifact }}.sha256
+            dist/isksh-macos-aarch64
+            dist/isksh-macos-aarch64.sha256
           if-no-files-found: error
           retention-days: 7
 
@@ -211,17 +199,9 @@ jobs:
         run: ./scripts/aqua-smoke.ps1 -Version $env:GITHUB_REF_NAME
 
   aqua-smoke-macos:
-    name: Install release with aqua on macOS ${{ matrix.arch }}
+    name: Install release with aqua on macOS aarch64
     needs: publish-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15-intel
-            arch: x86_64
-          - runner: macos-15
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-15
     timeout-minutes: 10
     permissions:
       contents: read
