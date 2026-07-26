@@ -1362,6 +1362,8 @@ impl Shell {
             "shopt" => self.builtin_shopt(args),
             "setopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, true),
             "unsetopt" if self.mode == ShellMode::Zsh => self.builtin_setopt(args, false),
+            "emulate" if self.mode == ShellMode::Zsh => self.builtin_emulate(args),
+            "whence" if self.mode == ShellMode::Zsh => self.builtin_whence(args),
             "autoload" | "zmodload" if self.mode == ShellMode::Zsh => ExecResult::status(0),
             "add-zsh-hook" if self.mode == ShellMode::Zsh => self.builtin_add_zsh_hook(args),
             "unfunction" if self.mode == ShellMode::Zsh => self.builtin_unfunction(args),
@@ -1466,6 +1468,9 @@ impl Shell {
         let mut newline = true;
         let mut raw = false;
         let mut prompt = false;
+        let mut line_mode = false;
+        let mut nul_mode = false;
+        let mut format = None;
         let mut index = 0;
         while let Some(option) = args.get(index).map(String::as_str) {
             match option {
@@ -1474,11 +1479,30 @@ impl Shell {
                     break;
                 }
                 _ if option.starts_with('-') => {
-                    for flag in option[1..].chars() {
+                    let mut flags = option[1..].chars().peekable();
+                    while let Some(flag) = flags.next() {
                         match flag {
                             'n' => newline = false,
-                            'r' => raw = true,
+                            'r' | 'R' => raw = true,
                             'P' => prompt = true,
+                            'l' => line_mode = true,
+                            'N' => nul_mode = true,
+                            'f' => {
+                                let attached = flags.collect::<String>();
+                                if !attached.is_empty() {
+                                    format = Some(attached);
+                                } else {
+                                    index += 1;
+                                    let Some(value) = args.get(index) else {
+                                        return ExecResult::error(
+                                            2,
+                                            "isksh: print: -f requires a format",
+                                        );
+                                    };
+                                    format = Some(value.clone());
+                                }
+                                break;
+                            }
                             _ => {
                                 return ExecResult::error(
                                     2,
@@ -1492,7 +1516,19 @@ impl Shell {
             }
             index += 1;
         }
-        let value = args[index..].join(" ");
+        if let Some(format) = format {
+            let mut values = vec![format];
+            values.extend_from_slice(&args[index..]);
+            return builtin_printf(&values);
+        }
+        let separator = if nul_mode {
+            "\0"
+        } else if line_mode {
+            "\n"
+        } else {
+            " "
+        };
+        let value = args[index..].join(separator);
         let value = if prompt {
             self.expand_zsh_prompt_escapes(&value, self.last_status)
         } else if raw {
@@ -1501,7 +1537,9 @@ impl Shell {
             decode_echo_escapes(&value)
         };
         let mut stdout = value.into_bytes();
-        if newline {
+        if nul_mode {
+            stdout.push(0);
+        } else if newline {
             stdout.push(b'\n');
         }
         ExecResult {
@@ -1512,14 +1550,112 @@ impl Shell {
 
     fn builtin_setopt(&mut self, args: &[String], enabled: bool) -> ExecResult {
         for option in args {
-            let normalized = option.to_ascii_lowercase().replace('_', "");
-            if enabled {
+            let mut normalized = option.to_ascii_lowercase().replace('_', "");
+            let inverted = if matches!(normalized.as_str(), "nomatch" | "notify") {
+                None
+            } else {
+                normalized.strip_prefix("no").map(ToOwned::to_owned)
+            };
+            if inverted
+                .as_deref()
+                .is_some_and(|name| name.starts_with("no") && !matches!(name, "nomatch" | "notify"))
+            {
+                let command = if enabled { "setopt" } else { "unsetopt" };
+                return ExecResult::error(1, format!("isksh: {command}: no such option: {option}"));
+            }
+            let is_inverted = inverted.is_some();
+            if let Some(name) = inverted {
+                normalized = name;
+            }
+            if enabled != is_inverted {
                 self.shell_options.insert(normalized);
             } else {
                 self.shell_options.remove(&normalized);
             }
         }
         ExecResult::status(0)
+    }
+
+    fn builtin_emulate(&mut self, args: &[String]) -> ExecResult {
+        let mut shell = None;
+        for argument in args {
+            match argument.as_str() {
+                "-L" | "-R" | "-LR" | "-RL" => {}
+                value if !value.starts_with('-') && shell.is_none() => shell = Some(value),
+                value => {
+                    return ExecResult::error(
+                        2,
+                        format!("isksh: emulate: unsupported argument: {value}"),
+                    );
+                }
+            }
+        }
+        let Some(shell) = shell else {
+            return ExecResult {
+                stdout: format!("{}\n", self.mode.as_str()).into_bytes(),
+                ..ExecResult::status(0)
+            };
+        };
+        self.mode = match shell {
+            "sh" | "ksh" | "csh" => ShellMode::Bash,
+            _ => ShellMode::Zsh,
+        };
+        let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
+        ExecResult::status(0)
+    }
+
+    fn builtin_whence(&self, args: &[String]) -> ExecResult {
+        let mut verbose = false;
+        let mut word = false;
+        let mut index = 0;
+        while let Some(argument) = args.get(index) {
+            match argument.as_str() {
+                "-v" => verbose = true,
+                "-w" => word = true,
+                "--" => {
+                    index += 1;
+                    break;
+                }
+                value if value.starts_with('-') => {
+                    return ExecResult::error(
+                        2,
+                        format!("isksh: whence: unsupported option: {value}"),
+                    );
+                }
+                _ => break,
+            }
+            index += 1;
+        }
+        let mut status = 0;
+        let mut output = String::new();
+        for name in &args[index..] {
+            let (kind, detail) = if let Some(alias) = self.aliases.get(name) {
+                ("alias", format!("{name} is an alias for {alias}"))
+            } else if self.functions.contains_key(name) {
+                ("function", format!("{name} is a shell function"))
+            } else if is_builtin(name) {
+                ("builtin", format!("{name} is a shell builtin"))
+            } else {
+                let path = self.resolve_command_file(name);
+                if path.is_file() {
+                    ("command", path.to_string_lossy().into_owned())
+                } else {
+                    status = 1;
+                    ("none", format!("{name} not found"))
+                }
+            };
+            if word {
+                output.push_str(&format!("{name}: {kind}\n"));
+            } else if verbose || kind != "none" {
+                output.push_str(&detail);
+                output.push('\n');
+            }
+        }
+        ExecResult {
+            status,
+            stdout: output.into_bytes(),
+            ..ExecResult::status(0)
+        }
     }
 
     fn builtin_add_zsh_hook(&mut self, args: &[String]) -> ExecResult {
@@ -2847,7 +2983,10 @@ impl Shell {
                 }
             }
         }
-        let fields = if allow_split && split {
+        let fields = if allow_split
+            && split
+            && (self.mode == ShellMode::Bash || self.shell_options.contains("shwordsplit"))
+        {
             let ifs = self.value_of("IFS").unwrap_or_else(|| " \t\n".into());
             split_fields(&value, &ifs)
         } else {
@@ -2900,6 +3039,12 @@ impl Shell {
     }
 
     fn expand_parameter(&mut self, expression: &str) -> Result<String, String> {
+        if self.mode == ShellMode::Zsh
+            && let Some(name) = expression.strip_prefix('+')
+            && valid_assignment_name(name)
+        {
+            return Ok(usize::from(self.zsh_parameter_is_set(name)).to_string());
+        }
         if let Some(reference) = expression.strip_prefix('!')
             && let Some((name, subscript)) = parse_array_reference(reference)
             && matches!(subscript, "@" | "*")
@@ -3403,6 +3548,18 @@ impl Shell {
         self.value_of(name)
     }
 
+    fn zsh_parameter_is_set(&self, name: &str) -> bool {
+        if let Some((parameter, subscript)) = parse_array_reference(name) {
+            return match parameter {
+                "functions" => self.functions.contains_key(subscript),
+                "builtins" => is_builtin(subscript),
+                "commands" => self.resolve_command_file(subscript).is_file(),
+                _ => self.parameter_value(name).is_some(),
+            };
+        }
+        self.parameter_value(name).is_some()
+    }
+
     fn set_variable(
         &mut self,
         name: &str,
@@ -3710,6 +3867,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "declare",
     "dirs",
     "echo",
+    "emulate",
     "eval",
     "exec",
     "exit",
@@ -3748,6 +3906,7 @@ const BUILTIN_NAMES: &[&str] = &[
     "unset",
     "unsetopt",
     "wait",
+    "whence",
     "zmodload",
 ];
 
@@ -4195,6 +4354,20 @@ impl<'a> ArithmeticParser<'a> {
 
     fn factor(&mut self) -> Result<i64, String> {
         self.whitespace();
+        if self.consume('$') && self.consume('+') {
+            let start = self.index;
+            while self
+                .peek()
+                .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '[' | ']'))
+            {
+                self.index += 1;
+            }
+            let name: String = self.chars[start..self.index].iter().collect();
+            if !valid_assignment_name(&name) {
+                return Err("expected zsh parameter name after $+".into());
+            }
+            return Ok(i64::from(self.shell.zsh_parameter_is_set(&name)));
+        }
         if self.consume('-') {
             return Ok(-self.factor()?);
         }
@@ -5604,6 +5777,107 @@ mod tests {
             )
             .unwrap();
         assert_eq!(shell.expand_zsh_prompt_escapes("%~", 0), "~");
+    }
+
+    #[test]
+    fn supports_zsh_parameter_option_print_and_command_semantics() {
+        let mut shell = Shell::new("isksh");
+        shell.run("export ISKSH_MODE=zsh", &[]);
+        shell.refresh_mode();
+
+        assert_eq!(
+            shell.run("value='a b'; printf '<%s>' $value", &[]).stdout,
+            b"<a b>"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "typeset -a zitems; zitems[0]=x; printf '%s:%s:%s' ${+value} ${+missing} ${+zitems[0]}",
+                    &[],
+                )
+                .stdout,
+            b"1:0:1"
+        );
+        assert_eq!(shell.run("setopt SH_WORD_SPLIT", &[]).status, 0);
+        assert_eq!(shell.run("printf '<%s>' $value", &[]).stdout, b"<a><b>");
+        assert_eq!(shell.run("setopt No_SH_WORD_SPLIT", &[]).status, 0);
+        assert_eq!(shell.run("printf '<%s>' $value", &[]).stdout, b"<a b>");
+        assert_eq!(shell.run("unsetopt NO_SH_WORD_SPLIT", &[]).status, 0);
+        assert_eq!(shell.run("printf '<%s>' $value", &[]).stdout, b"<a><b>");
+        assert_eq!(shell.run("setopt notify nomatch", &[]).status, 0);
+        assert!(shell.shell_options.contains("notify"));
+        assert!(shell.shell_options.contains("nomatch"));
+        assert_eq!(shell.run("setopt nonomatch", &[]).status, 0);
+        assert!(!shell.shell_options.contains("nomatch"));
+        assert_eq!(shell.run("setopt nonobeep", &[]).status, 1);
+
+        assert_eq!(shell.run("print -ln -- a b", &[]).stdout, b"a\nb");
+        assert_eq!(shell.run("print -N -- a b", &[]).stdout, b"a\0b\0");
+        assert_eq!(shell.run("print -R -- 'a\\nb'", &[]).stdout, b"a\\nb\n");
+        assert_eq!(shell.run("print -f '%s:%s' a b", &[]).stdout, b"a:b");
+        assert_eq!(shell.run("print -f%s value", &[]).stdout, b"value");
+        assert_eq!(shell.run("print -f", &[]).status, 2);
+
+        shell.run("alias short='print ok'; named() { :; }", &[]);
+        let commands = tempfile::tempdir().unwrap();
+        fs::write(commands.path().join("zsh-tool"), "").unwrap();
+        shell
+            .set_variable(
+                "PATH",
+                commands.path().to_string_lossy().into_owned(),
+                Some(true),
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            shell
+                .run(
+                    "printf '%s:%s:%s:%s' ${+functions[named]} ${+builtins[print]} ${+commands[zsh-tool]} ${+functions[missing]}",
+                    &[],
+                )
+                .stdout,
+            b"1:1:1:0"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "printf '%s:%s' $(( $+functions[named] )) $(( $+functions[missing] ))",
+                    &[]
+                )
+                .stdout,
+            b"1:0"
+        );
+        assert!(shell.evaluate_arithmetic("$+").is_err());
+        let kinds = shell.run("whence -w short named print missing", &[]).stdout;
+        assert_eq!(
+            kinds,
+            b"short: alias\nnamed: function\nprint: builtin\nmissing: none\n"
+        );
+        assert_eq!(shell.run("whence missing", &[]).status, 1);
+        assert_eq!(
+            shell.run("whence -- print", &[]).stdout,
+            b"print is a shell builtin\n"
+        );
+        assert!(
+            String::from_utf8(
+                shell
+                    .run("whence -v short named print zsh-tool missing", &[])
+                    .stdout
+            )
+            .unwrap()
+            .contains("shell builtin")
+        );
+        assert_eq!(shell.run("whence -x print", &[]).status, 2);
+
+        assert_eq!(shell.run("emulate", &[]).stdout, b"zsh\n");
+        assert_eq!(shell.run("emulate -LR zsh", &[]).status, 0);
+        assert_eq!(shell.builtin_emulate(&["sh".into()]).status, 0);
+        assert_eq!(shell.mode, ShellMode::Bash);
+        assert_eq!(shell.value_of("ISKSH_MODE").as_deref(), Some("bash"));
+        assert_eq!(shell.builtin_emulate(&["invalid".into()]).status, 0);
+        assert_eq!(shell.mode, ShellMode::Zsh);
+        shell.mode = ShellMode::Zsh;
+        assert_eq!(shell.builtin_emulate(&["-x".into()]).status, 2);
     }
 
     #[test]

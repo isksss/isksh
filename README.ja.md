@@ -47,7 +47,7 @@ isksh -l
 - 配列、`[[ ... ]]`、プロセス置換、alias、主要built-inなどのBash機能
 - 対話コマンドを短縮するfish形式の`abbr -a NAME EXPANSION`
 - Starship、mise、zoxide、Atuin、fzfのBash形式初期化
-- プロンプトescape、`print`、option、`precmd`・`chpwd` hookのzsh互換モード
+- scalar展開、`${+name}`・`$+functions[name]`、プロンプトescape、`print`、`setopt`、`emulate`、`whence`、`precmd`・`chpwd` hookのzsh互換モード
 - Vim、Neovimなどの全画面アプリへの端末引き渡し
 - UTF-8スクリプトとLF・CRLF改行
 
@@ -58,6 +58,8 @@ isksh -l
 3. interactive shellで`.iskrc`
 
 `ISKSH_MODE`の既定値は`bash`です。プロセス環境または`.iskenv`で`ISKSH_MODE=zsh`を設定すると、後続の起動ファイルでzsh互換モードが有効になります。不明な値は`bash`へフォールバックします。
+
+zshモードでは、引用符なしのscalar parameterを既定でfield分割しません。zsh互換のfield分割が必要な場合は`setopt SH_WORD_SPLIT`を使います。option名は大文字・小文字を区別せず、underscoreを無視し、先頭の`no`による1回の反転に対応します。
 
 ## 対応環境
 

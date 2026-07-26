@@ -47,7 +47,7 @@ Running `isksh` without arguments starts interactive mode when standard input is
 - Common Bash features including arrays, `[[ ... ]]`, process substitution, aliases, and frequently used built-ins
 - Interactive command abbreviations with fish-style `abbr -a NAME EXPANSION`
 - Bash-style initialization for Starship, mise, zoxide, Atuin, and fzf
-- Optional zsh compatibility mode for prompt escapes, `print`, options, and `precmd`/`chpwd` hooks
+- Optional zsh compatibility mode with native scalar expansion, `${+name}` and `$+functions[name]`, prompt escapes, `print`, `setopt`, `emulate`, `whence`, and `precmd`/`chpwd` hooks
 - Native terminal handoff for Vim, Neovim, and other full-screen applications
 - UTF-8 scripts with LF or CRLF line endings
 
@@ -58,6 +58,8 @@ Startup files live only under `$XDG_CONFIG_HOME/isksh` (or `$HOME/.config/isksh`
 3. `.iskrc` for interactive shells
 
 `ISKSH_MODE` defaults to `bash`. Set `ISKSH_MODE=zsh` in the process environment or in `.iskenv` to enable zsh compatibility for the later startup files. Unknown values fall back to `bash`.
+
+In zsh mode, unquoted scalar parameters remain a single field by default. Use `setopt SH_WORD_SPLIT` when zsh-compatible field splitting is required. Option names are case-insensitive, ignore underscores, and support a single `no` prefix inversion.
 
 ## Platforms
 
