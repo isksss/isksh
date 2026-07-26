@@ -47,6 +47,12 @@ pub struct LexError {
     pub incomplete: bool,
 }
 
+/// Tokenizes shell source text.
+///
+/// # Errors
+///
+/// Returns [`LexError`] when the source contains an invalid or incomplete
+/// lexical construct.
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(source).lex_all()
 }

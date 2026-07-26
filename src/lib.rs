@@ -1,3 +1,10 @@
+//! A portable, POSIX-oriented shell with optional Bash and zsh compatibility behavior.
+//!
+//! The crate exposes [`Shell`] for executing source text, startup-file helpers, and
+//! [`run_interactive`] for embedding the interactive read-evaluate-print loop.
+
+#![warn(missing_docs)]
+
 mod ast;
 mod interactive;
 mod lexer;

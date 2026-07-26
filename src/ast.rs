@@ -100,6 +100,7 @@ pub struct Word {
 }
 
 impl Word {
+    /// Returns the text when this word is exactly one unquoted literal part.
     pub fn as_plain_literal(&self) -> Option<&str> {
         match self.parts.as_slice() {
             [

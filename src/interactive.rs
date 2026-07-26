@@ -1,6 +1,15 @@
 use crate::{InputState, Shell};
 use std::io::{self, BufRead, Write};
 
+/// Runs the interactive read-evaluate-print loop for a shell.
+///
+/// Input is read from `reader`; command output and diagnostics are forwarded to
+/// `stdout` and `stderr`. When `show_prompts` is true, primary and continuation
+/// prompts are written before input is read.
+///
+/// # Errors
+///
+/// Returns an I/O error when reading input or writing output fails.
 pub fn run_interactive(
     shell: &mut Shell,
     reader: &mut dyn BufRead,

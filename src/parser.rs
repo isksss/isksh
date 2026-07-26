@@ -12,6 +12,11 @@ pub struct ParseError {
     pub incomplete: bool,
 }
 
+/// Parses shell source text into a syntax tree.
+///
+/// # Errors
+///
+/// Returns [`ParseError`] when tokenization or grammar validation fails.
 pub fn parse(source: &str) -> Result<Script, ParseError> {
     let (source, here_documents) = extract_here_documents(source)?;
     let tokens = lex(&source).map_err(|error| ParseError {

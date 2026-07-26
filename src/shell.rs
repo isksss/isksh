@@ -99,28 +99,43 @@ impl ExecResult {
     }
 }
 
+/// The observable result of executing shell source.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
+    /// The command exit status.
     pub status: i32,
+    /// Bytes written to standard output.
     pub stdout: Vec<u8>,
+    /// Bytes written to standard error.
     pub stderr: Vec<u8>,
 }
 
+/// Describes whether a source fragment is ready to execute.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputState {
+    /// The source is syntactically complete.
     Complete,
+    /// The source requires additional input.
     Incomplete,
+    /// The source is invalid and contains the associated diagnostic message.
     Invalid(String),
 }
 
+/// Selects the shell compatibility behavior exposed by [`Shell`].
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ShellMode {
+    /// Enables the default Bash-oriented compatibility behavior.
     #[default]
     Bash,
+    /// Enables zsh-oriented prompts, built-ins, and hooks.
     Zsh,
 }
 
 impl ShellMode {
+    /// Resolves a mode from an `ISKSH_MODE` environment value.
+    ///
+    /// Only the exact value `zsh` selects [`ShellMode::Zsh`]. Missing and
+    /// unsupported values fall back to [`ShellMode::Bash`].
     pub fn from_environment(value: Option<&str>) -> Self {
         match value {
             Some("zsh") => Self::Zsh,
@@ -128,6 +143,7 @@ impl ShellMode {
         }
     }
 
+    /// Returns the canonical value used by the `ISKSH_MODE` environment variable.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bash => "bash",
@@ -136,6 +152,10 @@ impl ShellMode {
     }
 }
 
+/// A stateful shell interpreter.
+///
+/// A `Shell` preserves variables, functions, aliases, options, the working
+/// directory, and other execution state between calls to [`Shell::run`].
 #[derive(Debug, Clone)]
 pub struct Shell {
     variables: HashMap<String, Variable>,
@@ -178,6 +198,10 @@ impl Default for Shell {
 }
 
 impl Shell {
+    /// Creates a shell using the current process environment and working directory.
+    ///
+    /// `name` becomes the shell's `$0` value. The initial compatibility mode is
+    /// resolved from `ISKSH_MODE` and defaults to Bash behavior.
     pub fn new(name: impl Into<String>) -> Self {
         let mut variables: HashMap<_, _> = std::env::vars()
             .map(|(name, value)| {
@@ -244,23 +268,34 @@ impl Shell {
         }
     }
 
+    /// Returns the active compatibility mode.
     pub fn mode(&self) -> ShellMode {
         self.mode
     }
 
+    /// Reloads the compatibility mode from the shell's `ISKSH_MODE` variable.
+    ///
+    /// Unsupported values are normalized to `bash` and exported back into the
+    /// shell environment.
     pub fn refresh_mode(&mut self) {
         self.mode = ShellMode::from_environment(self.value_of("ISKSH_MODE").as_deref());
         let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
     }
 
+    /// Replaces the shell's positional parameters.
     pub fn set_positional(&mut self, values: Vec<String>) {
         self.positional = values;
     }
 
+    /// Returns the current executable search path, or `None` when `PATH` is unset.
     pub fn command_search_path(&self) -> Option<String> {
         self.value_of("PATH")
     }
 
+    /// Returns configured alias, abbreviation, and function names.
+    ///
+    /// The returned order is unspecified and duplicate names may be present when
+    /// multiple configuration categories use the same name.
     pub fn configured_command_names(&self) -> Vec<String> {
         self.aliases
             .keys()
@@ -270,11 +305,12 @@ impl Shell {
             .collect()
     }
 
+    /// Returns a copy of all configured interactive abbreviations.
     pub fn configured_abbreviations(&self) -> HashMap<String, String> {
         self.abbreviations.clone()
     }
 
-    /// Expands command-position abbreviations in interactive input.
+    /// Expands command-position abbreviations in interactive source text.
     pub fn expand_abbreviations(&self, source: &str) -> String {
         let mut output = String::with_capacity(source.len());
         let mut rest = source;
@@ -342,7 +378,7 @@ impl Shell {
         output
     }
 
-    /// Controls whether foreground external commands may use the shell's terminal directly.
+    /// Controls whether foreground external commands may use the terminal directly.
     pub fn set_interactive(&mut self, interactive: bool) {
         self.terminal_io = interactive;
         if interactive {
@@ -350,6 +386,7 @@ impl Shell {
         }
     }
 
+    /// Classifies source text as complete, incomplete, or invalid.
     pub fn check_input(source: &str) -> InputState {
         match parse(source) {
             Ok(_) => InputState::Complete,
@@ -358,6 +395,10 @@ impl Shell {
         }
     }
 
+    /// Builds the primary or continuation prompt for the current shell state.
+    ///
+    /// Primary prompts run configured prompt hooks and `PROMPT_COMMAND` before
+    /// expanding prompt escapes and substitutions.
     pub fn prompt(&mut self, continuation: bool) -> String {
         let saved_status = self.last_status;
         let mut prefix = String::new();
@@ -411,10 +452,17 @@ impl Shell {
         prefix
     }
 
+    /// Takes the exit status requested by an executed `exit` built-in.
+    ///
+    /// The stored value is cleared after this call.
     pub fn take_exit_status(&mut self) -> Option<i32> {
         self.exit_status.take()
     }
 
+    /// Parses and executes shell source with the supplied standard-input bytes.
+    ///
+    /// Execution state is retained for subsequent calls. Syntax and runtime
+    /// failures are returned through [`RunResult`] instead of Rust errors.
     pub fn run(&mut self, source: &str, input: &[u8]) -> RunResult {
         if let Some(result) = self.apply_known_bash_integration(source) {
             self.last_status = result.status;

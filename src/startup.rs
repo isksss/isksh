@@ -4,13 +4,22 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+/// Paths to the startup files recognized by isksh.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupFiles {
+    /// The environment file loaded for every invocation.
     pub env: PathBuf,
+    /// The profile file loaded by login shells.
     pub profile: PathBuf,
+    /// The runtime configuration file loaded by interactive shells.
     pub rc: PathBuf,
 }
 
+/// Resolves startup-file paths from the current environment.
+///
+/// `XDG_CONFIG_HOME` is preferred. When it is unset, `$HOME/.config` is used,
+/// with `USERPROFILE` serving as the Windows home-directory fallback.
+/// Returns `None` when no usable configuration or home directory is available.
 pub fn startup_files() -> Option<StartupFiles> {
     startup_files_from(
         std::env::var_os("XDG_CONFIG_HOME"),
@@ -38,6 +47,15 @@ fn startup_files_from(
     })
 }
 
+/// Loads and executes one startup file.
+///
+/// Returns `Ok(None)` when `path` does not exist and `Ok(Some(_))` after an
+/// existing file has been executed.
+///
+/// # Errors
+///
+/// Returns an I/O error when the file cannot be read, or
+/// [`io::ErrorKind::InvalidData`] when its contents are not valid UTF-8.
 pub fn load_startup_file(shell: &mut Shell, path: &Path) -> io::Result<Option<RunResult>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
