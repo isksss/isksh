@@ -5725,6 +5725,22 @@ mod tests {
     #[test]
     fn manages_background_jobs_wait_and_special_parameter() {
         let mut shell = Shell::default();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let running_id = BACKGROUND_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        shell.background_jobs.lock().unwrap().insert(
+            running_id,
+            std::thread::spawn(move || {
+                blocked.recv().unwrap();
+                ExecResult::status(0)
+            }),
+        );
+        assert_eq!(
+            shell.builtin_jobs().stdout,
+            format!("[{running_id}] Running\n").into_bytes()
+        );
+        release.send(()).unwrap();
+        assert_eq!(shell.builtin_wait(&[running_id.to_string()]).status, 0);
+
         assert_eq!(shell.run("printf async &", &[]).status, 0);
         let id = shell.expand_parameter("!").unwrap().parse::<u32>().unwrap();
         while !shell
