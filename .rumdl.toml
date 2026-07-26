@@ -1,0 +1,4 @@
+[global]
+disable = ["MD013"]
+exclude = ["dist", "target"]
+respect-gitignore = true

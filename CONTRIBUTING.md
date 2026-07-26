@@ -53,11 +53,12 @@ git switch -c feat/zsh-autoload
 コミット前に全検証を実行します。
 
 ```console
+docker compose run --rm dev mise run fmt-markdown
 docker compose run --rm dev mise run check-all
 git diff --check
 ```
 
-`check-all`はrustfmt、Clippy、全テスト、差分テスト、100%の行・関数カバレッジ、対応ターゲットの検査、リリースバイナリの静的依存検証を実行します。
+`fmt-markdown`は全Markdownファイルを整形します。`check-all`はRustとMarkdownの整形検査、Clippy、Markdown lint、全テスト、差分テスト、100%の行・関数カバレッジ、対応ターゲットの検査、リリースバイナリの静的依存検証を実行します。
 
 Windows固有の実行処理を変更した場合は、Windowsホストでも次を実行します。
 

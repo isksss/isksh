@@ -84,7 +84,7 @@ docker compose build dev
 docker compose run --rm dev mise run check-all
 ```
 
-`check-all` runs formatting, Clippy, tests, 100% line-coverage enforcement, cross-target checks, release builds, and static dependency verification. Windows host behavior is tested with:
+`check-all` runs Rust and Markdown formatting checks, Clippy, Markdown lint, tests, 100% line-coverage enforcement, cross-target checks, release builds, and static dependency verification. Format all Markdown files with `docker compose run --rm dev mise run fmt-markdown`. Windows host behavior is tested with:
 
 ```powershell
 .\scripts\windows-smoke.ps1

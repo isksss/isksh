@@ -3,6 +3,7 @@ min_version = "2026.7.0"
 [tools]
 rust = { version = "1.97.1", components = ["clippy", "rustfmt", "llvm-tools-preview"], targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl", "x86_64-pc-windows-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin"] }
 zig = "0.15.2"
+rumdl = "0.2.34"
 "cargo:cargo-zigbuild" = "0.20.1"
 "cargo:cargo-llvm-cov" = "0.8.7"
 
@@ -26,6 +27,14 @@ run = "cargo llvm-cov --locked --lib --fail-under-lines 100 --fail-under-functio
 description = "Run Clippy with warnings denied"
 run = "cargo clippy --all-targets --locked -- -D warnings"
 
+[tasks.fmt-markdown]
+description = "Format every Markdown file"
+run = "rumdl fmt ."
+
+[tasks.lint-markdown]
+description = "Lint every Markdown file and reject formatting differences"
+run = "rumdl check ."
+
 [tasks.fmt-check]
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
@@ -40,5 +49,5 @@ depends = ["build-release"]
 run = "bash scripts/verify-static.sh"
 
 [tasks.check-all]
-description = "Run formatting, lint, tests, target checks and static verification"
-depends = ["fmt-check", "lint", "test", "coverage", "check-targets", "verify-static"]
+description = "Run Rust and Markdown formatting, lint, tests, target checks and static verification"
+depends = ["fmt-check", "lint", "lint-markdown", "test", "coverage", "check-targets", "verify-static"]

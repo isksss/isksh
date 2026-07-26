@@ -84,7 +84,7 @@ docker compose build dev
 docker compose run --rm dev mise run check-all
 ```
 
-`check-all`はフォーマット、Clippy、テスト、行カバレッジ100%、クロスターゲット検査、リリースビルド、静的依存検証を実行します。Windows実機では次を実行します。
+`check-all`はRustとMarkdownの整形検査、Clippy、Markdown lint、テスト、行カバレッジ100%、クロスターゲット検査、リリースビルド、静的依存検証を実行します。全Markdownファイルの整形には`docker compose run --rm dev mise run fmt-markdown`を使用します。Windows実機では次を実行します。
 
 ```powershell
 .\scripts\windows-smoke.ps1

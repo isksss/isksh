@@ -84,7 +84,7 @@ docker compose build dev
 docker compose run --rm dev mise run check-all
 ```
 
-`check-all` 会执行格式检查、Clippy、测试、100% 行覆盖率检查、交叉目标检查、发布构建和静态依赖验证。Windows 主机行为使用以下命令测试：
+`check-all`会执行Rust和Markdown格式检查、Clippy、Markdown lint、测试、100%行覆盖率检查、交叉目标检查、发布构建和静态依赖验证。使用`docker compose run --rm dev mise run fmt-markdown`格式化所有Markdown文件。Windows主机行为使用以下命令测试：
 
 ```powershell
 .\scripts\windows-smoke.ps1

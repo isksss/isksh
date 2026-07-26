@@ -47,6 +47,7 @@ docker compose run --rm dev mise run check-all
 
 - rustfmt差分ゼロ
 - Clippy警告ゼロ
+- 全Markdownファイルのformat差分とlint違反ゼロ
 - 全Rustテスト成功
 - dashとのPOSIX差分テスト成功
 - 本体ライブラリの行カバレッジ100%
