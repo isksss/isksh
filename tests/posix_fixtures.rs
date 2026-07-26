@@ -1,5 +1,6 @@
 use isksh::Shell;
 
+/// `assert_script`に対応する処理を行う。
 fn assert_script(source: &str, expected: &str, status: i32) {
     let result = Shell::default().run(source, &[]);
     assert_eq!(
@@ -12,6 +13,7 @@ fn assert_script(source: &str, expected: &str, status: i32) {
 }
 
 #[test]
+/// `and_or_lists_follow_exit_status`に対応する処理を行う。
 fn and_or_lists_follow_exit_status() {
     assert_script(
         "false && printf no; true || printf no; false || printf yes",
@@ -21,11 +23,13 @@ fn and_or_lists_follow_exit_status() {
 }
 
 #[test]
+/// `if_without_matching_branch_returns_success`に対応する処理を行う。
 fn if_without_matching_branch_returns_success() {
     assert_script("if false; then printf unexpected; fi", "", 0);
 }
 
 #[test]
+/// `quotes_control_field_splitting`に対応する処理を行う。
 fn quotes_control_field_splitting() {
     assert_script(
         "value='a b'; for x in $value; do printf '<%s>' \"$x\"; done",
@@ -40,6 +44,7 @@ fn quotes_control_field_splitting() {
 }
 
 #[test]
+/// `parameter_default_operators_work`に対応する処理を行う。
 fn parameter_default_operators_work() {
     assert_script(
         "unset value; printf '%s' \"${value:-fallback}\"",
@@ -54,6 +59,7 @@ fn parameter_default_operators_work() {
 }
 
 #[test]
+/// `redirection_writes_and_reads_files`に対応する処理を行う。
 fn redirection_writes_and_reads_files() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory
@@ -66,12 +72,14 @@ fn redirection_writes_and_reads_files() {
 }
 
 #[test]
+/// `here_documents_expand_unless_delimiter_is_quoted`に対応する処理を行う。
 fn here_documents_expand_unless_delimiter_is_quoted() {
     assert_script("value=ok\ncat <<EOF\n$value:$((1 + 2))\nEOF\n", "ok:3\n", 0);
     assert_script("value=ignored\ncat <<'EOF'\n$value\nEOF\n", "$value\n", 0);
 }
 
 #[test]
+/// `pattern_removal_and_non_whitespace_ifs_match_posix`に対応する処理を行う。
 fn pattern_removal_and_non_whitespace_ifs_match_posix() {
     assert_script(
         "value=abcabc; printf '%s|%s|%s|%s' \"${value%c*}\" \"${value%%c*}\" \"${value#a*}\" \"${value##a*}\"",
@@ -86,6 +94,7 @@ fn pattern_removal_and_non_whitespace_ifs_match_posix() {
 }
 
 #[test]
+/// `external_pipeline_is_concurrent`に対応する処理を行う。
 fn external_pipeline_is_concurrent() {
     assert_script("yes | head -n 1", "y\n", 0);
 }

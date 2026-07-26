@@ -1,10 +1,12 @@
 use std::process::{Command, Stdio};
 
+/// `isksh`に対応する処理を行う。
 fn isksh() -> Command {
     Command::new(env!("CARGO_BIN_EXE_isksh"))
 }
 
 #[test]
+/// `runs_command_string`に対応する処理を行う。
 fn runs_command_string() {
     let output = isksh()
         .args(["-c", "value=cli; printf '%s\\n' \"$value\""])
@@ -15,6 +17,7 @@ fn runs_command_string() {
 }
 
 #[test]
+/// `runs_script_file_with_arguments`に対応する処理を行う。
 fn runs_script_file_with_arguments() {
     let directory = tempfile::tempdir().unwrap();
     let script = directory.path().join("script.sh");
@@ -29,6 +32,7 @@ fn runs_script_file_with_arguments() {
 }
 
 #[test]
+/// `reads_script_from_stdin`に対応する処理を行う。
 fn reads_script_from_stdin() {
     let mut child = isksh()
         .arg("-s")
@@ -48,6 +52,7 @@ fn reads_script_from_stdin() {
 }
 
 #[test]
+/// `reads_script_from_stdin_without_option`に対応する処理を行う。
 fn reads_script_from_stdin_without_option() {
     let output = isksh()
         .stdin(Stdio::piped())
@@ -63,6 +68,7 @@ fn reads_script_from_stdin_without_option() {
 }
 
 #[test]
+/// `rejects_non_utf8_input`に対応する処理を行う。
 fn rejects_non_utf8_input() {
     let mut child = isksh()
         .arg("-s")
@@ -78,6 +84,7 @@ fn rejects_non_utf8_input() {
 }
 
 #[test]
+/// `reports_help_version_and_cli_errors`に対応する処理を行う。
 fn reports_help_version_and_cli_errors() {
     let help = isksh().arg("--help").output().unwrap();
     assert!(help.status.success());
@@ -101,7 +108,61 @@ fn reports_help_version_and_cli_errors() {
     );
 }
 
+/// 英語・日本語・中国語でヘルプ、通常メッセージ、診断を出力できることを確認する。
 #[test]
+fn localizes_cli_and_shell_messages() {
+    for (language, help_heading, usage_heading, builtin_text, missing_text) in [
+        (
+            "en",
+            "Usage:",
+            "usage:",
+            "shell builtin",
+            "command not found",
+        ),
+        (
+            "ja",
+            "使用方法:",
+            "使用方法:",
+            "シェル組み込みコマンド",
+            "コマンドが見つかりません",
+        ),
+        ("zh-CN", "用法:", "用法:", "shell 内置命令", "找不到命令"),
+    ] {
+        let help = isksh()
+            .arg("--help")
+            .env("ISKSH_LANG", language)
+            .output()
+            .unwrap();
+        assert!(help.status.success());
+        assert!(
+            String::from_utf8(help.stdout)
+                .unwrap()
+                .contains(help_heading)
+        );
+
+        let builtin = isksh()
+            .args(["-c", "help printf; type printf; abbr --help"])
+            .env("ISKSH_LANG", language)
+            .output()
+            .unwrap();
+        assert!(builtin.status.success());
+        let builtin = String::from_utf8(builtin.stdout).unwrap();
+        assert!(builtin.contains(builtin_text), "{language}: {builtin}");
+        assert!(builtin.contains(usage_heading), "{language}: {builtin}");
+
+        let missing = isksh()
+            .args(["-c", "__isksh_missing_localized_command__"])
+            .env("ISKSH_LANG", language)
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(127));
+        let missing = String::from_utf8(missing.stderr).unwrap();
+        assert!(missing.contains(missing_text), "{language}: {missing}");
+    }
+}
+
+#[test]
+/// `force_interactive_mode_reads_lines_and_exit`に対応する処理を行う。
 fn force_interactive_mode_reads_lines_and_exit() {
     let mut child = isksh()
         .arg("-i")
@@ -126,6 +187,7 @@ fn force_interactive_mode_reads_lines_and_exit() {
 }
 
 #[test]
+/// `interactive_mode_loads_iskrc`に対応する処理を行う。
 fn interactive_mode_loads_iskrc() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("isksh");
@@ -159,6 +221,7 @@ fn interactive_mode_loads_iskrc() {
 }
 
 #[test]
+/// `startup_files_follow_environment_login_and_interactive_rules`に対応する処理を行う。
 fn startup_files_follow_environment_login_and_interactive_rules() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("config/isksh");
@@ -211,6 +274,7 @@ fn startup_files_follow_environment_login_and_interactive_rules() {
 }
 
 #[test]
+/// `invalid_mode_falls_back_to_bash_and_other_shell_rc_files_are_ignored`に対応する処理を行う。
 fn invalid_mode_falls_back_to_bash_and_other_shell_rc_files_are_ignored() {
     let directory = tempfile::tempdir().unwrap();
     let config = directory.path().join("config/isksh");
@@ -230,6 +294,7 @@ fn invalid_mode_falls_back_to_bash_and_other_shell_rc_files_are_ignored() {
 
 #[cfg(unix)]
 #[test]
+/// `rejects_non_utf8_argument`に対応する処理を行う。
 fn rejects_non_utf8_argument() {
     use std::os::unix::ffi::OsStringExt;
     let output = isksh()

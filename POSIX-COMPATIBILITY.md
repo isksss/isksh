@@ -1,24 +1,24 @@
-# POSIX.1-2024 compatibility
+# POSIX.1-2024互換性
 
 基準文書は[Shell Command Language, POSIX.1-2024](https://pubs.opengroup.org/onlinepubs/9799919799/utilities/V3_chap02.html)です。
 
 | 分野 | 状態 | 備考 |
 |---|---|---|
-| Token recognition / quoting | Partial | UTF-8入力のみ |
-| Simple commands / assignments | Partial | 基本的な検索・実行に対応 |
-| Parameter expansion | Partial | 既定値演算子、入れ子展開、`#`・`##`・`%`・`%%`パターン削除に対応 |
-| Command / arithmetic substitution | Partial | 基本形式に対応 |
-| Field splitting / pathname expansion | Partial | IFS空白・非空白区切り、nullglob、dotglobに対応。UTF-8とホストファイルシステムに依存 |
-| Redirection / here-document | Partial | 任意番号の永続ディスクリプタと基本リダイレクトに対応。OSハンドルの完全継承は段階実装 |
-| Pipelines / AND-OR lists | Partial | 外部コマンド間は並列OSパイプ。built-in・関数を含む場合は内部バッファを使用 |
-| Compound commands | Partial | if/for/while/until/group/subshellを優先 |
-| Functions | Partial | 基本的な定義・呼び出しに対応 |
-| Built-in utilities | Partial | trap、umask、hash、exec永続リダイレクト、read、printfを含むMVP対象を実装 |
-| Job control | Partial | 非同期`&`、ジョブID、jobs、waitに対応。停止・再開・fg・bgは未対応 |
-| Interactive shell | Partial | PS1/PS2、PROMPT_COMMAND、履歴、補完、Ctrl+R、継続入力、外部コマンドのTTY・基本シグナル制御に対応 |
-| Startup configuration | Partial | `.config/isksh`配下の`.iskenv`、`.iskprofile`、`.iskrc`を起動種別に応じて読込 |
-| Bash extensions | Partial | 配列、`[[ ]]`、process substitution、PIPESTATUS、pipefail、ディレクトリスタック、`let`、`printf -v`、主要ツールのBash初期化変換を実装。高度な配列属性・拡張glob等は未対応 |
-| zsh compatibility mode | Partial | `ISKSH_MODE=zsh`でtied/special parameter、主要option、autoload/sticky function、global/suffix alias、主要hook、completion/ZLE状態、拡張PROMPT、算術・`[[ ]]`、zsh系builtinに対応。zshの全構文、全option、全module、terminal widgetの完全再現は未対応 |
-| Non-UTF-8 shell data | Not supported | 明示的エラー |
+| トークン認識・引用 | 部分対応 | UTF-8入力のみ |
+| 単純コマンド・代入 | 部分対応 | 基本的な検索・実行に対応 |
+| パラメータ展開 | 部分対応 | 既定値演算子、入れ子展開、`#`・`##`・`%`・`%%`パターン削除に対応 |
+| コマンド置換・算術置換 | 部分対応 | 基本形式に対応 |
+| フィールド分割・パス名展開 | 部分対応 | IFS空白・非空白区切り、nullglob、dotglobに対応。UTF-8とホストファイルシステムに依存 |
+| リダイレクト・ヒアドキュメント | 部分対応 | 任意番号の永続ディスクリプタと基本リダイレクトに対応。OSハンドルの完全継承は段階実装 |
+| パイプライン・AND-ORリスト | 部分対応 | 外部コマンド間は並列OSパイプ。組み込みコマンド・関数を含む場合は内部バッファを使用 |
+| 複合コマンド | 部分対応 | if、for、while、until、group、subshellを優先 |
+| 関数 | 部分対応 | 基本的な定義・呼び出しに対応 |
+| 組み込みユーティリティ | 部分対応 | trap、umask、hash、exec永続リダイレクト、read、printfを含むMVP対象を実装 |
+| ジョブ制御 | 部分対応 | 非同期`&`、ジョブID、jobs、waitに対応。停止・再開・fg・bgは未対応 |
+| 対話シェル | 部分対応 | PS1、PS2、PROMPT_COMMAND、履歴、補完、Ctrl+R、継続入力、外部コマンドのTTY・基本シグナル制御に対応 |
+| 起動設定 | 部分対応 | `.config/isksh`配下の`.iskenv`、`.iskprofile`、`.iskrc`を起動種別に応じて読込 |
+| Bash拡張 | 部分対応 | 配列、`[[ ]]`、プロセス置換、PIPESTATUS、pipefail、ディレクトリスタック、`let`、`printf -v`、主要ツールのBash初期化変換を実装。高度な配列属性・拡張globなどは未対応 |
+| zsh互換モード | 部分対応 | `ISKSH_MODE=zsh`で連動・特殊パラメータ、主要オプション、自動読み込み・sticky関数、global・suffix alias、主要フック、補完・ZLE状態、拡張PROMPT、算術・`[[ ]]`、zsh系組み込みコマンドに対応。zshの全構文、全オプション、全モジュール、端末ウィジェットの完全再現は未対応 |
+| UTF-8以外のシェルデータ | 未対応 | 明示的エラー |
 
 WindowsではPOSIXシグナル、プロセスグループ、パス表現を完全には再現できません。`.cmd`と`.bat`は`cmd.exe`経由で実行し、PowerShellスクリプトは自動実行しません。

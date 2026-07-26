@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/isksh.svg)](https://crates.io/crates/isksh)
 [![aqua](https://img.shields.io/github/v/release/isksss/isksh?label=aqua&color=2e9afe)](https://github.com/aquaproj/aqua-registry/blob/main/pkgs/isksss/isksh/registry.yaml)
 
-[English](README.md)
+[英語](README.md) | [簡体字中国語](README.zh-CN.md)
 
 `isksh`はRust製のクロスプラットフォームシェルです。POSIX.1-2024 Shell Command Languageへの準拠を目標とし、一般的なdotfilesやCLIツールで使われるBash構文にも対応します。
 
@@ -58,6 +58,8 @@ isksh -l
 3. interactive shellで`.iskrc`
 
 `ISKSH_MODE`の既定値は`bash`です。プロセス環境または`.iskenv`で`ISKSH_MODE=zsh`を設定すると、後続の起動ファイルでzsh互換モードが有効になります。不明な値は`bash`へフォールバックします。
+
+isksh自身のヘルプ、通常メッセージ、診断は英語・日本語・簡体字中国語に対応します。`ISKSH_LANG=en`、`ISKSH_LANG=ja`、`ISKSH_LANG=zh`のいずれかを設定してください。未設定時は`LC_ALL`、`LC_MESSAGES`、`LANGUAGE`、`LANG`の順に参照し、未対応または未設定の値は英語へフォールバックします。外部コマンドが出力した内容は翻訳しません。
 
 zshモードでは、引用符なしのscalar parameterを既定でfield分割しません。zsh互換のfield分割が必要な場合は`setopt SH_WORD_SPLIT`を使います。option名は大文字・小文字を区別せず、underscoreを無視し、先頭の`no`による1回の反転に対応します。
 

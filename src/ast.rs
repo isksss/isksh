@@ -100,7 +100,7 @@ pub struct Word {
 }
 
 impl Word {
-    /// Returns the text when this word is exactly one unquoted literal part.
+    /// 単語が引用されていない単一リテラルだけの場合に、その文字列を返す。
     pub fn as_plain_literal(&self) -> Option<&str> {
         match self.parts.as_slice() {
             [

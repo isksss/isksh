@@ -1,15 +1,14 @@
 use crate::{InputState, Shell};
 use std::io::{self, BufRead, Write};
 
-/// Runs the interactive read-evaluate-print loop for a shell.
+/// シェルの対話的な読み取り・評価・表示ループを実行する。
 ///
-/// Input is read from `reader`; command output and diagnostics are forwarded to
-/// `stdout` and `stderr`. When `show_prompts` is true, primary and continuation
-/// prompts are written before input is read.
+/// `reader`から入力を読み、コマンド出力と診断を`stdout`と`stderr`へ転送する。
+/// `show_prompts`が真の場合は、入力を読む前に一次・継続プロンプトを書き込む。
 ///
-/// # Errors
+/// # エラー
 ///
-/// Returns an I/O error when reading input or writing output fails.
+/// 入力の読み取りまたは出力の書き込みに失敗した場合はI/Oエラーを返す。
 pub fn run_interactive(
     shell: &mut Shell,
     reader: &mut dyn BufRead,
@@ -62,6 +61,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
+    /// `preserves_state_and_collects_continuation_lines`に対応する処理を行う。
     fn preserves_state_and_collects_continuation_lines() {
         let mut shell = Shell::default();
         let mut input =
@@ -76,6 +76,7 @@ mod tests {
     }
 
     #[test]
+    /// `prints_primary_and_continuation_prompts`に対応する処理を行う。
     fn prints_primary_and_continuation_prompts() {
         let mut shell = Shell::default();
         let mut input = Cursor::new(b"printf '%s' 'continued\nline'\n");
@@ -89,6 +90,7 @@ mod tests {
     }
 
     #[test]
+    /// `executes_pending_input_at_eof_and_reports_invalid_input`に対応する処理を行う。
     fn executes_pending_input_at_eof_and_reports_invalid_input() {
         let mut shell = Shell::default();
         let mut input = Cursor::new(b"printf pending");
@@ -120,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    /// `expands_abbreviations_before_interactive_execution`に対応する処理を行う。
     fn expands_abbreviations_before_interactive_execution() {
         let mut shell = Shell::default();
         assert_eq!(shell.run("abbr -a p printf", &[]).status, 0);

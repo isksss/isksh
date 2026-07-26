@@ -4,7 +4,7 @@
 [![crates.io](https://img.shields.io/crates/v/isksh.svg)](https://crates.io/crates/isksh)
 [![aqua](https://img.shields.io/github/v/release/isksss/isksh?label=aqua&color=2e9afe)](https://github.com/aquaproj/aqua-registry/blob/main/pkgs/isksss/isksh/registry.yaml)
 
-[日本語](README.ja.md)
+[日本語](README.ja.md) | [简体中文](README.zh-CN.md)
 
 `isksh` is a cross-platform shell written in Rust. It targets the POSIX.1-2024 Shell Command Language and supports practical Bash syntax used by common dotfiles and command-line tools.
 
@@ -58,6 +58,8 @@ Startup files live only under `$XDG_CONFIG_HOME/isksh` (or `$HOME/.config/isksh`
 3. `.iskrc` for interactive shells
 
 `ISKSH_MODE` defaults to `bash`. Set `ISKSH_MODE=zsh` in the process environment or in `.iskenv` to enable zsh compatibility for the later startup files. Unknown values fall back to `bash`.
+
+isksh's own help, informational messages, and diagnostics support English, Japanese, and Simplified Chinese. Set `ISKSH_LANG=en`, `ISKSH_LANG=ja`, or `ISKSH_LANG=zh`. When it is unset, `LC_ALL`, `LC_MESSAGES`, `LANGUAGE`, and `LANG` are checked in that order; unsupported or missing values fall back to English. Output produced by external commands is never translated.
 
 In zsh mode, unquoted scalar parameters remain a single field by default. Use `setopt SH_WORD_SPLIT` when zsh-compatible field splitting is required. Option names are case-insensitive, ignore underscores, and support a single `no` prefix inversion.
 

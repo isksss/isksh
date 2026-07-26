@@ -1,25 +1,26 @@
+use crate::i18n::localize;
 use crate::{RunResult, Shell};
 use std::ffi::OsString;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-/// Paths to the startup files recognized by isksh.
+/// iskshが認識する起動ファイルのパス。
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupFiles {
-    /// The environment file loaded for every invocation.
+    /// 起動のたびに読み込む環境ファイル。
     pub env: PathBuf,
-    /// The profile file loaded by login shells.
+    /// ログインシェルが読み込むプロファイルファイル。
     pub profile: PathBuf,
-    /// The runtime configuration file loaded by interactive shells.
+    /// 対話シェルが読み込む実行時設定ファイル。
     pub rc: PathBuf,
 }
 
-/// Resolves startup-file paths from the current environment.
+/// 現在の環境から起動ファイルのパスを解決する。
 ///
-/// `XDG_CONFIG_HOME` is preferred. When it is unset, `$HOME/.config` is used,
-/// with `USERPROFILE` serving as the Windows home-directory fallback.
-/// Returns `None` when no usable configuration or home directory is available.
+/// `XDG_CONFIG_HOME`を優先し、未設定なら`$HOME/.config`を使用する。
+/// Windowsでは`USERPROFILE`をホームディレクトリの代替として扱う。
+/// 利用可能な設定またはホームディレクトリがなければ`None`を返す。
 pub fn startup_files() -> Option<StartupFiles> {
     startup_files_from(
         std::env::var_os("XDG_CONFIG_HOME"),
@@ -27,6 +28,7 @@ pub fn startup_files() -> Option<StartupFiles> {
     )
 }
 
+/// `startup_files_from`に対応する処理を行う。
 fn startup_files_from(
     config_home: Option<OsString>,
     home: Option<OsString>,
@@ -47,15 +49,14 @@ fn startup_files_from(
     })
 }
 
-/// Loads and executes one startup file.
+/// 起動ファイルを一つ読み込んで実行する。
 ///
-/// Returns `Ok(None)` when `path` does not exist and `Ok(Some(_))` after an
-/// existing file has been executed.
+/// `path`が存在しなければ`Ok(None)`、既存ファイルを実行した場合は`Ok(Some(_))`を返す。
 ///
-/// # Errors
+/// # エラー
 ///
-/// Returns an I/O error when the file cannot be read, or
-/// [`io::ErrorKind::InvalidData`] when its contents are not valid UTF-8.
+/// ファイルを読み込めない場合はI/Oエラー、内容が有効なUTF-8でない場合は
+/// [`io::ErrorKind::InvalidData`]を返す。
 pub fn load_startup_file(shell: &mut Shell, path: &Path) -> io::Result<Option<RunResult>> {
     let bytes = match fs::read(path) {
         Ok(bytes) => bytes,
@@ -65,11 +66,11 @@ pub fn load_startup_file(shell: &mut Shell, path: &Path) -> io::Result<Option<Ru
     let source = String::from_utf8(bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
+            localize(format!(
                 "{}: input must be valid UTF-8 (invalid byte at offset {})",
                 path.display(),
                 error.utf8_error().valid_up_to()
-            ),
+            )),
         )
     })?;
     Ok(Some(shell.run(&source, &[])))
@@ -80,6 +81,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// `resolves_xdg_home_and_missing_paths`に対応する処理を行う。
     fn resolves_xdg_home_and_missing_paths() {
         let _ = startup_files();
         assert_eq!(
@@ -103,6 +105,7 @@ mod tests {
     }
 
     #[test]
+    /// `loads_supported_configuration_and_handles_errors`に対応する処理を行う。
     fn loads_supported_configuration_and_handles_errors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join(".iskrc");

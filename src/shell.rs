@@ -1,4 +1,5 @@
 use crate::ast::*;
+use crate::i18n::{abbreviation_help, builtin_description, localize};
 use crate::parser::parse;
 use chrono::Local;
 use glob::{MatchOptions, Pattern, glob_with};
@@ -15,9 +16,12 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// `PROCESS_SUBSTITUTION_ID`で使用する値を保持する定数。
 static PROCESS_SUBSTITUTION_ID: AtomicU64 = AtomicU64::new(0);
+/// `BACKGROUND_JOB_ID`で使用する値を保持する定数。
 static BACKGROUND_JOB_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(windows)]
+/// `WINDOWS_CHILD_FOREGROUND`で使用する値を保持する定数。
 static WINDOWS_CHILD_FOREGROUND: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
@@ -75,6 +79,7 @@ struct LocalScope {
 }
 
 impl ExecResult {
+    /// `status`に対応する処理を行う。
     fn status(status: i32) -> Self {
         Self {
             status,
@@ -84,15 +89,18 @@ impl ExecResult {
         }
     }
 
+    /// `error`に対応する処理を行う。
     fn error(status: i32, message: impl AsRef<str>) -> Self {
         let mut result = Self::status(status);
-        result.stderr.extend_from_slice(message.as_ref().as_bytes());
-        if !message.as_ref().ends_with('\n') {
+        let message = localize(message);
+        result.stderr.extend_from_slice(message.as_bytes());
+        if !message.ends_with('\n') {
             result.stderr.push(b'\n');
         }
         result
     }
 
+    /// `append`に対応する処理を行う。
     fn append(&mut self, mut other: ExecResult) {
         self.status = other.status;
         self.stdout.append(&mut other.stdout);
@@ -103,43 +111,43 @@ impl ExecResult {
     }
 }
 
-/// The observable result of executing shell source.
+/// シェルソースを実行した結果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunResult {
-    /// The command exit status.
+    /// コマンドの終了ステータス。
     pub status: i32,
-    /// Bytes written to standard output.
+    /// 標準出力へ書き込まれたバイト列。
     pub stdout: Vec<u8>,
-    /// Bytes written to standard error.
+    /// 標準エラー出力へ書き込まれたバイト列。
     pub stderr: Vec<u8>,
 }
 
-/// Describes whether a source fragment is ready to execute.
+/// ソース断片を実行できる状態かどうかを表す。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputState {
-    /// The source is syntactically complete.
+    /// ソースの構文が完結している。
     Complete,
-    /// The source requires additional input.
+    /// ソースに追加の入力が必要である。
     Incomplete,
-    /// The source is invalid and contains the associated diagnostic message.
+    /// ソースが無効で、関連する診断メッセージを保持している。
     Invalid(String),
 }
 
-/// Selects the shell compatibility behavior exposed by [`Shell`].
+/// [`Shell`]が提供する互換動作を選択する。
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ShellMode {
-    /// Enables the default Bash-oriented compatibility behavior.
+    /// デフォルトのBash指向互換動作を有効にする。
     #[default]
     Bash,
-    /// Enables zsh-oriented prompts, built-ins, and hooks.
+    /// zsh指向のプロンプト、組み込みコマンド、フックを有効にする。
     Zsh,
 }
 
 impl ShellMode {
-    /// Resolves a mode from an `ISKSH_MODE` environment value.
+    /// `ISKSH_MODE`環境変数の値からモードを解決する。
     ///
-    /// Only the exact value `zsh` selects [`ShellMode::Zsh`]. Missing and
-    /// unsupported values fall back to [`ShellMode::Bash`].
+    /// 値が正確に`zsh`の場合だけ[`ShellMode::Zsh`]を選択する。
+    /// 未設定または未対応の値は[`ShellMode::Bash`]へフォールバックする。
     pub fn from_environment(value: Option<&str>) -> Self {
         match value {
             Some("zsh") => Self::Zsh,
@@ -147,7 +155,7 @@ impl ShellMode {
         }
     }
 
-    /// Returns the canonical value used by the `ISKSH_MODE` environment variable.
+    /// `ISKSH_MODE`環境変数で使用する正規値を返す。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Bash => "bash",
@@ -156,10 +164,10 @@ impl ShellMode {
     }
 }
 
-/// A stateful shell interpreter.
+/// 状態を保持するシェルインタプリタ。
 ///
-/// A `Shell` preserves variables, functions, aliases, options, the working
-/// directory, and other execution state between calls to [`Shell::run`].
+/// `Shell`は[`Shell::run`]の呼び出し間で変数、関数、別名、オプション、
+/// 作業ディレクトリなどの実行状態を保持する。
 #[derive(Debug, Clone)]
 pub struct Shell {
     variables: HashMap<String, Variable>,
@@ -213,16 +221,17 @@ pub struct Shell {
 }
 
 impl Default for Shell {
+    /// `default`に対応する処理を行う。
     fn default() -> Self {
         Self::new("isksh")
     }
 }
 
 impl Shell {
-    /// Creates a shell using the current process environment and working directory.
+    /// 現在のプロセス環境と作業ディレクトリを使用してシェルを生成する。
     ///
-    /// `name` becomes the shell's `$0` value. The initial compatibility mode is
-    /// resolved from `ISKSH_MODE` and defaults to Bash behavior.
+    /// `name`はシェルの`$0`になる。初期互換モードは`ISKSH_MODE`から解決し、
+    /// デフォルトではBash互換動作を使用する。
     pub fn new(name: impl Into<String>) -> Self {
         let mut variables: HashMap<_, _> = std::env::vars()
             .map(|(name, value)| {
@@ -311,15 +320,14 @@ impl Shell {
         }
     }
 
-    /// Returns the active compatibility mode.
+    /// 有効な互換モードを返す。
     pub fn mode(&self) -> ShellMode {
         self.mode
     }
 
-    /// Reloads the compatibility mode from the shell's `ISKSH_MODE` variable.
+    /// シェルの`ISKSH_MODE`変数から互換モードを再読み込みする。
     ///
-    /// Unsupported values are normalized to `bash` and exported back into the
-    /// shell environment.
+    /// 未対応の値は`bash`へ正規化し、シェル環境へ再度exportする。
     pub fn refresh_mode(&mut self) {
         self.mode = ShellMode::from_environment(self.value_of("ISKSH_MODE").as_deref());
         if self.mode == ShellMode::Zsh {
@@ -328,20 +336,19 @@ impl Shell {
         let _ = self.set_variable("ISKSH_MODE", self.mode.as_str().into(), Some(true), false);
     }
 
-    /// Replaces the shell's positional parameters.
+    /// シェルの位置パラメータを置き換える。
     pub fn set_positional(&mut self, values: Vec<String>) {
         self.positional = values;
     }
 
-    /// Returns the current executable search path, or `None` when `PATH` is unset.
+    /// 現在の実行ファイル検索パスを返し、`PATH`が未設定なら`None`を返す。
     pub fn command_search_path(&self) -> Option<String> {
         self.value_of("PATH")
     }
 
-    /// Returns configured alias, abbreviation, and function names.
+    /// 設定済みの別名、短縮入力、関数の名前を返す。
     ///
-    /// The returned order is unspecified and duplicate names may be present when
-    /// multiple configuration categories use the same name.
+    /// 返却順は未規定で、複数の設定分類に同じ名前がある場合は重複を含む。
     pub fn configured_command_names(&self) -> Vec<String> {
         self.aliases
             .keys()
@@ -352,17 +359,17 @@ impl Shell {
             .collect()
     }
 
-    /// Returns a copy of all configured interactive abbreviations.
+    /// 設定済みの対話用短縮入力をすべて複製して返す。
     pub fn configured_abbreviations(&self) -> HashMap<String, String> {
         self.abbreviations.clone()
     }
 
-    /// Returns completion candidates added by the zsh-compatible `compadd` built-in.
+    /// zsh互換の`compadd`組み込みコマンドで追加された補完候補を返す。
     pub fn configured_completion_candidates(&self) -> Vec<String> {
         self.completion_candidates.clone()
     }
 
-    /// Applies zsh history options, runs history hooks, and reports whether to store the line.
+    /// zshの履歴オプションとフックを適用し、行を保存するかどうかを返す。
     pub fn record_history(&mut self, source: &str) -> bool {
         if self.mode != ShellMode::Zsh {
             return true;
@@ -391,7 +398,7 @@ impl Shell {
         true
     }
 
-    /// Expands command-position abbreviations in interactive source text.
+    /// 対話用ソース内のコマンド位置にある短縮入力を展開する。
     pub fn expand_abbreviations(&self, source: &str) -> String {
         let mut output = String::with_capacity(source.len());
         let mut rest = source;
@@ -459,6 +466,7 @@ impl Shell {
         output
     }
 
+    /// `expand_zsh_aliases`に対応する処理を行う。
     fn expand_zsh_aliases(&self, source: &str) -> String {
         let mut output = String::with_capacity(source.len());
         let mut word = String::new();
@@ -503,7 +511,7 @@ impl Shell {
         output
     }
 
-    /// Controls whether foreground external commands may use the terminal directly.
+    /// フォアグラウンドの外部コマンドが端末を直接使用できるか設定する。
     pub fn set_interactive(&mut self, interactive: bool) {
         self.terminal_io = interactive;
         if interactive {
@@ -511,19 +519,19 @@ impl Shell {
         }
     }
 
-    /// Classifies source text as complete, incomplete, or invalid.
+    /// ソース文字列を完結、不完全、無効のいずれかに分類する。
     pub fn check_input(source: &str) -> InputState {
         match parse(source) {
             Ok(_) => InputState::Complete,
             Err(error) if error.incomplete => InputState::Incomplete,
-            Err(error) => InputState::Invalid(error.to_string()),
+            Err(error) => InputState::Invalid(localize(error.to_string())),
         }
     }
 
-    /// Builds the primary or continuation prompt for the current shell state.
+    /// 現在のシェル状態から一次または継続プロンプトを生成する。
     ///
-    /// Primary prompts run configured prompt hooks and `PROMPT_COMMAND` before
-    /// expanding prompt escapes and substitutions.
+    /// 一次プロンプトでは、プロンプトのエスケープと置換を展開する前に、
+    /// 設定済みのプロンプトフックと`PROMPT_COMMAND`を実行する。
     pub fn prompt(&mut self, continuation: bool) -> String {
         let saved_status = self.last_status;
         let mut prefix = String::new();
@@ -579,7 +587,7 @@ impl Shell {
         prefix
     }
 
-    /// Expands the zsh-compatible right prompt (`RPROMPT` or `RPS1`).
+    /// zsh互換の右プロンプト（`RPROMPT`または`RPS1`）を展開する。
     pub fn right_prompt(&self) -> String {
         if self.mode != ShellMode::Zsh {
             return String::new();
@@ -591,17 +599,17 @@ impl Shell {
         self.expand_zsh_prompt_escapes(&value, self.last_status)
     }
 
-    /// Takes the exit status requested by an executed `exit` built-in.
+    /// 実行済みの`exit`組み込みコマンドが要求した終了ステータスを取得する。
     ///
-    /// The stored value is cleared after this call.
+    /// この呼び出し後に保存値を消去する。
     pub fn take_exit_status(&mut self) -> Option<i32> {
         self.exit_status.take()
     }
 
-    /// Parses and executes shell source with the supplied standard-input bytes.
+    /// 指定された標準入力バイト列を使ってシェルソースを解析・実行する。
     ///
-    /// Execution state is retained for subsequent calls. Syntax and runtime
-    /// failures are returned through [`RunResult`] instead of Rust errors.
+    /// 実行状態は後続の呼び出しへ保持する。構文エラーと実行時エラーはRustの
+    /// エラーではなく[`RunResult`]で返す。
     pub fn run(&mut self, source: &str, input: &[u8]) -> RunResult {
         if let Some(result) = self.apply_known_bash_integration(source) {
             self.last_status = result.status;
@@ -624,7 +632,7 @@ impl Shell {
                 return RunResult {
                     status: 2,
                     stdout: Vec::new(),
-                    stderr: format!("isksh: {error}\n").into_bytes(),
+                    stderr: format!("{}\n", localize(format!("isksh: {error}"))).into_bytes(),
                 };
             }
         };
@@ -652,6 +660,7 @@ impl Shell {
         }
     }
 
+    /// `execute_script`に対応する処理を行う。
     fn execute_script(&mut self, script: &Script, input: &[u8]) -> ExecResult {
         let mut combined = ExecResult::status(0);
         for list in &script.lists {
@@ -665,6 +674,7 @@ impl Shell {
         combined
     }
 
+    /// `execute_and_or`に対応する処理を行う。
     fn execute_and_or(&mut self, list: &AndOr, input: &[u8]) -> ExecResult {
         let mut result = if list.background {
             let mut child = self.clone();
@@ -699,6 +709,7 @@ impl Shell {
         result
     }
 
+    /// `execute_pipeline`に対応する処理を行う。
     fn execute_pipeline(&mut self, pipeline: &Pipeline, input: &[u8]) -> ExecResult {
         if pipeline.commands.len() > 1
             && let Some(prepared) = self.prepare_external_pipeline(pipeline)
@@ -742,6 +753,7 @@ impl Shell {
         last
     }
 
+    /// `prepare_external_pipeline`に対応する処理を行う。
     fn prepare_external_pipeline(
         &mut self,
         pipeline: &Pipeline,
@@ -788,6 +800,7 @@ impl Shell {
         )
     }
 
+    /// `execute_external_pipeline`に対応する処理を行う。
     fn execute_external_pipeline(
         &mut self,
         commands: Vec<PreparedExternal>,
@@ -913,6 +926,7 @@ impl Shell {
         }
     }
 
+    /// `set_pipeline_statuses`に対応する処理を行う。
     fn set_pipeline_statuses(&mut self, statuses: &[i32]) {
         self.indexed_arrays.insert(
             "PIPESTATUS".into(),
@@ -924,6 +938,7 @@ impl Shell {
         );
     }
 
+    /// `execute_command`に対応する処理を行う。
     fn execute_command(&mut self, command: &Command, input: &[u8]) -> ExecResult {
         match command {
             Command::Simple(command) => {
@@ -977,6 +992,7 @@ impl Shell {
         }
     }
 
+    /// `run_zsh_hooks`に対応する処理を行う。
     fn run_zsh_hooks(&mut self, hooks: Vec<String>) -> ExecResult {
         let mut output = ExecResult::status(0);
         self.zsh_hook_depth += 1;
@@ -987,6 +1003,7 @@ impl Shell {
         output
     }
 
+    /// `execute_loop`に対応する処理を行う。
     fn execute_loop(
         &mut self,
         condition: &Script,
@@ -1029,6 +1046,7 @@ impl Shell {
         output
     }
 
+    /// `execute_for`に対応する処理を行う。
     fn execute_for(
         &mut self,
         name: &str,
@@ -1081,6 +1099,7 @@ impl Shell {
         output
     }
 
+    /// `execute_case`に対応する処理を行う。
     fn execute_case(&mut self, word: &Word, arms: &[CaseArm], input: &[u8]) -> ExecResult {
         let value = match self.expand_scalar(word) {
             Ok(value) => value,
@@ -1100,6 +1119,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `execute_simple`に対応する処理を行う。
     fn execute_simple(&mut self, command: &SimpleCommand, input: &[u8]) -> ExecResult {
         for (name, words) in &command.array_assignments {
             let mut values = BTreeMap::new();
@@ -1312,6 +1332,7 @@ impl Shell {
         result
     }
 
+    /// `apply_redirections`に対応する処理を行う。
     fn apply_redirections(
         &mut self,
         command: &SimpleCommand,
@@ -1426,6 +1447,7 @@ impl Shell {
         result
     }
 
+    /// `execute_function`に対応する処理を行う。
     fn execute_function(
         &mut self,
         name: &str,
@@ -1470,6 +1492,7 @@ impl Shell {
         result
     }
 
+    /// `execute_external`に対応する処理を行う。
     fn execute_external(
         &self,
         name: &str,
@@ -1525,6 +1548,7 @@ impl Shell {
         finish_external(name, output)
     }
 
+    /// `execute_builtin`に対応する処理を行う。
     fn execute_builtin(&mut self, name: &str, args: &[String], input: &[u8]) -> ExecResult {
         match name {
             ":" | "true" => ExecResult::status(0),
@@ -1649,6 +1673,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_cd`に対応する処理を行う。
     fn builtin_cd(&mut self, args: &[String]) -> ExecResult {
         if args.len() > 1 {
             return ExecResult::error(1, "isksh: cd: too many arguments");
@@ -1693,6 +1718,7 @@ impl Shell {
         result
     }
 
+    /// `change_directory`に対応する処理を行う。
     fn change_directory(&mut self, target: &str) -> ExecResult {
         let path = self.resolve_path(target);
         match fs::canonicalize(path) {
@@ -1714,6 +1740,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_print`に対応する処理を行う。
     fn builtin_print(&self, args: &[String]) -> ExecResult {
         let mut newline = true;
         let mut raw = false;
@@ -1854,6 +1881,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_setopt`に対応する処理を行う。
     fn builtin_setopt(&mut self, args: &[String], enabled: bool) -> ExecResult {
         if args.is_empty() {
             let mut options: Vec<_> = self.shell_options.iter().cloned().collect();
@@ -1879,6 +1907,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_emulate`に対応する処理を行う。
     fn builtin_emulate(&mut self, args: &[String]) -> ExecResult {
         let mut shell = None;
         let mut command = None;
@@ -1950,6 +1979,7 @@ impl Shell {
         result
     }
 
+    /// `builtin_whence`に対応する処理を行う。
     fn builtin_whence(&self, args: &[String]) -> ExecResult {
         let mut verbose = false;
         let mut word = false;
@@ -2039,7 +2069,7 @@ impl Shell {
             } else if path_only && kind == "command" {
                 output.push_str(&format!("{}\n", external.display()));
             } else if verbose || kind != "none" {
-                output.push_str(&detail);
+                output.push_str(&localize(&detail));
                 output.push('\n');
             }
             if all && kind != "command" && external.is_file() {
@@ -2054,6 +2084,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_add_zsh_hook`に対応する処理を行う。
     fn builtin_add_zsh_hook(&mut self, args: &[String]) -> ExecResult {
         let (remove, operands) = if args.first().map(String::as_str) == Some("-d") {
             (true, &args[1..])
@@ -2085,6 +2116,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_unfunction`に対応する処理を行う。
     fn builtin_unfunction(&mut self, args: &[String]) -> ExecResult {
         let mut status = 0;
         for name in args {
@@ -2095,6 +2127,7 @@ impl Shell {
         ExecResult::status(status)
     }
 
+    /// `builtin_autoload`に対応する処理を行う。
     fn builtin_autoload(&mut self, args: &[String]) -> ExecResult {
         let mut load_now = false;
         let mut names = Vec::new();
@@ -2127,6 +2160,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `load_autoload_function`に対応する処理を行う。
     fn load_autoload_function(&mut self, name: &str) -> ExecResult {
         let search = self
             .indexed_arrays
@@ -2158,6 +2192,7 @@ impl Shell {
         result
     }
 
+    /// `builtin_zmodload`に対応する処理を行う。
     fn builtin_zmodload(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() || args.iter().any(|arg| arg == "-L") {
             let mut modules = self.loaded_modules.iter().cloned().collect::<Vec<_>>();
@@ -2186,6 +2221,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_functions`に対応する処理を行う。
     fn builtin_functions(&mut self, args: &[String]) -> ExecResult {
         let trace = args
             .iter()
@@ -2231,6 +2267,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_zstyle`に対応する処理を行う。
     fn builtin_zstyle(&mut self, args: &[String]) -> ExecResult {
         if args.first().map(String::as_str) == Some("-d") {
             if let (Some(pattern), Some(style)) = (args.get(1), args.get(2)) {
@@ -2274,6 +2311,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_bindkey`に対応する処理を行う。
     fn builtin_bindkey(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() || args.first().map(String::as_str) == Some("-L") {
             let stdout = self
@@ -2337,6 +2375,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_zle`に対応する処理を行う。
     fn builtin_zle(&mut self, args: &[String]) -> ExecResult {
         match args.first().map(String::as_str) {
             Some("-N") => {
@@ -2379,6 +2418,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_vared`に対応する処理を行う。
     fn builtin_vared(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let Some(name) = args.iter().find(|argument| !argument.starts_with('-')) else {
             return ExecResult::error(2, "isksh: vared: variable name required");
@@ -2394,6 +2434,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_compdef`に対応する処理を行う。
     fn builtin_compdef(&mut self, args: &[String]) -> ExecResult {
         let Some((function, commands)) = args.split_first() else {
             return ExecResult::status(1);
@@ -2405,6 +2446,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_compadd`に対応する処理を行う。
     fn builtin_compadd(&mut self, args: &[String]) -> ExecResult {
         let mut options = true;
         let mut skip = false;
@@ -2431,6 +2473,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_compset`に対応する処理を行う。
     fn builtin_compset(&mut self, args: &[String]) -> ExecResult {
         let Some(option) = args.first().map(String::as_str) else {
             return ExecResult::status(1);
@@ -2462,6 +2505,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_pushd`に対応する処理を行う。
     fn builtin_pushd(&mut self, args: &[String]) -> ExecResult {
         if args.len() > 1 {
             return ExecResult::error(1, "isksh: pushd: too many arguments");
@@ -2503,6 +2547,7 @@ impl Shell {
         result
     }
 
+    /// `push_directory`に対応する処理を行う。
     fn push_directory(&mut self, path: PathBuf) {
         if self.mode == ShellMode::Zsh && self.shell_options.contains("pushdignoredups") {
             self.directory_stack.retain(|existing| existing != &path);
@@ -2510,6 +2555,7 @@ impl Shell {
         self.directory_stack.insert(0, path);
     }
 
+    /// `builtin_popd`に対応する処理を行う。
     fn builtin_popd(&mut self, args: &[String]) -> ExecResult {
         if args.len() > 1 {
             return ExecResult::error(1, "isksh: popd: unsupported argument");
@@ -2548,6 +2594,7 @@ impl Shell {
         result
     }
 
+    /// `builtin_dirs`に対応する処理を行う。
     fn builtin_dirs(&mut self, args: &[String]) -> ExecResult {
         let mut per_line = false;
         let mut indexed = false;
@@ -2587,6 +2634,7 @@ impl Shell {
         }
     }
 
+    /// `directory_listing`に対応する処理を行う。
     fn directory_listing(&self, per_line: bool, indexed: bool) -> String {
         let paths = std::iter::once(&self.cwd)
             .chain(self.directory_stack.iter())
@@ -2609,6 +2657,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_trap`に対応する処理を行う。
     fn builtin_trap(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() || args.first().map(String::as_str) == Some("-p") {
             let requested = if args.first().map(String::as_str) == Some("-p") {
@@ -2646,6 +2695,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `run_trap`に対応する処理を行う。
     fn run_trap(&mut self, signal: &str) -> ExecResult {
         if self.trap_depth != 0 {
             return ExecResult::status(0);
@@ -2665,6 +2715,7 @@ impl Shell {
         result
     }
 
+    /// `builtin_jobs`に対応する処理を行う。
     fn builtin_jobs(&self) -> ExecResult {
         let jobs = self.background_jobs.lock().expect("background jobs lock");
         let mut output = String::new();
@@ -2674,7 +2725,7 @@ impl Shell {
             } else {
                 "Running"
             };
-            output.push_str(&format!("[{id}] {state}\n"));
+            output.push_str(&format!("[{id}] {}\n", localize(state)));
         }
         ExecResult {
             stdout: output.into_bytes(),
@@ -2682,6 +2733,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_hash`に対応する処理を行う。
     fn builtin_hash(&mut self, args: &[String]) -> ExecResult {
         if args == ["-r"] {
             self.command_hash.clear();
@@ -2710,6 +2762,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_umask`に対応する処理を行う。
     fn builtin_umask(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() || args == ["-S"] {
             let output = if args == ["-S"] {
@@ -2736,6 +2789,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_wait`に対応する処理を行う。
     fn builtin_wait(&mut self, args: &[String]) -> ExecResult {
         let ids = if args.is_empty() {
             self.background_jobs
@@ -2779,6 +2833,7 @@ impl Shell {
         combined
     }
 
+    /// `builtin_declare`に対応する処理を行う。
     fn builtin_declare(&mut self, command: &str, args: &[String]) -> ExecResult {
         if command == "local" && self.function_depth == 0 {
             return ExecResult::error(1, "isksh: local: can only be used in a function");
@@ -2910,6 +2965,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_shopt`に対応する処理を行う。
     fn builtin_shopt(&mut self, args: &[String]) -> ExecResult {
         let mut mode = None;
         let mut quiet = false;
@@ -2926,6 +2982,7 @@ impl Shell {
                 _ => names.push(argument.as_str()),
             }
         }
+        /// `OPTIONS`で使用する値を保持する定数。
         const OPTIONS: &[&str] = &["dotglob", "extglob", "globstar", "nocasematch", "nullglob"];
         if names.iter().any(|name| !OPTIONS.contains(name)) {
             return ExecResult::error(1, "isksh: shopt: invalid shell option name");
@@ -2972,6 +3029,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_type`に対応する処理を行う。
     fn builtin_type(&self, args: &[String]) -> ExecResult {
         let terse = args.first().map(String::as_str) == Some("-t");
         let names = if terse { &args[1..] } else { args };
@@ -2990,7 +3048,11 @@ impl Shell {
                 }
                 ("file", format!("{name} is {}", path.display()))
             };
-            output.push_str(if terse { kind } else { &detail });
+            if terse {
+                output.push_str(kind);
+            } else {
+                output.push_str(&localize(&detail));
+            }
             output.push('\n');
         }
         ExecResult {
@@ -2999,6 +3061,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_mapfile`に対応する処理を行う。
     fn builtin_mapfile(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let mut trim = false;
         let mut index = 0;
@@ -3038,6 +3101,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_double_bracket`に対応する処理を行う。
     fn builtin_double_bracket(&mut self, args: &[String]) -> ExecResult {
         if args.last().map(String::as_str) != Some("]]") {
             return ExecResult::error(2, "isksh: [[: missing ]]");
@@ -3048,6 +3112,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_command`に対応する処理を行う。
     fn builtin_command(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let mut index = 0;
         let mut describe = false;
@@ -3099,6 +3164,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_export`に対応する処理を行う。
     fn builtin_export(&mut self, args: &[String], readonly: bool) -> ExecResult {
         if args.is_empty() {
             let mut names: Vec<_> = self
@@ -3156,6 +3222,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_unset`に対応する処理を行う。
     fn builtin_unset(&mut self, args: &[String]) -> ExecResult {
         for name in args {
             if self.variables.get(name).is_some_and(|value| value.readonly) {
@@ -3167,6 +3234,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_set`に対応する処理を行う。
     fn builtin_set(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() {
             let mut variables: Vec<_> = self.variables.iter().collect();
@@ -3214,6 +3282,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_shift`に対応する処理を行う。
     fn builtin_shift(&mut self, args: &[String]) -> ExecResult {
         let count = args
             .first()
@@ -3227,6 +3296,7 @@ impl Shell {
         }
     }
 
+    /// `loop_flow`に対応する処理を行う。
     fn loop_flow(&self, args: &[String], is_break: bool) -> ExecResult {
         if self.loop_depth == 0 {
             return ExecResult::error(1, "isksh: loop control used outside a loop");
@@ -3244,6 +3314,7 @@ impl Shell {
         result
     }
 
+    /// `execute_eval`に対応する処理を行う。
     fn execute_eval(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let source = args.join(" ");
         if let Some(result) = self.apply_known_bash_integration(&source) {
@@ -3255,6 +3326,7 @@ impl Shell {
         }
     }
 
+    /// `apply_known_bash_integration`に対応する処理を行う。
     fn apply_known_bash_integration(&mut self, source: &str) -> Option<ExecResult> {
         if source.contains("starship_precmd()") && source.contains("STARSHIP_SHELL=\"bash\"") {
             let _ = self.set_variable("PS1", "$(starship prompt --status=$?)".into(), None, false);
@@ -3310,6 +3382,7 @@ impl Shell {
         None
     }
 
+    /// `append_prompt_command`に対応する処理を行う。
     fn append_prompt_command(&mut self, command: &str) {
         let current = self.value_of("PROMPT_COMMAND").unwrap_or_default();
         if !current.split(';').any(|part| part.trim() == command) {
@@ -3322,6 +3395,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_dot`に対応する処理を行う。
     fn builtin_dot(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let Some(name) = args.first() else {
             return ExecResult::error(2, "isksh: .: filename required");
@@ -3333,6 +3407,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_printf`に対応する処理を行う。
     fn builtin_printf(&mut self, args: &[String]) -> ExecResult {
         if args.first().map(String::as_str) != Some("-v") {
             return builtin_printf(args);
@@ -3351,6 +3426,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_read`に対応する処理を行う。
     fn builtin_read(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let input = match std::str::from_utf8(input) {
             Ok(input) => input,
@@ -3438,6 +3514,7 @@ impl Shell {
         ExecResult::status(i32::from(input.is_empty()))
     }
 
+    /// `builtin_builtin`に対応する処理を行う。
     fn builtin_builtin(&mut self, args: &[String], input: &[u8]) -> ExecResult {
         let Some(name) = args.first() else {
             return ExecResult::status(0);
@@ -3448,6 +3525,7 @@ impl Shell {
         self.execute_builtin(name, &args[1..], input)
     }
 
+    /// `builtin_help`に対応する処理を行う。
     fn builtin_help(&self, args: &[String]) -> ExecResult {
         if args.is_empty() {
             return ExecResult {
@@ -3460,7 +3538,7 @@ impl Shell {
             if !is_builtin(name) {
                 return ExecResult::error(1, format!("isksh: help: {name}: no help topic"));
             }
-            output.push_str(&format!("{name}: isksh shell builtin\n"));
+            output.push_str(&builtin_description(name));
         }
         ExecResult {
             stdout: output.into_bytes(),
@@ -3468,6 +3546,7 @@ impl Shell {
         }
     }
 
+    /// `builtin_let`に対応する処理を行う。
     fn builtin_let(&mut self, args: &[String]) -> ExecResult {
         if args.is_empty() {
             return ExecResult::status(1);
@@ -3482,6 +3561,7 @@ impl Shell {
         ExecResult::status(i32::from(value == 0))
     }
 
+    /// `evaluate_let_expression`に対応する処理を行う。
     fn evaluate_let_expression(&mut self, expression: &str) -> Result<i64, String> {
         let expression = expression.trim();
         for (prefix, delta) in [("++", 1i64), ("--", -1)] {
@@ -3520,6 +3600,7 @@ impl Shell {
         self.evaluate_arithmetic(expression)
     }
 
+    /// `update_arithmetic_variable`に対応する処理を行う。
     fn update_arithmetic_variable(
         &mut self,
         name: &str,
@@ -3538,6 +3619,7 @@ impl Shell {
         Ok(if prefix { value } else { previous })
     }
 
+    /// `builtin_getopts`に対応する処理を行う。
     fn builtin_getopts(&mut self, args: &[String]) -> ExecResult {
         if args.len() < 2 || !valid_variable_name(&args[1]) {
             return ExecResult::error(2, "isksh: getopts: usage: getopts optstring name [arg ...]");
@@ -3629,6 +3711,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_alias`に対応する処理を行う。
     fn builtin_alias(&mut self, args: &[String]) -> ExecResult {
         let mut global = false;
         let mut suffix = false;
@@ -3697,6 +3780,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_unalias`に対応する処理を行う。
     fn builtin_unalias(&mut self, args: &[String]) -> ExecResult {
         if args.first().map(String::as_str) == Some("-a") {
             self.aliases.clear();
@@ -3712,6 +3796,7 @@ impl Shell {
         ExecResult::status(0)
     }
 
+    /// `builtin_abbr`に対応する処理を行う。
     fn builtin_abbr(&mut self, args: &[String]) -> ExecResult {
         let mut operation = None;
         let mut operands = Vec::new();
@@ -3783,7 +3868,7 @@ impl Shell {
                 ExecResult::status(0)
             }
             "help" => ExecResult {
-                stdout: b"usage: abbr [-a|-e|-r|-q|-l|-s] [NAME [EXPANSION]]\n".to_vec(),
+                stdout: abbreviation_help().as_bytes().to_vec(),
                 ..ExecResult::status(0)
             },
             _ => {
@@ -3805,10 +3890,12 @@ impl Shell {
         }
     }
 
+    /// `expand_word`に対応する処理を行う。
     fn expand_word(&mut self, word: &Word) -> Result<Vec<String>, String> {
         self.expand_word_context(word, true, true)
     }
 
+    /// `expand_word_context`に対応する処理を行う。
     fn expand_word_context(
         &mut self,
         word: &Word,
@@ -3875,7 +3962,7 @@ impl Shell {
                     child.terminal_io = false;
                     let result = child.run(source, &[]);
                     if result.status != 0 && !result.stderr.is_empty() {
-                        // Command substitution preserves stdout even when the command fails.
+                        // コマンドが失敗した場合も、コマンド置換の標準出力は維持する。
                     }
                     let output = match String::from_utf8(result.stdout) {
                         Ok(output) => output,
@@ -3994,11 +4081,13 @@ impl Shell {
         Ok(expanded)
     }
 
+    /// `expand_scalar`に対応する処理を行う。
     fn expand_scalar(&mut self, word: &Word) -> Result<String, String> {
         let fields = self.expand_word_context(word, false, false)?;
         Ok(fields.join(" "))
     }
 
+    /// `expand_parameter`に対応する処理を行う。
     fn expand_parameter(&mut self, expression: &str) -> Result<String, String> {
         if self.mode == ShellMode::Zsh
             && let Some(name) = expression.strip_prefix('+')
@@ -4136,6 +4225,7 @@ impl Shell {
         })
     }
 
+    /// `expand_prompt_escapes`に対応する処理を行う。
     fn expand_prompt_escapes(&self, value: &str) -> String {
         let username = self
             .value_of("USER")
@@ -4220,6 +4310,7 @@ impl Shell {
         output
     }
 
+    /// `expand_zsh_prompt_escapes`に対応する処理を行う。
     fn expand_zsh_prompt_escapes(&self, value: &str, status: i32) -> String {
         let username = self
             .value_of("USER")
@@ -4382,6 +4473,7 @@ impl Shell {
         output
     }
 
+    /// `expand_here_document`に対応する処理を行う。
     fn expand_here_document(&mut self, body: &str) -> Result<String, String> {
         let chars: Vec<char> = body.chars().collect();
         let mut output = String::new();
@@ -4494,10 +4586,12 @@ impl Shell {
         Ok(output)
     }
 
+    /// `evaluate_arithmetic`に対応する処理を行う。
     fn evaluate_arithmetic(&self, expression: &str) -> Result<i64, String> {
         ArithmeticParser::new(expression, self).parse()
     }
 
+    /// `redirection_path`に対応する処理を行う。
     fn redirection_path(&mut self, word: &Word) -> Result<PathBuf, String> {
         let fields = self.expand_word(word)?;
         if fields.len() != 1 {
@@ -4506,6 +4600,7 @@ impl Shell {
         Ok(self.resolve_path(&fields[0]))
     }
 
+    /// `resolve_path`に対応する処理を行う。
     fn resolve_path(&self, value: &str) -> PathBuf {
         let path = Path::new(value);
         if path.is_absolute() {
@@ -4515,6 +4610,7 @@ impl Shell {
         }
     }
 
+    /// `resolve_command_file`に対応する処理を行う。
     fn resolve_command_file(&self, name: &str) -> PathBuf {
         if name.contains(['/', '\\']) {
             return self.resolve_path(name);
@@ -4528,6 +4624,7 @@ impl Shell {
     }
 
     #[cfg(windows)]
+    /// `resolve_external_name`に対応する処理を行う。
     fn resolve_external_name(&self, name: &str) -> String {
         if let Some(path) = self.command_hash.get(name) {
             return path.clone();
@@ -4573,6 +4670,7 @@ impl Shell {
     }
 
     #[cfg(not(windows))]
+    /// `resolve_external_name`に対応する処理を行う。
     fn resolve_external_name(&self, name: &str) -> String {
         self.command_hash
             .get(name)
@@ -4580,12 +4678,14 @@ impl Shell {
             .unwrap_or_else(|| name.to_string())
     }
 
+    /// `value_of`に対応する処理を行う。
     fn value_of(&self, name: &str) -> Option<String> {
         self.variables
             .get(name)
             .map(|variable| variable.value.clone())
     }
 
+    /// `parameter_value`に対応する処理を行う。
     fn parameter_value(&self, name: &str) -> Option<String> {
         if let Some((array, subscript)) = parse_array_reference(name) {
             return self.array_value(array, subscript);
@@ -4611,6 +4711,7 @@ impl Shell {
         self.value_of(name)
     }
 
+    /// `zsh_parameter_is_set`に対応する処理を行う。
     fn zsh_parameter_is_set(&self, name: &str) -> bool {
         if let Some((parameter, subscript)) = parse_array_reference(name) {
             return match parameter {
@@ -4623,6 +4724,7 @@ impl Shell {
         self.parameter_value(name).is_some()
     }
 
+    /// `set_variable`に対応する処理を行う。
     fn set_variable(
         &mut self,
         name: &str,
@@ -4655,6 +4757,7 @@ impl Shell {
         Ok(())
     }
 
+    /// `set_assignment`に対応する処理を行う。
     fn set_assignment(
         &mut self,
         target: &str,
@@ -4681,6 +4784,7 @@ impl Shell {
         }
     }
 
+    /// `array_value`に対応する処理を行う。
     fn array_value(&self, name: &str, subscript: &str) -> Option<String> {
         if self.mode == ShellMode::Zsh {
             match name {
@@ -4747,6 +4851,7 @@ impl Shell {
         }
     }
 
+    /// `array_index`に対応する処理を行う。
     fn array_index(&self, subscript: &str) -> Option<usize> {
         let value = self.evaluate_arithmetic(subscript).ok()?;
         if self.mode == ShellMode::Zsh {
@@ -4756,6 +4861,7 @@ impl Shell {
         }
     }
 
+    /// `array_values`に対応する処理を行う。
     fn array_values(&self, name: &str) -> Vec<String> {
         if self.mode == ShellMode::Zsh {
             match name {
@@ -4789,6 +4895,7 @@ impl Shell {
         Vec::new()
     }
 
+    /// `array_keys`に対応する処理を行う。
     fn array_keys(&self, name: &str) -> Vec<String> {
         if self.mode == ShellMode::Zsh {
             match name {
@@ -4822,6 +4929,7 @@ impl Shell {
             .unwrap_or_default()
     }
 
+    /// `zsh_path_values`に対応する処理を行う。
     fn zsh_path_values(&self, variable: &str) -> Vec<String> {
         let array = variable.to_ascii_lowercase();
         self.indexed_arrays
@@ -4836,6 +4944,7 @@ impl Shell {
             })
     }
 
+    /// `zsh_array_element`に対応する処理を行う。
     fn zsh_array_element(&self, values: Vec<String>, subscript: &str) -> Option<String> {
         let index = self.evaluate_arithmetic(subscript).ok()?;
         let index = if index < 0 {
@@ -4846,6 +4955,7 @@ impl Shell {
         values.get(usize::try_from(index).ok()?).cloned()
     }
 
+    /// `sync_zsh_tied_array`に対応する処理を行う。
     fn sync_zsh_tied_array(&mut self, name: &str) {
         if self.mode != ShellMode::Zsh || !matches!(name, "path" | "fpath") {
             return;
@@ -4860,6 +4970,7 @@ impl Shell {
         let _ = self.set_variable(&variable, value, Some(true), false);
     }
 
+    /// `command_names_from_path`に対応する処理を行う。
     fn command_names_from_path(&self) -> Vec<String> {
         let mut names = HashSet::new();
         for directory in self.zsh_path_values("PATH") {
@@ -4881,6 +4992,7 @@ impl Shell {
         names
     }
 
+    /// `finish_process_substitutions`に対応する処理を行う。
     fn finish_process_substitutions(&mut self) -> ExecResult {
         let mut result = ExecResult::status(0);
         for pending in std::mem::take(&mut self.pending_process_substitutions) {
@@ -4905,16 +5017,19 @@ impl Shell {
     }
 }
 
+/// `parse_array_reference`に対応する処理を行う。
 fn parse_array_reference(value: &str) -> Option<(&str, &str)> {
     let (name, subscript) = value.split_once('[')?;
     let subscript = subscript.strip_suffix(']')?;
     (valid_variable_name(name) && !subscript.is_empty()).then_some((name, subscript))
 }
 
+/// `io_error_string`に対応する処理を行う。
 fn io_error_string(error: std::io::Error) -> String {
     error.to_string()
 }
 
+/// `restore_map`に対応する処理を行う。
 fn restore_map<T>(target: &mut HashMap<String, T>, saved: HashMap<String, Option<T>>) {
     for (name, value) in saved {
         if let Some(value) = value {
@@ -4925,10 +5040,12 @@ fn restore_map<T>(target: &mut HashMap<String, T>, saved: HashMap<String, Option
     }
 }
 
+/// `valid_assignment_name`に対応する処理を行う。
 fn valid_assignment_name(value: &str) -> bool {
     valid_variable_name(value) || parse_array_reference(value).is_some()
 }
 
+/// `format_array_declaration`に対応する処理を行う。
 fn format_array_declaration<'a>(
     prefix: &str,
     name: &str,
@@ -4941,6 +5058,7 @@ fn format_array_declaration<'a>(
     format!("{prefix} {name}=({entries})\n")
 }
 
+/// `evaluate_conditional`に対応する処理を行う。
 fn evaluate_conditional(tokens: &[String], shell: &mut Shell) -> Result<bool, String> {
     if tokens.is_empty() {
         return Err("expression required".into());
@@ -5064,6 +5182,7 @@ fn evaluate_conditional(tokens: &[String], shell: &mut Shell) -> Result<bool, St
     }
 }
 
+/// `conditional_integer`に対応する処理を行う。
 fn conditional_integer(value: &str) -> Result<i64, String> {
     match value.parse() {
         Ok(value) => Ok(value),
@@ -5071,6 +5190,7 @@ fn conditional_integer(value: &str) -> Result<i64, String> {
     }
 }
 
+/// `path_modified_time`に対応する処理を行う。
 fn path_modified_time(path: &Path) -> Result<std::time::SystemTime, String> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
@@ -5079,6 +5199,7 @@ fn path_modified_time(path: &Path) -> Result<std::time::SystemTime, String> {
     Ok(metadata.modified().unwrap_or(std::time::UNIX_EPOCH))
 }
 
+/// `canonical_conditional_path`に対応する処理を行う。
 fn canonical_conditional_path(path: &Path) -> Result<PathBuf, String> {
     match fs::canonicalize(path) {
         Ok(path) => Ok(path),
@@ -5086,6 +5207,7 @@ fn canonical_conditional_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// `conditional_operator`に対応する処理を行う。
 fn conditional_operator(tokens: &[String], expected: &str) -> Option<usize> {
     let mut depth = 0usize;
     for (index, token) in tokens.iter().enumerate() {
@@ -5100,11 +5222,13 @@ fn conditional_operator(tokens: &[String], expected: &str) -> Option<usize> {
 }
 
 #[cfg(unix)]
+/// `is_executable_file`に対応する処理を行う。
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.permissions().mode() & 0o111 != 0)
 }
 
 #[cfg(windows)]
+/// `is_executable_file`に対応する処理を行う。
 fn is_executable_file(path: &Path) -> bool {
     path.is_file()
         && path
@@ -5119,6 +5243,7 @@ fn is_executable_file(path: &Path) -> bool {
 }
 
 #[cfg(unix)]
+/// `path_has_unix_type`に対応する処理を行う。
 fn path_has_unix_type(path: &Path, fifo: bool) -> bool {
     fs::metadata(path).is_ok_and(|meta| {
         if fifo {
@@ -5130,10 +5255,12 @@ fn path_has_unix_type(path: &Path, fifo: bool) -> bool {
 }
 
 #[cfg(windows)]
+/// `path_has_unix_type`に対応する処理を行う。
 fn path_has_unix_type(_: &Path, _: bool) -> bool {
     false
 }
 
+/// `finish_external`に対応する処理を行う。
 fn finish_external(name: &str, output: std::io::Result<std::process::Output>) -> ExecResult {
     match output {
         Ok(output) => ExecResult {
@@ -5146,6 +5273,7 @@ fn finish_external(name: &str, output: std::io::Result<std::process::Output>) ->
     }
 }
 
+/// `finish_external_status`に対応する処理を行う。
 fn finish_external_status(
     name: &str,
     status: std::io::Result<std::process::ExitStatus>,
@@ -5156,10 +5284,12 @@ fn finish_external_status(
     }
 }
 
+/// `pipeline_wait_status`に対応する処理を行う。
 fn pipeline_wait_status(status: std::io::Result<std::process::ExitStatus>) -> i32 {
     status.map_or(126, |status| exit_status(&status))
 }
 
+/// `is_special_builtin`に対応する処理を行う。
 fn is_special_builtin(name: &str) -> bool {
     matches!(
         name,
@@ -5180,6 +5310,7 @@ fn is_special_builtin(name: &str) -> bool {
     )
 }
 
+/// `BUILTIN_NAMES`で使用する値を保持する定数。
 const BUILTIN_NAMES: &[&str] = &[
     ".",
     ":",
@@ -5255,11 +5386,13 @@ const BUILTIN_NAMES: &[&str] = &[
     "zstyle",
 ];
 
+/// `ZSH_SIGNALS`で使用する値を保持する定数。
 const ZSH_SIGNALS: &[&str] = &[
     "EXIT", "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE", "KILL", "USR1", "SEGV",
     "USR2", "PIPE", "ALRM", "TERM", "CHLD", "CONT", "STOP", "TSTP", "TTIN", "TTOU",
 ];
 
+/// `normalize_zsh_function_syntax`に対応する処理を行う。
 fn normalize_zsh_function_syntax(source: &str) -> String {
     let named = Regex::new(
         r"(?s)\bfunction\s+([A-Za-z_][A-Za-z0-9_]*(?:\s+[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:\(\s*\))?\s*\{([^{}]*)\}",
@@ -5284,6 +5417,7 @@ fn normalize_zsh_function_syntax(source: &str) -> String {
         .into_owned()
 }
 
+/// `directory_stack_index`に対応する処理を行う。
 fn directory_stack_index(value: &str, length: usize) -> Option<usize> {
     let (direction, digits) = value.split_at_checked(1)?;
     let index = digits.parse::<usize>().ok()?;
@@ -5294,6 +5428,7 @@ fn directory_stack_index(value: &str, length: usize) -> Option<usize> {
     }
 }
 
+/// `normalize_zsh_option`に対応する処理を行う。
 fn normalize_zsh_option(option: &str) -> (String, bool) {
     let normalized = option.to_ascii_lowercase().replace('_', "");
     if matches!(normalized.as_str(), "nomatch" | "notify") {
@@ -5304,6 +5439,7 @@ fn normalize_zsh_option(option: &str) -> (String, bool) {
         .map_or((normalized.clone(), false), |name| (name.to_string(), true))
 }
 
+/// `decode_echo_escapes`に対応する処理を行う。
 fn decode_echo_escapes(value: &str) -> String {
     value
         .replace("\\n", "\n")
@@ -5312,6 +5448,7 @@ fn decode_echo_escapes(value: &str) -> String {
         .replace("\\\\", "\\")
 }
 
+/// `zsh_color_escape`に対応する処理を行う。
 fn zsh_color_escape(background: bool, color: &str) -> String {
     let layer = if background { 48 } else { 38 };
     if let Some(hex) = color.strip_prefix('#')
@@ -5338,16 +5475,19 @@ fn zsh_color_escape(background: bool, color: &str) -> String {
     format!("\x1b[{}m", if background { 40 + code } else { 30 + code })
 }
 
+/// `is_builtin`に対応する処理を行う。
 fn is_builtin(name: &str) -> bool {
     BUILTIN_NAMES.contains(&name)
 }
 
+/// `valid_variable_name`に対応する処理を行う。
 fn valid_variable_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// `remove_parameter_pattern`に対応する処理を行う。
 fn remove_parameter_pattern(value: &str, pattern: &str, operator: &str) -> String {
     let Ok(pattern) = Pattern::new(pattern) else {
         return value.to_string();
@@ -5384,6 +5524,7 @@ fn remove_parameter_pattern(value: &str, pattern: &str, operator: &str) -> Strin
     }
 }
 
+/// `split_fields`に対応する処理を行う。
 fn split_fields(value: &str, ifs: &str) -> Vec<String> {
     if ifs.is_empty() {
         return vec![value.to_string()];
@@ -5416,6 +5557,7 @@ fn split_fields(value: &str, ifs: &str) -> Vec<String> {
     fields
 }
 
+/// `normalize_signal`に対応する処理を行う。
 fn normalize_signal(signal: &str) -> String {
     match signal.trim_start_matches("SIG") {
         "0" => "EXIT".into(),
@@ -5425,6 +5567,7 @@ fn normalize_signal(signal: &str) -> String {
     }
 }
 
+/// `symbolic_umask`に対応する処理を行う。
 fn symbolic_umask(mask: u32) -> String {
     let permissions = 0o777 & !mask;
     let render = |read, write, execute| {
@@ -5444,12 +5587,14 @@ fn symbolic_umask(mask: u32) -> String {
 }
 
 #[cfg(all(unix, not(target_os = "macos")))]
+/// `set_process_umask`に対応する処理を行う。
 fn set_process_umask(mask: u32) {
     use nix::sys::stat::{Mode, umask};
     umask(Mode::from_bits_truncate(mask));
 }
 
 #[cfg(target_os = "macos")]
+/// `set_process_umask`に対応する処理を行う。
 fn set_process_umask(mask: u32) {
     use nix::sys::stat::{Mode, umask};
     let mask = u16::try_from(mask).expect("validated permission masks fit macOS mode_t");
@@ -5457,12 +5602,15 @@ fn set_process_umask(mask: u32) {
 }
 
 #[cfg(not(unix))]
+/// `set_process_umask`に対応する処理を行う。
 fn set_process_umask(_mask: u32) {}
 
+/// `shell_quote`に対応する処理を行う。
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// `write_output_sink`に対応する処理を行う。
 fn write_output_sink(
     sink: &OutputSink,
     data: &[u8],
@@ -5482,6 +5630,7 @@ fn write_output_sink(
     Ok(())
 }
 
+/// `flow_status`に対応する処理を行う。
 fn flow_status(args: &[String], constructor: fn(i32) -> Flow, default: i32) -> ExecResult {
     let status = args
         .first()
@@ -5493,6 +5642,7 @@ fn flow_status(args: &[String], constructor: fn(i32) -> Flow, default: i32) -> E
     result
 }
 
+/// `builtin_printf`に対応する処理を行う。
 fn builtin_printf(args: &[String]) -> ExecResult {
     let Some(format) = args.first() else {
         return ExecResult::status(0);
@@ -5562,6 +5712,7 @@ fn builtin_printf(args: &[String]) -> ExecResult {
     }
 }
 
+/// `builtin_test`に対応する処理を行う。
 fn builtin_test(args: &[String]) -> ExecResult {
     let success = match args {
         [] => false,
@@ -5586,6 +5737,7 @@ fn builtin_test(args: &[String]) -> ExecResult {
 }
 
 #[cfg(windows)]
+/// `platform_command`に対応する処理を行う。
 fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
     let lower = name.to_ascii_lowercase();
     if lower.ends_with(".cmd") || lower.ends_with(".bat") {
@@ -5605,6 +5757,7 @@ fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
 }
 
 #[cfg(not(windows))]
+/// `platform_command`に対応する処理を行う。
 fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
     let mut command = ProcessCommand::new(name);
     command.args(arguments);
@@ -5612,73 +5765,88 @@ fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
 }
 
 #[cfg(unix)]
+/// `configure_process_group`に対応する処理を行う。
 fn configure_process_group(command: &mut ProcessCommand, group: Option<u32>) {
     use std::os::unix::process::CommandExt;
     command.process_group(group.unwrap_or(0) as i32);
 }
 
 #[cfg(not(unix))]
+/// `configure_process_group`に対応する処理を行う。
 fn configure_process_group(_command: &mut ProcessCommand, _group: Option<u32>) {}
 
 #[cfg(unix)]
+/// `set_foreground_process_group`に対応する処理を行う。
 fn set_foreground_process_group(group: u32) {
     use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{Pid, tcsetpgrp};
-    // SAFETY: SIGTTOU is ignored only while the shell transfers terminal ownership.
+    // SAFETY: シェルが端末の所有権を移す間だけSIGTTOUを無視する。
     let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) };
     let _ = tcsetpgrp(std::io::stdin(), Pid::from_raw(group as i32));
 }
 
 #[cfg(windows)]
+/// `set_foreground_process_group`に対応する処理を行う。
 fn set_foreground_process_group(_group: u32) {
     WINDOWS_CHILD_FOREGROUND.store(true, Ordering::SeqCst);
 }
 
 #[cfg(not(any(unix, windows)))]
+/// `set_foreground_process_group`に対応する処理を行う。
 fn set_foreground_process_group(_group: u32) {}
 
 #[cfg(unix)]
+/// `restore_shell_process_group`に対応する処理を行う。
 fn restore_shell_process_group() {
     use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{getpgrp, tcsetpgrp};
     let _ = tcsetpgrp(std::io::stdin(), getpgrp());
-    // SAFETY: restore the conventional default action after terminal ownership is recovered.
+    // SAFETY: 端末の所有権を回収した後に標準の既定動作へ戻す。
     let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigDfl) };
 }
 
 #[cfg(windows)]
+/// `restore_shell_process_group`に対応する処理を行う。
 fn restore_shell_process_group() {
     WINDOWS_CHILD_FOREGROUND.store(false, Ordering::SeqCst);
 }
 
 #[cfg(not(any(unix, windows)))]
+/// `restore_shell_process_group`に対応する処理を行う。
 fn restore_shell_process_group() {}
 
 #[cfg(windows)]
+/// `install_console_control_handler`に対応する処理を行う。
 fn install_console_control_handler() {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+    /// `handler`に対応する処理を行う。
     unsafe extern "system" fn handler(control: u32) -> i32 {
+        /// `CTRL_C_EVENT`で使用する値を保持する定数。
         const CTRL_C_EVENT: u32 = 0;
         i32::from(control == CTRL_C_EVENT && WINDOWS_CHILD_FOREGROUND.load(Ordering::SeqCst))
     }
-    // SAFETY: the callback has static lifetime and performs only atomic operations.
+    // SAFETY: コールバックはstatic lifetimeを持ち、atomic操作だけを行う。
     let _ = unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
 }
 
 #[cfg(not(windows))]
+/// `install_console_control_handler`に対応する処理を行う。
 fn install_console_control_handler() {}
 
+/// `exit_status`に対応する処理を行う。
 fn exit_status(status: &std::process::ExitStatus) -> i32 {
     status.code().unwrap_or_else(|| signal_exit_status(status))
 }
 
 #[cfg(unix)]
+/// `signal_exit_status`に対応する処理を行う。
 fn signal_exit_status(status: &std::process::ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.signal().map_or(128, |signal| 128 + signal)
 }
 
 #[cfg(not(unix))]
+/// `signal_exit_status`に対応する処理を行う。
 fn signal_exit_status(_status: &std::process::ExitStatus) -> i32 {
     128
 }
@@ -5690,6 +5858,7 @@ struct ArithmeticParser<'a> {
 }
 
 impl<'a> ArithmeticParser<'a> {
+    /// `new`に対応する処理を行う。
     fn new(source: &str, shell: &'a Shell) -> Self {
         Self {
             chars: source.chars().collect(),
@@ -5698,6 +5867,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `parse`に対応する処理を行う。
     fn parse(mut self) -> Result<i64, String> {
         let value = self.conditional()?;
         self.whitespace();
@@ -5708,6 +5878,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `conditional`に対応する処理を行う。
     fn conditional(&mut self) -> Result<i64, String> {
         let condition = self.logical_or()?;
         self.whitespace();
@@ -5723,6 +5894,7 @@ impl<'a> ArithmeticParser<'a> {
         Ok(if condition != 0 { yes } else { no })
     }
 
+    /// `logical_or`に対応する処理を行う。
     fn logical_or(&mut self) -> Result<i64, String> {
         let mut value = self.logical_and()?;
         while self.consume_str("||") {
@@ -5732,6 +5904,7 @@ impl<'a> ArithmeticParser<'a> {
         Ok(value)
     }
 
+    /// `logical_and`に対応する処理を行う。
     fn logical_and(&mut self) -> Result<i64, String> {
         let mut value = self.bit_or()?;
         while self.consume_str("&&") {
@@ -5741,6 +5914,7 @@ impl<'a> ArithmeticParser<'a> {
         Ok(value)
     }
 
+    /// `bit_or`に対応する処理を行う。
     fn bit_or(&mut self) -> Result<i64, String> {
         let mut value = self.bit_xor()?;
         loop {
@@ -5752,6 +5926,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `bit_xor`に対応する処理を行う。
     fn bit_xor(&mut self) -> Result<i64, String> {
         let mut value = self.bit_and()?;
         while self.consume_str("^") {
@@ -5760,6 +5935,7 @@ impl<'a> ArithmeticParser<'a> {
         Ok(value)
     }
 
+    /// `bit_and`に対応する処理を行う。
     fn bit_and(&mut self) -> Result<i64, String> {
         let mut value = self.equality()?;
         loop {
@@ -5771,6 +5947,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `equality`に対応する処理を行う。
     fn equality(&mut self) -> Result<i64, String> {
         let mut value = self.comparison()?;
         loop {
@@ -5784,6 +5961,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `comparison`に対応する処理を行う。
     fn comparison(&mut self) -> Result<i64, String> {
         let mut value = self.shift()?;
         loop {
@@ -5801,6 +5979,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `shift`に対応する処理を行う。
     fn shift(&mut self) -> Result<i64, String> {
         let mut value = self.expression()?;
         loop {
@@ -5814,6 +5993,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `expression`に対応する処理を行う。
     fn expression(&mut self) -> Result<i64, String> {
         let mut value = self.term()?;
         loop {
@@ -5828,6 +6008,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `term`に対応する処理を行う。
     fn term(&mut self) -> Result<i64, String> {
         let mut value = self.power()?;
         loop {
@@ -5852,6 +6033,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `power`に対応する処理を行う。
     fn power(&mut self) -> Result<i64, String> {
         let value = self.factor()?;
         if self.consume_str("**") {
@@ -5862,6 +6044,7 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `factor`に対応する処理を行う。
     fn factor(&mut self) -> Result<i64, String> {
         self.whitespace();
         if self.consume('$') && self.consume('+') {
@@ -5934,14 +6117,17 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `whitespace`に対応する処理を行う。
     fn whitespace(&mut self) {
         while self.peek().is_some_and(char::is_whitespace) {
             self.index += 1;
         }
     }
+    /// `peek`に対応する処理を行う。
     fn peek(&self) -> Option<char> {
         self.chars.get(self.index).copied()
     }
+    /// `consume`に対応する処理を行う。
     fn consume(&mut self, expected: char) -> bool {
         if self.peek() == Some(expected) {
             self.index += 1;
@@ -5951,12 +6137,14 @@ impl<'a> ArithmeticParser<'a> {
         }
     }
 
+    /// `starts_with`に対応する処理を行う。
     fn starts_with(&mut self, expected: &str) -> bool {
         self.whitespace();
         let expected = expected.chars().collect::<Vec<_>>();
         self.chars[self.index..].starts_with(&expected)
     }
 
+    /// `consume_str`に対応する処理を行う。
     fn consume_str(&mut self, expected: &str) -> bool {
         if self.starts_with(expected) {
             self.index += expected.chars().count();
@@ -5971,11 +6159,13 @@ impl<'a> ArithmeticParser<'a> {
 mod tests {
     use super::*;
 
+    /// `run`に対応する処理を行う。
     fn run(source: &str) -> RunResult {
         Shell::default().run(source, &[])
     }
 
     #[test]
+    /// `executes_assignments_expansions_and_printf`に対応する処理を行う。
     fn executes_assignments_expansions_and_printf() {
         let result = run("name=world; printf 'hello %s\\n' \"$name\"");
         assert_eq!(result.status, 0);
@@ -5983,6 +6173,7 @@ mod tests {
     }
 
     #[test]
+    /// `executes_conditionals_and_loops`に対応する処理を行う。
     fn executes_conditionals_and_loops() {
         let result = run(
             "for value in a b c; do if test \"$value\" != b; then printf '%s' \"$value\"; fi; done",
@@ -5991,6 +6182,7 @@ mod tests {
     }
 
     #[test]
+    /// `executes_function_with_positional_parameters`に対応する処理を行う。
     fn executes_function_with_positional_parameters() {
         let result = run("show() { printf '<%s>' \"$1\"; }; show ok");
         assert_eq!(result.stdout, b"<ok>");
@@ -5999,12 +6191,14 @@ mod tests {
     }
 
     #[test]
+    /// `arithmetic_and_command_substitution_work`に対応する処理を行う。
     fn arithmetic_and_command_substitution_work() {
         let result = run("value=$((2 + 3 * 4)); printf '%s:%s' \"$value\" \"$(printf done)\"");
         assert_eq!(result.stdout, b"14:done");
     }
 
     #[test]
+    /// `case_while_break_and_group_work`に対応する処理を行う。
     fn case_while_break_and_group_work() {
         let result = run(
             "i=0; while test $i -ne 4; do i=$((i + 1)); case $i in 2) continue;; 4) break;; *) printf '%s' $i;; esac; done; { printf done; }",
@@ -6013,6 +6207,7 @@ mod tests {
     }
 
     #[test]
+    /// `getopts_reads_grouped_options_and_arguments`に対応する処理を行う。
     fn getopts_reads_grouped_options_and_arguments() {
         let result = run(
             "set -- -ab value; while getopts 'ab:' option; do printf '%s:%s;' \"$option\" \"${OPTARG:-}\"; done",
@@ -6021,6 +6216,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_control_flow_and_shell_state`に対応する処理を行う。
     fn exercises_control_flow_and_shell_state() {
         let mut shell = Shell::default();
         let result = shell.run(
@@ -6039,6 +6235,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_parameter_tilde_glob_and_arithmetic_errors`に対応する処理を行う。
     fn exercises_parameter_tilde_glob_and_arithmetic_errors() {
         let directory = tempfile::tempdir().unwrap();
         fs::write(directory.path().join("a.txt"), b"").unwrap();
@@ -6072,6 +6269,7 @@ mod tests {
     }
 
     #[test]
+    /// `preserves_invalid_glob_literals_for_bracket_builtin`に対応する処理を行う。
     fn preserves_invalid_glob_literals_for_bracket_builtin() {
         let mut shell = Shell::default();
         assert_eq!(shell.run("[ -n value ]", &[]).status, 0);
@@ -6079,6 +6277,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_redirection_order_and_errors`に対応する処理を行う。
     fn exercises_redirection_order_and_errors() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("combined");
@@ -6113,6 +6312,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_builtins`に対応する処理を行う。
     fn exercises_builtins() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("file");
@@ -6248,6 +6448,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_printf_test_getopts_and_external_commands`に対応する処理を行う。
     fn exercises_printf_test_getopts_and_external_commands() {
         assert_eq!(builtin_printf(&[]).status, 0);
         assert_eq!(
@@ -6310,6 +6511,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_input_classification_background_pipeline_and_nested_flow`に対応する処理を行う。
     fn exercises_input_classification_background_pipeline_and_nested_flow() {
         assert!(matches!(
             Shell::check_input("echo ok"),
@@ -6389,6 +6591,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_assignment_alias_and_expansion_edge_cases`に対応する処理を行う。
     fn exercises_assignment_alias_and_expansion_edge_cases() {
         let mut shell = Shell::default();
         shell.run("KEEP=old; readonly LOCK=old", &[]);
@@ -6505,6 +6708,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_heredoc_and_redirection_internal_errors`に対応する処理を行う。
     fn exercises_heredoc_and_redirection_internal_errors() {
         let mut shell = Shell::default();
         assert_eq!(
@@ -6653,6 +6857,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_remaining_builtin_and_arithmetic_paths`に対応する処理を行う。
     fn exercises_remaining_builtin_and_arithmetic_paths() {
         let directory = tempfile::tempdir().unwrap();
         let file = directory.path().join("file");
@@ -6770,6 +6975,7 @@ mod tests {
     }
 
     #[test]
+    /// `exercises_getopts_operand_variants`に対応する処理を行う。
     fn exercises_getopts_operand_variants() {
         let mut shell = Shell::default();
         assert_eq!(
@@ -6832,6 +7038,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_bash_arrays_and_conditionals`に対応する処理を行う。
     fn supports_bash_arrays_and_conditionals() {
         let mut shell = Shell::default();
         let result = shell.run(
@@ -6879,6 +7086,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_process_substitution_and_bashrc_builtins`に対応する処理を行う。
     fn supports_process_substitution_and_bashrc_builtins() {
         let mut shell = Shell::default();
         let result = shell.run("cat <(printf input); printf output > >(cat)", &[]);
@@ -6906,6 +7114,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_common_bash_compatibility_builtins`に対応する処理を行う。
     fn supports_common_bash_compatibility_builtins() {
         let mut shell = Shell::default();
 
@@ -6979,6 +7188,7 @@ mod tests {
     }
 
     #[test]
+    /// `manages_the_bash_directory_stack`に対応する処理を行う。
     fn manages_the_bash_directory_stack() {
         let root = tempfile::tempdir().unwrap();
         let first = root.path().join("first");
@@ -7042,6 +7252,7 @@ mod tests {
     }
 
     #[test]
+    /// `covers_bash_compatibility_errors_and_variants`に対応する処理を行う。
     fn covers_bash_compatibility_errors_and_variants() {
         let mut shell = Shell::default();
         assert_eq!(
@@ -7137,6 +7348,7 @@ mod tests {
     }
 
     #[test]
+    /// `expands_bash_style_prompts_and_runs_prompt_command`に対応する処理を行う。
     fn expands_bash_style_prompts_and_runs_prompt_command() {
         let directory = tempfile::tempdir().unwrap();
         let child = directory.path().join("project");
@@ -7217,6 +7429,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_zsh_mode_prompts_builtins_and_hooks`に対応する処理を行う。
     fn supports_zsh_mode_prompts_builtins_and_hooks() {
         let mut shell = Shell::new("isksh");
         shell.run("export ISKSH_MODE=zsh", &[]);
@@ -7325,6 +7538,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_zsh_parameter_option_print_and_command_semantics`に対応する処理を行う。
     fn supports_zsh_parameter_option_print_and_command_semantics() {
         let mut shell = Shell::new("isksh");
         shell.run("export ISKSH_MODE=zsh", &[]);
@@ -7426,6 +7640,7 @@ mod tests {
     }
 
     #[test]
+    /// `expands_every_supported_zsh_prompt_color`に対応する処理を行う。
     fn expands_every_supported_zsh_prompt_color() {
         assert_eq!(decode_echo_escapes("a\\nb\\rc\\t\\\\"), "a\nb\rc\t\\");
         assert_eq!(
@@ -7454,6 +7669,7 @@ mod tests {
     }
 
     #[test]
+    /// `unknown_mode_refreshes_to_bash`に対応する処理を行う。
     fn unknown_mode_refreshes_to_bash() {
         let mut shell = Shell::new("isksh");
         shell.run("export ISKSH_MODE=unknown", &[]);
@@ -7463,6 +7679,7 @@ mod tests {
     }
 
     #[test]
+    /// `interactive_external_commands_inherit_the_terminal`に対応する処理を行う。
     fn interactive_external_commands_inherit_the_terminal() {
         let mut shell = Shell::default();
         shell.set_interactive(true);
@@ -7483,6 +7700,7 @@ mod tests {
     }
 
     #[test]
+    /// `runs_external_pipelines_concurrently_and_tracks_statuses`に対応する処理を行う。
     fn runs_external_pipelines_concurrently_and_tracks_statuses() {
         let mut shell = Shell::default();
         let result = shell.run("yes | head -n 1", &[]);
@@ -7542,6 +7760,7 @@ mod tests {
     }
 
     #[test]
+    /// `manages_background_jobs_wait_and_special_parameter`に対応する処理を行う。
     fn manages_background_jobs_wait_and_special_parameter() {
         let mut shell = Shell::default();
         let (release, blocked) = std::sync::mpsc::channel();
@@ -7589,6 +7808,7 @@ mod tests {
     }
 
     #[test]
+    /// `expands_posix_patterns_nested_defaults_and_ifs_fields`に対応する処理を行う。
     fn expands_posix_patterns_nested_defaults_and_ifs_fields() {
         let mut shell = Shell::default();
         let result = shell.run(
@@ -7607,6 +7827,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_traps_and_starship_bash_initialization_fallback`に対応する処理を行う。
     fn supports_traps_and_starship_bash_initialization_fallback() {
         let mut shell = Shell::default();
         let result = shell.run("trap 'printf debug' DEBUG; printf body", &[]);
@@ -7640,6 +7861,7 @@ mod tests {
     }
 
     #[test]
+    /// `translates_dotfiles_bash_tool_integrations`に対応する処理を行う。
     fn translates_dotfiles_bash_tool_integrations() {
         let mut shell = Shell::default();
         assert!(shell.command_search_path().is_some());
@@ -7734,6 +7956,7 @@ mod tests {
     }
 
     #[test]
+    /// `handles_persistent_descriptors_hash_and_wait_errors`に対応する処理を行う。
     fn handles_persistent_descriptors_hash_and_wait_errors() {
         let directory = tempfile::tempdir().unwrap();
         let input = directory.path().join("input");
@@ -7783,6 +8006,7 @@ mod tests {
     }
 
     #[test]
+    /// `manages_and_expands_interactive_abbreviations`に対応する処理を行う。
     fn manages_and_expands_interactive_abbreviations() {
         let mut shell = Shell::default();
         assert_ne!(shell.run("abbr -a", &[]).status, 0);
@@ -7820,6 +8044,7 @@ mod tests {
     }
 
     #[test]
+    /// `supports_extended_zsh_runtime_compatibility`に対応する処理を行う。
     fn supports_extended_zsh_runtime_compatibility() {
         let mut shell = Shell::default();
         shell.run("ISKSH_MODE=zsh", &[]);
@@ -7962,6 +8187,7 @@ mod tests {
     }
 
     #[test]
+    /// `covers_extended_zsh_compatibility_errors_and_variants`に対応する処理を行う。
     fn covers_extended_zsh_compatibility_errors_and_variants() {
         let mut shell = Shell::default();
         shell.run("ISKSH_MODE=zsh", &[]);
@@ -8017,8 +8243,9 @@ mod tests {
     }
 
     #[test]
+    /// `covers_remaining_zsh_compatibility_paths`に対応する処理を行う。
     fn covers_remaining_zsh_compatibility_paths() {
-        // SAFETY: the coverage task runs this module with one test thread.
+        // SAFETY: カバレッジタスクはこのモジュールを単一テストスレッドで実行する。
         unsafe { std::env::set_var("ISKSH_MODE", "zsh") };
         let mut shell = Shell::default();
         unsafe { std::env::remove_var("ISKSH_MODE") };

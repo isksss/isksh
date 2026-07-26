@@ -1,4 +1,4 @@
-use isksh::{Shell, load_startup_file, run_interactive, startup_files};
+use isksh::{Shell, cli_help, load_startup_file, localize, run_interactive, startup_files};
 use rustyline::Movement;
 use rustyline::Word;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -17,17 +17,19 @@ use std::io::{self, BufReader, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
+/// `main`に対応する処理を行う。
 fn main() {
     let status = match run_cli() {
         Ok(status) => status,
         Err((status, message)) => {
-            eprintln!("isksh: {message}");
+            eprintln!("isksh: {}", localize(message));
             status
         }
     };
     std::process::exit(status);
 }
 
+/// `run_cli`に対応する処理を行う。
 fn run_cli() -> Result<i32, (i32, String)> {
     let mut raw_arguments = std::env::args_os();
     let executable = raw_arguments.next().unwrap_or_default();
@@ -35,15 +37,12 @@ fn run_cli() -> Result<i32, (i32, String)> {
         .map(|argument| {
             argument
                 .into_string()
-                .map_err(|_| (2, "arguments must be valid UTF-8".to_string()))
+                .map_err(|_| (2, localize("arguments must be valid UTF-8")))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     if arguments.first().map(String::as_str) == Some("--help") {
-        println!(
-            "isksh {}\n\nUsage:\n  isksh [OPTION...] SCRIPT [ARG...]\n  isksh [OPTION...] -c COMMAND [NAME [ARG...]]\n  isksh [OPTION...] -s [ARG...]\n  isksh -i\n\nOptions:\n  -i            force interactive mode\n  -l, --login   start as a login shell\n",
-            env!("CARGO_PKG_VERSION")
-        );
+        print!("{}", cli_help(env!("CARGO_PKG_VERSION")));
         return Ok(0);
     }
     if arguments.first().map(String::as_str) == Some("--version") {
@@ -114,7 +113,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
             let source = arguments
                 .get(1)
                 .cloned()
-                .ok_or_else(|| (2, "-c requires a command string".to_string()))?;
+                .ok_or_else(|| (2, localize("-c requires a command string")))?;
             let positional = arguments.get(3..).unwrap_or_default().to_vec();
             (source, positional)
         }
@@ -123,7 +122,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
             arguments.get(1..).unwrap_or_default().to_vec(),
         ),
         Some(path) if path.starts_with('-') => {
-            return Err((2, format!("unknown option: {path}")));
+            return Err((2, localize(format!("unknown option: {path}"))));
         }
         Some(path) => {
             let source =
@@ -144,6 +143,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
     Ok(result.status)
 }
 
+/// `parse_shell_options`に対応する処理を行う。
 fn parse_shell_options(
     arguments: Vec<String>,
     login_from_argv0: bool,
@@ -164,7 +164,7 @@ fn parse_shell_options(
                     match flag {
                         'i' => interactive = true,
                         'l' => login = true,
-                        _ => return Err((2, format!("unknown option: {option}"))),
+                        _ => return Err((2, localize(format!("unknown option: {option}")))),
                     }
                 }
             }
@@ -175,6 +175,7 @@ fn parse_shell_options(
     Ok((interactive, login, arguments[index..].to_vec()))
 }
 
+/// `load_and_report_startup`に対応する処理を行う。
 fn load_and_report_startup(
     shell: &mut Shell,
     path: &Path,
@@ -192,8 +193,12 @@ fn load_and_report_startup(
         }
         Ok(None) => {}
         Err(error) => {
-            writeln!(stderr, "isksh: {}: {error}", path.display())
-                .map_err(|error| (1, error.to_string()))?;
+            writeln!(
+                stderr,
+                "{}",
+                localize(format!("isksh: {}: {error}", path.display()))
+            )
+            .map_err(|error| (1, error.to_string()))?;
         }
     }
     Ok(())
@@ -208,6 +213,7 @@ struct ShellHelper {
 struct AbbreviationHandler(Arc<RwLock<HashMap<String, String>>>);
 
 impl ConditionalEventHandler for AbbreviationHandler {
+    /// `handle`に対応する処理を行う。
     fn handle(&self, _: &Event, _: RepeatCount, _: bool, context: &EventContext) -> Option<Cmd> {
         let before_cursor = &context.line()[..context.pos()];
         if in_shell_quote(before_cursor) {
@@ -231,6 +237,7 @@ impl ConditionalEventHandler for AbbreviationHandler {
     }
 }
 
+/// `in_shell_quote`に対応する処理を行う。
 fn in_shell_quote(source: &str) -> bool {
     let mut quote = None;
     let mut escaped = false;
@@ -263,6 +270,7 @@ impl Hinter for ShellHelper {
 impl Completer for ShellHelper {
     type Candidate = Pair;
 
+    /// `complete`に対応する処理を行う。
     fn complete(
         &self,
         line: &str,
@@ -291,6 +299,7 @@ impl Completer for ShellHelper {
     }
 }
 
+/// `run_line_editor`に対応する処理を行う。
 fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     let mut editor = Editor::<ShellHelper, DefaultHistory>::new().map_err(io::Error::other)?;
     let abbreviations = Arc::new(RwLock::new(shell.configured_abbreviations()));
@@ -352,6 +361,7 @@ fn run_line_editor(shell: &mut Shell) -> io::Result<i32> {
     Ok(status)
 }
 
+/// `command_candidates`に対応する処理を行う。
 fn command_candidates(shell: &Shell) -> Vec<String> {
     let mut commands = BTreeSet::from(
         [
@@ -419,6 +429,7 @@ fn command_candidates(shell: &Shell) -> Vec<String> {
     commands.into_iter().collect()
 }
 
+/// `history_file`に対応する処理を行う。
 fn history_file() -> PathBuf {
     std::env::var_os("ISKSH_HISTORY")
         .map(PathBuf::from)
@@ -440,6 +451,7 @@ fn history_file() -> PathBuf {
         .unwrap_or_else(|| Path::new(".isksh_history").to_path_buf())
 }
 
+/// `read_stdin_utf8`に対応する処理を行う。
 fn read_stdin_utf8() -> Result<String, (i32, String)> {
     let mut bytes = Vec::new();
     io::stdin()
@@ -448,10 +460,10 @@ fn read_stdin_utf8() -> Result<String, (i32, String)> {
     String::from_utf8(bytes).map_err(|error| {
         (
             2,
-            format!(
+            localize(format!(
                 "input must be valid UTF-8 (invalid byte at offset {})",
                 error.utf8_error().valid_up_to()
-            ),
+            )),
         )
     })
 }
@@ -461,6 +473,7 @@ mod tests {
     use super::{in_shell_quote, parse_shell_options};
 
     #[test]
+    /// `identifies_open_shell_quotes`に対応する処理を行う。
     fn identifies_open_shell_quotes() {
         assert!(in_shell_quote("echo 'open"));
         assert!(in_shell_quote("echo \"open\\\" still open"));
@@ -469,6 +482,7 @@ mod tests {
     }
 
     #[test]
+    /// `parses_login_and_interactive_options`に対応する処理を行う。
     fn parses_login_and_interactive_options() {
         assert_eq!(
             parse_shell_options(vec!["-il".into()], false).unwrap(),

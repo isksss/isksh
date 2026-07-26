@@ -1,5 +1,6 @@
 #[cfg(unix)]
 #[test]
+/// `resolves_and_runs_every_dotfiles_cli_tool`に対応する処理を行う。
 fn resolves_and_runs_every_dotfiles_cli_tool() {
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;

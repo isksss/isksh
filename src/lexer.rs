@@ -47,12 +47,11 @@ pub struct LexError {
     pub incomplete: bool,
 }
 
-/// Tokenizes shell source text.
+/// シェルのソース文字列をトークンへ分割する。
 ///
-/// # Errors
+/// # エラー
 ///
-/// Returns [`LexError`] when the source contains an invalid or incomplete
-/// lexical construct.
+/// ソースに無効または不完全な字句要素が含まれる場合は[`LexError`]を返す。
 pub fn lex(source: &str) -> Result<Vec<Token>, LexError> {
     Lexer::new(source).lex_all()
 }
@@ -66,6 +65,7 @@ struct Lexer<'a> {
 }
 
 impl<'a> Lexer<'a> {
+    /// `new`に対応する処理を行う。
     fn new(source: &'a str) -> Self {
         Self {
             chars: source.chars().collect(),
@@ -76,6 +76,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// `lex_all`に対応する処理を行う。
     fn lex_all(mut self) -> Result<Vec<Token>, LexError> {
         let mut tokens = Vec::new();
         let mut conditional = false;
@@ -118,6 +119,7 @@ impl<'a> Lexer<'a> {
         Ok(tokens)
     }
 
+    /// `operator`に対応する処理を行う。
     fn operator(&mut self) -> Option<Operator> {
         if self.starts_with("<(") || self.starts_with(">(") {
             return None;
@@ -159,6 +161,7 @@ impl<'a> Lexer<'a> {
         Some(op)
     }
 
+    /// `word`に対応する処理を行う。
     fn word(&mut self, conditional: bool) -> Result<Word, LexError> {
         let mut parts = Vec::new();
         let mut literal = String::new();
@@ -232,6 +235,7 @@ impl<'a> Lexer<'a> {
         Ok(Word { parts })
     }
 
+    /// `double_quoted`に対応する処理を行う。
     fn double_quoted(&mut self, parts: &mut Vec<WordPart>) -> Result<(), LexError> {
         let mut literal = String::new();
         loop {
@@ -281,6 +285,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// `dollar`に対応する処理を行う。
     fn dollar(&mut self, parts: &mut Vec<WordPart>, quoted: bool) -> Result<(), LexError> {
         self.bump();
         if self.starts_with("((") {
@@ -330,6 +335,7 @@ impl<'a> Lexer<'a> {
         Ok(())
     }
 
+    /// `collect_balanced`に対応する処理を行う。
     fn collect_balanced(&mut self, open: char, close: char) -> Result<String, LexError> {
         let mut value = String::new();
         let mut depth = 1usize;
@@ -361,6 +367,7 @@ impl<'a> Lexer<'a> {
         self.incomplete_error("置換式が閉じられていません")
     }
 
+    /// `collect_balanced_arithmetic`に対応する処理を行う。
     fn collect_balanced_arithmetic(&mut self) -> Result<String, LexError> {
         let mut value = String::new();
         let mut depth = 1usize;
@@ -382,6 +389,7 @@ impl<'a> Lexer<'a> {
         self.incomplete_error("算術展開が閉じられていません")
     }
 
+    /// `backticks`に対応する処理を行う。
     fn backticks(&mut self) -> Result<String, LexError> {
         self.bump();
         let mut value = String::new();
@@ -400,6 +408,7 @@ impl<'a> Lexer<'a> {
         self.incomplete_error("バッククォートが閉じられていません")
     }
 
+    /// `collect_until`に対応する処理を行う。
     fn collect_until(&mut self, end: char) -> Result<String, LexError> {
         let mut value = String::new();
         while let Some(ch) = self.bump() {
@@ -411,6 +420,7 @@ impl<'a> Lexer<'a> {
         self.incomplete_error("引用符が閉じられていません")
     }
 
+    /// `flush_literal`に対応する処理を行う。
     fn flush_literal(&self, parts: &mut Vec<WordPart>, value: &mut String, quoted: bool) {
         if !value.is_empty() {
             parts.push(WordPart::Literal {
@@ -420,6 +430,7 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// `starts_with`に対応する処理を行う。
     fn starts_with(&self, text: &str) -> bool {
         self.chars[self.index..]
             .iter()
@@ -429,10 +440,12 @@ impl<'a> Lexer<'a> {
             && self.chars.len().saturating_sub(self.index) >= text.chars().count()
     }
 
+    /// `peek`に対応する処理を行う。
     fn peek(&self) -> Option<char> {
         self.chars.get(self.index).copied()
     }
 
+    /// `bump`に対応する処理を行う。
     fn bump(&mut self) -> Option<char> {
         let ch = self.peek()?;
         self.index += 1;
@@ -445,6 +458,7 @@ impl<'a> Lexer<'a> {
         Some(ch)
     }
 
+    /// `incomplete_error`に対応する処理を行う。
     fn incomplete_error<T>(&self, message: impl Into<String>) -> Result<T, LexError> {
         Err(LexError {
             message: message.into(),
@@ -460,6 +474,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// `preserves_quote_context_and_expansions`に対応する処理を行う。
     fn preserves_quote_context_and_expansions() {
         let tokens = lex("echo 'a b' \"$name\" ${value:-x} $(printf y)").unwrap();
         assert_eq!(tokens.len(), 5);
@@ -471,6 +486,7 @@ mod tests {
     }
 
     #[test]
+    /// `reports_unclosed_quote_with_position`に対応する処理を行う。
     fn reports_unclosed_quote_with_position() {
         let error = lex("echo 'oops").unwrap_err();
         assert_eq!(error.line, 1);
@@ -478,6 +494,7 @@ mod tests {
     }
 
     #[test]
+    /// `recognizes_every_operator_and_comment`に対応する処理を行う。
     fn recognizes_every_operator_and_comment() {
         let tokens =
             lex("word \r# comment\n; & && || | ( ) { } < > >> << <<- <& >& <> >| ;;").unwrap();
@@ -516,6 +533,7 @@ mod tests {
     }
 
     #[test]
+    /// `handles_escape_and_all_substitution_forms`に対応する処理を行う。
     fn handles_escape_and_all_substitution_forms() {
         let tokens =
             lex("a\\ b\\\n c \"\\$\\`\\\"\\\\\\q$var${x}$(echo (x))$((1+(2)))$-$$$9\" `a\\`b` $")
@@ -528,6 +546,7 @@ mod tests {
     }
 
     #[test]
+    /// `reports_each_incomplete_lexical_form`に対応する処理を行う。
     fn reports_each_incomplete_lexical_form() {
         for source in ["\\", "\"", "'", "${x", "$(x", "$((1", "`x"] {
             let error = lex(source).unwrap_err();
@@ -536,6 +555,7 @@ mod tests {
     }
 
     #[test]
+    /// `covers_double_quote_and_balanced_quote_edges`に対応する処理を行う。
     fn covers_double_quote_and_balanced_quote_edges() {
         let tokens = lex("\"\" \"a\\\nb\" \"`printf x`\" ${'x'} ${a{b}}").unwrap();
         assert_eq!(tokens.len(), 5);
@@ -544,6 +564,7 @@ mod tests {
     }
 
     #[test]
+    /// `recognizes_bash_conditionals_and_process_substitution`に対応する処理を行う。
     fn recognizes_bash_conditionals_and_process_substitution() {
         let tokens = lex("[[ x == x && 2 > 1 ]]; cat <(printf x) >(cat)").unwrap();
         assert!(

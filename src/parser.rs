@@ -12,11 +12,11 @@ pub struct ParseError {
     pub incomplete: bool,
 }
 
-/// Parses shell source text into a syntax tree.
+/// シェルのソース文字列を構文木へ変換する。
 ///
-/// # Errors
+/// # エラー
 ///
-/// Returns [`ParseError`] when tokenization or grammar validation fails.
+/// 字句解析または文法検証に失敗した場合は[`ParseError`]を返す。
 pub fn parse(source: &str) -> Result<Script, ParseError> {
     let (source, here_documents) = extract_here_documents(source)?;
     let tokens = lex(&source).map_err(|error| ParseError {
@@ -42,6 +42,7 @@ struct Parser {
 }
 
 impl Parser {
+    /// `parse_script_until`に対応する処理を行う。
     fn parse_script_until(
         &mut self,
         stop_words: &[&str],
@@ -74,6 +75,7 @@ impl Parser {
         Ok(Script { lists })
     }
 
+    /// `parse_and_or`に対応する処理を行う。
     fn parse_and_or(&mut self) -> Result<AndOr, ParseError> {
         let first = self.parse_pipeline()?;
         let mut rest = Vec::new();
@@ -96,6 +98,7 @@ impl Parser {
         })
     }
 
+    /// `parse_pipeline`に対応する処理を行う。
     fn parse_pipeline(&mut self) -> Result<Pipeline, ParseError> {
         let negated = self.consume_word("!");
         let mut commands = vec![self.parse_command()?];
@@ -106,6 +109,7 @@ impl Parser {
         Ok(Pipeline { negated, commands })
     }
 
+    /// `parse_command`に対応する処理を行う。
     fn parse_command(&mut self) -> Result<Command, ParseError> {
         if self.at_word("if") {
             return self.parse_if();
@@ -147,6 +151,7 @@ impl Parser {
         self.parse_simple().map(Command::Simple)
     }
 
+    /// `parse_if`に対応する処理を行う。
     fn parse_if(&mut self) -> Result<Command, ParseError> {
         self.expect_word("if")?;
         let condition = self.parse_script_until(&["then"], &[])?;
@@ -174,6 +179,7 @@ impl Parser {
         })
     }
 
+    /// `parse_while`に対応する処理を行う。
     fn parse_while(&mut self) -> Result<Command, ParseError> {
         let until = self.consume_word("until");
         if !until {
@@ -193,6 +199,7 @@ impl Parser {
         })
     }
 
+    /// `parse_for`に対応する処理を行う。
     fn parse_for(&mut self) -> Result<Command, ParseError> {
         self.expect_word("for")?;
         let name = self
@@ -222,6 +229,7 @@ impl Parser {
         Ok(Command::For { name, words, body })
     }
 
+    /// `parse_case`に対応する処理を行う。
     fn parse_case(&mut self) -> Result<Command, ParseError> {
         self.expect_word("case")?;
         let word = self
@@ -255,6 +263,7 @@ impl Parser {
         Ok(Command::Case { word, arms })
     }
 
+    /// `parse_simple`に対応する処理を行う。
     fn parse_simple(&mut self) -> Result<SimpleCommand, ParseError> {
         let mut command = SimpleCommand::default();
         loop {
@@ -305,6 +314,7 @@ impl Parser {
         }
     }
 
+    /// `peek_redirection`に対応する処理を行う。
     fn peek_redirection(&self) -> Option<(usize, Option<u32>, RedirectionKind)> {
         let (offset, fd) = match self.peek() {
             Some(Token {
@@ -338,6 +348,7 @@ impl Parser {
         Some((offset + 1, fd, kind))
     }
 
+    /// `function_name`に対応する処理を行う。
     fn function_name(&self) -> Option<String> {
         let TokenKind::Word(word) = &self.tokens.get(self.index)?.kind else {
             return None;
@@ -358,6 +369,7 @@ impl Parser {
         Some(name.to_string())
     }
 
+    /// `skip_separators`に対応する処理を行う。
     fn skip_separators(&mut self) -> bool {
         let start = self.index;
         while self.consume_operator(Operator::Newline) || self.consume_operator(Operator::Semicolon)
@@ -366,10 +378,12 @@ impl Parser {
         self.index != start
     }
 
+    /// `skip_newlines`に対応する処理を行う。
     fn skip_newlines(&mut self) {
         while self.consume_operator(Operator::Newline) {}
     }
 
+    /// `take_word`に対応する処理を行う。
     fn take_word(&mut self) -> Option<Word> {
         let TokenKind::Word(word) = &self.peek()?.kind else {
             return None;
@@ -379,6 +393,7 @@ impl Parser {
         Some(word)
     }
 
+    /// `take_plain_word`に対応する処理を行う。
     fn take_plain_word(&mut self) -> Option<String> {
         let value = match &self.peek()?.kind {
             TokenKind::Word(word) => word.as_plain_literal()?.to_string(),
@@ -388,14 +403,17 @@ impl Parser {
         Some(value)
     }
 
+    /// `at_word`に対応する処理を行う。
     fn at_word(&self, expected: &str) -> bool {
         matches!(&self.peek().map(|token| &token.kind), Some(TokenKind::Word(word)) if word.as_plain_literal() == Some(expected))
     }
 
+    /// `at_any_word`に対応する処理を行う。
     fn at_any_word(&self, expected: &[&str]) -> bool {
         expected.iter().any(|word| self.at_word(word))
     }
 
+    /// `consume_word`に対応する処理を行う。
     fn consume_word(&mut self, expected: &str) -> bool {
         if self.at_word(expected) {
             self.index += 1;
@@ -405,6 +423,7 @@ impl Parser {
         }
     }
 
+    /// `expect_word`に対応する処理を行う。
     fn expect_word(&mut self, expected: &str) -> Result<(), ParseError> {
         self.skip_newlines();
         if self.consume_word(expected) {
@@ -414,14 +433,17 @@ impl Parser {
         }
     }
 
+    /// `at_any_operator`に対応する処理を行う。
     fn at_any_operator(&self, expected: &[Operator]) -> bool {
         expected.iter().any(|operator| self.at_operator(*operator))
     }
 
+    /// `at_operator`に対応する処理を行う。
     fn at_operator(&self, expected: Operator) -> bool {
         matches!(self.peek().map(|token| &token.kind), Some(TokenKind::Operator(operator)) if *operator == expected)
     }
 
+    /// `consume_operator`に対応する処理を行う。
     fn consume_operator(&mut self, expected: Operator) -> bool {
         if self.at_operator(expected) {
             self.index += 1;
@@ -431,6 +453,7 @@ impl Parser {
         }
     }
 
+    /// `expect_operator`に対応する処理を行う。
     fn expect_operator(&mut self, expected: Operator) -> Result<(), ParseError> {
         if self.consume_operator(expected) {
             Ok(())
@@ -439,10 +462,12 @@ impl Parser {
         }
     }
 
+    /// `peek`に対応する処理を行う。
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.index)
     }
 
+    /// `current_error`に対応する処理を行う。
     fn current_error(&self, message: impl Into<String>) -> ParseError {
         let (line, column) = self
             .peek()
@@ -455,11 +480,13 @@ impl Parser {
         }
     }
 
+    /// `error`に対応する処理を行う。
     fn error<T>(&self, message: impl Into<String>) -> Result<T, ParseError> {
         Err(self.current_error(message))
     }
 }
 
+/// `extract_here_documents`に対応する処理を行う。
 fn extract_here_documents(
     source: &str,
 ) -> Result<(String, HashMap<String, HereDocument>), ParseError> {
@@ -509,6 +536,7 @@ fn extract_here_documents(
     Ok((output, documents))
 }
 
+/// `rewrite_here_document_line`に対応する処理を行う。
 fn rewrite_here_document_line(
     line: &str,
     sequence: &mut usize,
@@ -582,18 +610,21 @@ fn rewrite_here_document_line(
     (output, specs)
 }
 
+/// `valid_name`に対応する処理を行う。
 fn valid_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+/// `valid_function_name`に対応する処理を行う。
 fn valid_function_name(name: &str) -> bool {
     let mut chars = name.chars();
     matches!(chars.next(), Some(ch) if ch.is_ascii_alphabetic() || ch == '_')
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
 }
 
+/// `split_assignment`に対応する処理を行う。
 fn split_assignment(word: &Word) -> Option<(String, Word)> {
     let WordPart::Literal {
         value,
@@ -620,6 +651,7 @@ fn split_assignment(word: &Word) -> Option<(String, Word)> {
     Some((name.to_string(), Word { parts }))
 }
 
+/// `parse_array_reference`に対応する処理を行う。
 fn parse_array_reference(value: &str) -> Option<(&str, &str)> {
     let (name, subscript) = value.split_once('[')?;
     let subscript = subscript.strip_suffix(']')?;
@@ -631,6 +663,7 @@ mod tests {
     use super::*;
 
     #[test]
+    /// `parses_pipeline_and_conditionals`に対応する処理を行う。
     fn parses_pipeline_and_conditionals() {
         let script = parse("value=x; if true; then echo $value | cat; else false; fi").unwrap();
         assert_eq!(script.lists.len(), 2);
@@ -641,6 +674,7 @@ mod tests {
     }
 
     #[test]
+    /// `parses_loops_and_function`に対応する処理を行う。
     fn parses_loops_and_function() {
         let script =
             parse("show() { printf '%s' \"$1\"; }; for x in a b; do show $x; done").unwrap();
@@ -648,12 +682,14 @@ mod tests {
     }
 
     #[test]
+    /// `rejects_unclosed_if`に対応する処理を行う。
     fn rejects_unclosed_if() {
         let error = parse("if true; then echo nope").unwrap_err();
         assert!(error.incomplete);
     }
 
     #[test]
+    /// `parses_every_compound_command_and_redirection`に対応する処理を行う。
     fn parses_every_compound_command_and_redirection() {
         let source = concat!(
             "until false; do break; done\n",
@@ -672,6 +708,7 @@ mod tests {
     }
 
     #[test]
+    /// `parses_heredoc_variants_and_crlf`に対応する処理を行う。
     fn parses_heredoc_variants_and_crlf() {
         let script = parse("cat <<-EOF\r\n\tvalue\r\n\tEOF\r\ncat <<'Q'\n$x\nQ\n").unwrap();
         assert!(matches!(
@@ -686,6 +723,7 @@ mod tests {
     }
 
     #[test]
+    /// `rejects_invalid_syntax_forms`に対応する処理を行う。
     fn rejects_invalid_syntax_forms() {
         for source in [
             ")",
@@ -705,6 +743,7 @@ mod tests {
     }
 
     #[test]
+    /// `covers_elif_empty_loop_and_parser_helpers`に対応する処理を行う。
     fn covers_elif_empty_loop_and_parser_helpers() {
         let script = parse("if false; then :; elif true; then :; else false; fi").unwrap();
         assert!(matches!(
