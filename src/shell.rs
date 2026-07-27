@@ -1295,18 +1295,18 @@ impl Shell {
         }) {
             return ExecResult::error(1, format!("isksh: {key}: invalid or readonly variable"));
         }
-        for (key, value) in assignments {
-            let inserted = self.set_assignment(&key, value, Some(true));
-            debug_assert!(inserted.is_ok());
-        }
-        let previous_terminal_io = self.terminal_io;
-        self.terminal_io &= command.redirections.is_empty() && command_input.is_empty();
         if self.mode == ShellMode::Zsh && self.autoload_functions.contains(&name) {
             let loaded = self.load_autoload_function(&name);
             if loaded.status != 0 {
                 return loaded;
             }
         }
+        for (key, value) in assignments {
+            let inserted = self.set_assignment(&key, value, Some(true));
+            debug_assert!(inserted.is_ok());
+        }
+        let previous_terminal_io = self.terminal_io;
+        self.terminal_io &= command.redirections.is_empty() && command_input.is_empty();
         let mut result = if let Some(function) = self.functions.get(&name).cloned() {
             self.execute_function(&name, &function, words, &command_input)
         } else if is_builtin(&name) {
@@ -8313,6 +8313,16 @@ mod tests {
                 .status,
             0
         );
+        let input = root.path().join("autoload-input");
+        fs::write(&input, "input").unwrap();
+        shell.terminal_io = true;
+        let source = format!(
+            "autoload absent_state; TEMP_ASSIGN=value absent_state < {}",
+            shell_quote(&input.to_string_lossy())
+        );
+        assert_ne!(shell.run(&source, &[]).status, 0);
+        assert!(!shell.variables.contains_key("TEMP_ASSIGN"));
+        assert!(shell.terminal_io);
         fs::write(functions.join("unreadable"), [0xff]).unwrap();
         let _ = shell.run("autoload +X unreadable", &[]);
         assert_eq!(shell.run("zmodload -f ignored zsh/example", &[]).status, 0);
