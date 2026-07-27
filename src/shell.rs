@@ -1746,6 +1746,14 @@ impl Shell {
                         Ok(path) => path,
                         Err(message) => return ExecResult::error(1, message),
                     };
+                    if self
+                        .pending_process_substitutions
+                        .iter()
+                        .any(|pending| pending.path == path)
+                    {
+                        descriptors.insert(fd, OutputSink::File(path));
+                        continue;
+                    }
                     let mut options = OpenOptions::new();
                     options.create(true).write(true).append(true);
                     if redirection.kind != RedirectionKind::Append
@@ -8947,6 +8955,27 @@ mod tests {
     }
 
     #[test]
+    /// 高速終了する出力プロセス置換を一度だけ接続して終了状態を回収する。
+    fn finalizes_fast_process_substitutions_without_reopening_streams() {
+        let mut shell = Shell::default();
+        for _ in 0..64 {
+            for source in [
+                "printf x > >(false)",
+                ": > >(false)",
+                "printf x >| >(false)",
+                "printf x >> >(false)",
+            ] {
+                assert_eq!(shell.run(source, &[]).status, 1, "{source}");
+            }
+            assert_ne!(
+                shell.run("printf x > >(missing-isksh-command)", &[]).status,
+                0
+            );
+            assert!(shell.pending_process_substitutions.is_empty());
+        }
+    }
+
+    #[test]
     /// `covers_bash_compatibility_errors_and_variants`に対応する処理を行う。
     fn covers_bash_compatibility_errors_and_variants() {
         let mut shell = Shell::default();
@@ -8966,7 +8995,6 @@ mod tests {
         };
         assert_ne!(shell.execute_simple(&command, &[]).status, 0);
 
-        assert_eq!(shell.run("printf x > >(false)", &[]).status, 1);
         shell
             .pending_process_substitutions
             .push(PendingProcessSubstitution {
