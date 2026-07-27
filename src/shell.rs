@@ -6,7 +6,7 @@ use glob::{MatchOptions, Pattern, glob_with};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -14,6 +14,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
 /// `BACKGROUND_JOB_ID`で使用する値を保持する定数。
@@ -64,6 +65,39 @@ struct PreparedExternal {
     name: String,
     arguments: Vec<String>,
     assignments: Vec<(String, String)>,
+}
+
+/// 混在パイプラインから届くバイト列を読み取る入力ストリーム。
+#[derive(Debug)]
+struct PipelineInput {
+    receiver: Receiver<Vec<u8>>,
+    current: Cursor<Vec<u8>>,
+}
+
+impl PipelineInput {
+    /// パイプライン入力ストリームを生成する。
+    fn new(receiver: Receiver<Vec<u8>>) -> Self {
+        Self {
+            receiver,
+            current: Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for PipelineInput {
+    /// 受信済みの断片を読み、必要なら次の断片を待つ。
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let read = self.current.read(buffer)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            let Ok(next) = self.receiver.recv() else {
+                return Ok(0);
+            };
+            self.current = Cursor::new(next);
+        }
+    }
 }
 
 type BackgroundJobs = Arc<Mutex<BTreeMap<u32, std::thread::JoinHandle<ExecResult>>>>;
@@ -216,6 +250,7 @@ pub struct Shell {
     completion_definitions: BTreeMap<String, String>,
     completion_candidates: Vec<String>,
     zsh_hook_depth: usize,
+    pipeline_input: Option<Arc<Mutex<PipelineInput>>>,
 }
 
 impl Default for Shell {
@@ -315,6 +350,7 @@ impl Shell {
             completion_definitions: BTreeMap::new(),
             completion_candidates: Vec::new(),
             zsh_hook_depth: 0,
+            pipeline_input: None,
         }
     }
 
@@ -717,28 +753,73 @@ impl Shell {
                 Err(message) => ExecResult::error(1, message),
             };
         }
-        let mut pipe_input = input.to_vec();
-        let mut all_stderr = Vec::new();
-        let mut last = ExecResult::status(0);
-        let mut statuses = Vec::new();
-        for (index, command) in pipeline.commands.iter().enumerate() {
-            let is_last = index + 1 == pipeline.commands.len();
-            let mut result = if pipeline.commands.len() == 1 {
-                self.execute_command(command, &pipe_input)
+        if pipeline.commands.len() > 1 {
+            return self.execute_mixed_pipeline(pipeline, input);
+        }
+        let command = pipeline
+            .commands
+            .first()
+            .expect("パイプラインには一つ以上のコマンドが含まれる");
+        let mut last = self.execute_command(command, input);
+        let statuses = [last.status];
+        self.set_pipeline_statuses(&statuses);
+        if pipeline.negated {
+            last.status = i32::from(last.status == 0);
+        }
+        last
+    }
+
+    /// 組み込みコマンドや関数を含むパイプラインを並行実行する。
+    fn execute_mixed_pipeline(&mut self, pipeline: &Pipeline, input: &[u8]) -> ExecResult {
+        let count = pipeline.commands.len();
+        let mut senders = Vec::with_capacity(count.saturating_sub(1));
+        let mut receivers = Vec::with_capacity(count.saturating_sub(1));
+        for _ in 1..count {
+            let (sender, receiver) = sync_channel(1);
+            senders.push(Some(sender));
+            receivers.push(Some(receiver));
+        }
+
+        let mut handles = Vec::with_capacity(count);
+        for (index, command) in pipeline.commands.iter().cloned().enumerate() {
+            let mut child = self.clone();
+            child.terminal_io = false;
+            child.pipeline_input = if index == 0 {
+                None
             } else {
-                let mut child = self.clone();
-                child.terminal_io = false;
-                child.execute_command(command, &pipe_input)
+                Some(Arc::new(Mutex::new(PipelineInput::new(
+                    receivers[index - 1]
+                        .take()
+                        .expect("パイプライン入力は一度だけ取得される"),
+                ))))
             };
-            statuses.push(result.status);
-            all_stderr.append(&mut result.stderr);
-            if is_last {
-                last = result;
+            let sender = if index + 1 == count {
+                None
             } else {
-                pipe_input = result.stdout;
+                senders[index].take()
+            };
+            let initial_input = if index == 0 {
+                input.to_vec()
+            } else {
+                Vec::new()
+            };
+            handles.push(std::thread::spawn(move || {
+                child.execute_pipeline_stage(&command, &initial_input, sender)
+            }));
+        }
+
+        let mut statuses = Vec::with_capacity(count);
+        let mut stderr = Vec::new();
+        let mut last = ExecResult::status(0);
+        for (index, handle) in handles.into_iter().enumerate() {
+            let mut result = handle.join().expect("パイプラインの各段が正常に終了する");
+            statuses.push(result.status);
+            stderr.append(&mut result.stderr);
+            if index + 1 == count {
+                last = result;
             }
         }
-        last.stderr.splice(0..0, all_stderr);
+        last.stderr.splice(0..0, stderr);
         self.set_pipeline_statuses(&statuses);
         if self.shell_options.contains("pipefail")
             && let Some(status) = statuses.iter().rev().find(|status| **status != 0)
@@ -749,6 +830,63 @@ impl Shell {
             last.status = i32::from(last.status == 0);
         }
         last
+    }
+
+    /// 混在パイプラインの一段を実行し、出力を次段へ渡す。
+    fn execute_pipeline_stage(
+        &mut self,
+        command: &Command,
+        input: &[u8],
+        output: Option<SyncSender<Vec<u8>>>,
+    ) -> ExecResult {
+        if let Some(prepared) = self.prepare_external_command(command) {
+            return match prepared {
+                Ok(prepared) => self.execute_streaming_external(prepared, input, output),
+                Err(message) => ExecResult::error(1, message),
+            };
+        }
+        let mut result = self.execute_command(command, input);
+        if let Some(output) = output {
+            let bytes = std::mem::take(&mut result.stdout);
+            let _ = output.send(bytes);
+        }
+        result
+    }
+
+    /// 単純コマンドがリダイレクトのない外部コマンドなら実行情報を準備する。
+    fn prepare_external_command(
+        &mut self,
+        command: &Command,
+    ) -> Option<Result<PreparedExternal, String>> {
+        let Command::Simple(command) = command else {
+            return None;
+        };
+        if !command.redirections.is_empty()
+            || !command.array_assignments.is_empty()
+            || command.words.is_empty()
+        {
+            return None;
+        }
+        let name = command.words[0].as_plain_literal()?;
+        if is_builtin(name) || self.functions.contains_key(name) || self.aliases.contains_key(name)
+        {
+            return None;
+        }
+        Some((|| {
+            let mut assignments = Vec::new();
+            for (name, word) in &command.assignments {
+                assignments.push((name.clone(), self.expand_scalar(word)?));
+            }
+            let mut words = Vec::new();
+            for word in &command.words {
+                words.extend(self.expand_word(word)?);
+            }
+            Ok(PreparedExternal {
+                name: words.remove(0),
+                arguments: words,
+                assignments,
+            })
+        })())
     }
 
     /// `prepare_external_pipeline`に対応する処理を行う。
@@ -1535,15 +1673,116 @@ impl Shell {
             }
             Err(error) => return ExecResult::error(126, format!("isksh: {name}: {error}")),
         };
+        let pipeline_input = self.pipeline_input.clone();
         let stdin_writer = child.stdin.take().map(|mut stdin| {
             let input = input.to_vec();
-            std::thread::spawn(move || stdin.write_all(&input))
+            std::thread::spawn(move || {
+                if let Some(pipeline_input) = pipeline_input {
+                    let mut pipeline_input = pipeline_input
+                        .lock()
+                        .expect("パイプライン入力をロックできる");
+                    std::io::copy(&mut *pipeline_input, &mut stdin).map(|_| ())
+                } else {
+                    stdin.write_all(&input)
+                }
+            })
         });
         let output = child.wait_with_output();
         if let Some(writer) = stdin_writer {
             let _ = writer.join();
         }
         finish_external(name, output)
+    }
+
+    /// 外部コマンドの出力を混在パイプラインの次段へ逐次転送する。
+    fn execute_streaming_external(
+        &self,
+        prepared: PreparedExternal,
+        input: &[u8],
+        output: Option<SyncSender<Vec<u8>>>,
+    ) -> ExecResult {
+        let resolved_name = self.resolve_external_name(&prepared.name);
+        let mut process = platform_command(&resolved_name, &prepared.arguments);
+        process
+            .current_dir(&self.cwd)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, variable) in &self.variables {
+            if variable.exported {
+                process.env(name, &variable.value);
+            }
+        }
+        process.envs(prepared.assignments);
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return ExecResult::error(
+                    127,
+                    format!("isksh: {}: command not found", prepared.name),
+                );
+            }
+            Err(error) => {
+                return ExecResult::error(126, format!("isksh: {}: {error}", prepared.name));
+            }
+        };
+
+        let pipeline_input = self.pipeline_input.clone();
+        let initial_input = input.to_vec();
+        let stdin_writer = child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                if let Some(input) = pipeline_input {
+                    let mut input = input.lock().expect("パイプライン入力をロックできる");
+                    std::io::copy(&mut *input, &mut stdin).map(|_| ())
+                } else {
+                    stdin.write_all(&initial_input)
+                }
+            })
+        });
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let mut buffer = vec![0; 8192];
+                loop {
+                    let read = match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if let Some(output) = &output {
+                        if output.send(buffer[..read].to_vec()).is_err() {
+                            break;
+                        }
+                    } else {
+                        captured.extend_from_slice(&buffer[..read]);
+                    }
+                }
+                captured
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let _ = stderr.read_to_end(&mut captured);
+                captured
+            })
+        });
+        let status = child.wait();
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
+        let stdout = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        ExecResult {
+            status: pipeline_wait_status(status),
+            stdout,
+            stderr,
+            flow: Flow::None,
+        }
     }
 
     /// `execute_builtin`に対応する処理を行う。
@@ -2421,7 +2660,8 @@ impl Shell {
         let Some(name) = args.iter().find(|argument| !argument.starts_with('-')) else {
             return ExecResult::error(2, "isksh: vared: variable name required");
         };
-        let value = String::from_utf8_lossy(input)
+        let input = self.read_pipeline_line(input);
+        let value = String::from_utf8_lossy(&input)
             .lines()
             .next()
             .map(ToOwned::to_owned)
@@ -3078,7 +3318,8 @@ impl Shell {
         if !valid_variable_name(name) {
             return ExecResult::error(1, "isksh: mapfile: invalid array name");
         }
-        let text = match std::str::from_utf8(input) {
+        let input = self.read_pipeline_all(input);
+        let text = match std::str::from_utf8(&input) {
             Ok(value) => value,
             Err(_) => return ExecResult::error(1, "isksh: mapfile: input is not valid UTF-8"),
         };
@@ -3426,7 +3667,8 @@ impl Shell {
 
     /// `builtin_read`に対応する処理を行う。
     fn builtin_read(&mut self, args: &[String], input: &[u8]) -> ExecResult {
-        let input = match std::str::from_utf8(input) {
+        let input = self.read_pipeline_line(input);
+        let input = match std::str::from_utf8(&input) {
             Ok(input) => input,
             Err(error) => {
                 return ExecResult::error(
@@ -3510,6 +3752,37 @@ impl Shell {
             }
         }
         ExecResult::status(i32::from(input.is_empty()))
+    }
+
+    /// パイプライン入力から一行だけ読み取る。
+    fn read_pipeline_line(&self, fallback: &[u8]) -> Vec<u8> {
+        let Some(input) = &self.pipeline_input else {
+            return fallback.to_vec();
+        };
+        let mut input = input.lock().expect("パイプライン入力をロックできる");
+        let mut line = Vec::new();
+        let mut byte = [0];
+        loop {
+            if input.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        line
+    }
+
+    /// パイプライン入力を終端まで読み取る。
+    fn read_pipeline_all(&self, fallback: &[u8]) -> Vec<u8> {
+        let Some(input) = &self.pipeline_input else {
+            return fallback.to_vec();
+        };
+        let mut input = input.lock().expect("パイプライン入力をロックできる");
+        let mut bytes = Vec::new();
+        let _ = input.read_to_end(&mut bytes);
+        bytes
     }
 
     /// `builtin_builtin`に対応する処理を行う。
@@ -7841,6 +8114,53 @@ mod tests {
         );
         shell.set_interactive(true);
         assert_eq!(shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]).status, 0);
+    }
+
+    #[test]
+    /// `runs_mixed_pipelines_concurrently`に対応する処理を行う。
+    fn runs_mixed_pipelines_concurrently() {
+        let mut shell = Shell::default();
+        let result = shell.run("yes | read value; printf 'reached:%s\\n' \"$value\"", &[]);
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"reached:\n");
+
+        let result = shell.run(
+            "consume() { read value; printf 'function:%s\\n' \"$value\"; }; yes | consume",
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"function:y\n");
+        assert_eq!(
+            shell
+                .run("forward() { cat; }; printf forwarded | forward", &[])
+                .stdout,
+            b"forwarded"
+        );
+
+        assert_eq!(
+            shell
+                .run("printf 'one\\ntwo\\n' | mapfile -t values", &[])
+                .status,
+            0
+        );
+        shell.mode = ShellMode::Zsh;
+        assert_eq!(shell.run("printf 'edited\\n' | vared value", &[]).status, 0);
+        shell.mode = ShellMode::Bash;
+        assert_eq!(shell.run("printf x | false | cat", &[]).status, 0);
+        assert_eq!(
+            shell.run("missing-isksh-command | read value", &[]).status,
+            1
+        );
+        assert_eq!(shell.run("/ | read value", &[]).status, 1);
+        assert_eq!(
+            shell
+                .run("BAD=$((1/0)) sh -c 'printf ignored' | read value", &[])
+                .status,
+            1
+        );
+        assert_eq!(shell.run("! printf x | read value", &[]).status, 1);
+        shell.run("set -o pipefail", &[]);
+        assert_ne!(shell.run("yes | read value", &[]).status, 0);
     }
 
     #[test]
