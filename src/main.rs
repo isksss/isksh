@@ -1,4 +1,7 @@
-use isksh::{Shell, cli_help, load_startup_file, localize, run_interactive, startup_files};
+use isksh::{
+    Shell, cli_help, load_startup_file, localize, run_interactive, run_process_group_guard,
+    startup_files,
+};
 use rustyline::Movement;
 use rustyline::Word;
 use rustyline::completion::{Completer, FilenameCompleter, Pair};
@@ -41,6 +44,11 @@ fn run_cli() -> Result<i32, (i32, String)> {
         })
         .collect::<Result<Vec<_>, _>>()?;
 
+    if let Some(result) = run_process_group_guard(&arguments) {
+        result.map_err(|error| (2, error.to_string()))?;
+        return Ok(0);
+    }
+
     if arguments.first().map(String::as_str) == Some("--help") {
         print!("{}", cli_help(env!("CARGO_PKG_VERSION")));
         return Ok(0);
@@ -65,6 +73,7 @@ fn run_cli() -> Result<i32, (i32, String)> {
         "isksh".into()
     };
     let mut shell = Shell::new(name);
+    shell.set_process_group_guard_executable(std::env::current_exe().ok());
     shell.set_interactive(interactive && io::stdin().is_terminal() && io::stdout().is_terminal());
     let mut startup_stdout = io::stdout();
     let mut startup_stderr = io::stderr();

@@ -16,5 +16,7 @@ mod startup;
 #[doc(hidden)]
 pub use i18n::{cli_help, localize};
 pub use interactive::run_interactive;
+#[doc(hidden)]
+pub use shell::run_process_group_guard;
 pub use shell::{InputState, RunResult, Shell, ShellMode};
 pub use startup::{StartupFiles, load_startup_file, startup_files};

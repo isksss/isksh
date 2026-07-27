@@ -68,6 +68,74 @@ fn reads_script_from_stdin_without_option() {
 }
 
 #[test]
+/// 内部guardモードが標準入力をEOFまで読み、利用者向け出力を生成せず終了することを確認する。
+fn process_group_guard_mode_drains_standard_input() {
+    let nonce = "fixture-nonce";
+    let mut child = isksh()
+        .arg(format!("--__isksh-process-group-guard={nonce}"))
+        .env("__ISKSH_PROCESS_GROUP_GUARD_NONCE", nonce)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child.stdin.take().unwrap().write_all(b"guard").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+
+    for arguments in [
+        vec!["--help"],
+        vec!["--__isksh-process-group-guard=fixture-nonce", "--help"],
+    ] {
+        let rejected = isksh()
+            .args(arguments)
+            .env("__ISKSH_PROCESS_GROUP_GUARD_NONCE", nonce)
+            .output()
+            .unwrap();
+        assert_eq!(rejected.status.code(), Some(2));
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("handshake"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+/// 埋め込みShellが明示注入したfixture binaryだけをguardとして使用することを確認する。
+fn embedded_shell_uses_only_explicit_process_group_guard() {
+    let mut injected = isksh::Shell::default();
+    injected.set_process_group_guard_executable(Some(std::path::PathBuf::from(env!(
+        "CARGO_BIN_EXE_isksh"
+    ))));
+    injected.set_interactive(true);
+    let result = injected.run(
+        concat!(
+            "nested() { ",
+            "sh -c 'read pid comm state ppid pgid rest < /proc/self/stat; printf \"%s\\n\" \"$pgid\"' | ",
+            "sh -c 'read first; read pid comm state ppid pgid rest < /proc/self/stat; ",
+            "printf \"%s %s\" \"$first\" \"$pgid\"'; ",
+            "}; nested | cat",
+        ),
+        &[],
+    );
+    assert_eq!(result.status, 0);
+    let groups = String::from_utf8(result.stdout).unwrap();
+    let groups = groups.split_ascii_whitespace().collect::<Vec<_>>();
+    assert_eq!(groups.len(), 2);
+    assert_eq!(groups[0], groups[1]);
+
+    let mut uninjected = isksh::Shell::default();
+    uninjected.set_interactive(true);
+    let result = uninjected.run(
+        "fallback() { sh -c 'printf fallback' | cat; }; fallback | cat",
+        &[],
+    );
+    assert_eq!(result.status, 0);
+    assert_eq!(result.stdout, b"fallback");
+}
+
+#[test]
 /// `rejects_non_utf8_input`に対応する処理を行う。
 fn rejects_non_utf8_input() {
     let mut child = isksh()

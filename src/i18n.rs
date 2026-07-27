@@ -93,6 +93,18 @@ const ENGLISH_TO_JAPANESE: &[(&str, &str)] = &[
     (" is a shell builtin", " はシェル組み込みコマンドです"),
     ("unknown option", "不明なオプション"),
     ("requires a command string", "コマンド文字列が必要です"),
+    (
+        "process group guard failed",
+        "プロセスグループguardの起動に失敗しました",
+    ),
+    (
+        "using child process fallback",
+        "子プロセス方式へfallbackします",
+    ),
+    (
+        "invalid process group guard handshake",
+        "プロセスグループguardのhandshakeが無効です",
+    ),
     ("command not found", "コマンドが見つかりません"),
     ("unsupported builtin", "未対応の組み込みコマンドです"),
     ("unsupported option", "未対応のオプションです"),
@@ -245,6 +257,12 @@ const ENGLISH_TO_CHINESE: &[(&str, &str)] = &[
     (" is a shell builtin", " 是 shell 内置命令"),
     ("unknown option", "未知选项"),
     ("requires a command string", "需要命令字符串"),
+    ("process group guard failed", "进程组 guard 启动失败"),
+    ("using child process fallback", "回退到子进程方式"),
+    (
+        "invalid process group guard handshake",
+        "进程组 guard 握手无效",
+    ),
     ("command not found", "找不到命令"),
     ("unsupported builtin", "不支持的内置命令"),
     ("unsupported option", "不支持的选项"),
@@ -493,6 +511,33 @@ mod tests {
         assert_eq!(
             localize_for(MessageLanguage::Chinese, message),
             "isksh: demo: 找不到命令"
+        );
+        let guard_message = "process group guard failed: denied; using child process fallback";
+        assert_eq!(
+            localize_for(MessageLanguage::English, guard_message),
+            guard_message
+        );
+        assert_eq!(
+            localize_for(MessageLanguage::Japanese, guard_message),
+            "プロセスグループguardの起動に失敗しました: denied; 子プロセス方式へfallbackします"
+        );
+        assert_eq!(
+            localize_for(MessageLanguage::Chinese, guard_message),
+            "进程组 guard 启动失败: denied; 回退到子进程方式"
+        );
+        assert_eq!(
+            localize_for(
+                MessageLanguage::Japanese,
+                "invalid process group guard handshake"
+            ),
+            "プロセスグループguardのhandshakeが無効です"
+        );
+        assert_eq!(
+            localize_for(
+                MessageLanguage::Chinese,
+                "invalid process group guard handshake"
+            ),
+            "进程组 guard 握手无效"
         );
         assert_eq!(
             localize_for(

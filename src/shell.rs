@@ -17,6 +17,13 @@ use std::sync::{Arc, Mutex};
 
 /// `BACKGROUND_JOB_ID`で使用する値を保持する定数。
 static BACKGROUND_JOB_ID: AtomicU32 = AtomicU32::new(1);
+#[cfg(unix)]
+/// プロセス全体のsignal disposition変更を直列化するためのロック。
+static PROCESS_GROUP_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+/// guard起動nonceを渡す環境変数名。
+const PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT: &str = "__ISKSH_PROCESS_GROUP_GUARD_NONCE";
+/// guard起動を識別する専用引数の接頭辞。
+const PROCESS_GROUP_GUARD_ARGUMENT_PREFIX: &str = "--__isksh-process-group-guard=";
 #[cfg(windows)]
 /// `WINDOWS_CHILD_FOREGROUND`で使用する値を保持する定数。
 static WINDOWS_CHILD_FOREGROUND: AtomicBool = AtomicBool::new(false);
@@ -63,6 +70,35 @@ struct PreparedExternal {
     name: String,
     arguments: Vec<String>,
     assignments: Vec<(String, String)>,
+}
+
+/// 対話パイプラインのプロセスグループを全段の起動完了まで保持する。
+struct PipelineProcessGroupGuard {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+}
+
+#[cfg(unix)]
+/// 端末の前景プロセスグループとSIGTTOU設定をスコープ終了時に復元する。
+struct TerminalProcessGroupGuard {
+    active: bool,
+    previous_sigttou: Option<nix::sys::signal::SigHandler>,
+    _signal_lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(not(unix))]
+/// 端末の前景プロセスグループ状態をスコープ終了時に復元する。
+struct TerminalProcessGroupGuard {
+    active: bool,
+}
+
+impl Drop for PipelineProcessGroupGuard {
+    /// 保持用プロセスへEOFを通知し、panic時を含めて必ず終了回収する。
+    fn drop(&mut self) {
+        drop(self.input.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 /// 混在パイプラインから届くバイト列を読み取る入力ストリーム。
@@ -251,6 +287,7 @@ pub struct Shell {
     pipeline_input: Option<Arc<Mutex<PipelineInput>>>,
     pipeline_output: Option<SyncSender<Vec<u8>>>,
     pipeline_process_group: Option<Arc<AtomicU32>>,
+    process_group_guard_executable: Option<PathBuf>,
     pipeline_subshell: bool,
     pipeline_closed: Option<Arc<AtomicBool>>,
 }
@@ -355,6 +392,7 @@ impl Shell {
             pipeline_input: None,
             pipeline_output: None,
             pipeline_process_group: None,
+            process_group_guard_executable: None,
             pipeline_subshell: false,
             pipeline_closed: None,
         }
@@ -557,6 +595,15 @@ impl Shell {
         if interactive {
             install_console_control_handler();
         }
+    }
+
+    /// 対話パイプラインのプロセスグループを保持する補助実行ファイルを設定する。
+    ///
+    /// 実行ファイルは起動直後に[`run_process_group_guard`]を呼び出す必要がある。
+    /// `None`では対話パイプラインのプロセスグループ管理を無効化する。
+    /// これは埋め込み先を誤って再起動しないための既定値である。
+    pub fn set_process_group_guard_executable(&mut self, executable: Option<PathBuf>) {
+        self.process_group_guard_executable = executable;
     }
 
     /// ソース文字列を完結、不完全、無効のいずれかに分類する。
@@ -808,11 +855,19 @@ impl Shell {
             receivers.push(Some(receiver));
         }
 
-        let owns_process_group = self.terminal_io && self.pipeline_process_group.is_none();
+        let owns_process_group = self.terminal_io
+            && self.pipeline_process_group.is_none()
+            && self.process_group_guard_executable.is_some();
         let process_group = self
             .pipeline_process_group
             .clone()
-            .or_else(|| self.terminal_io.then(|| Arc::new(AtomicU32::new(0))));
+            .or_else(|| owns_process_group.then(|| Arc::new(AtomicU32::new(0))));
+        let _terminal_guard = TerminalProcessGroupGuard::new(owns_process_group);
+        let (process_group_guard, process_group_diagnostic) = initialize_pipeline_process_group(
+            process_group.as_ref(),
+            owns_process_group,
+            self.process_group_guard_executable.as_deref(),
+        );
         let pipeline_closed = self
             .pipeline_closed
             .clone()
@@ -862,14 +917,9 @@ impl Shell {
                 last = result;
             }
         }
-        if owns_process_group
-            && process_group
-                .as_ref()
-                .is_some_and(|group| !matches!(group.load(Ordering::Acquire), 0 | u32::MAX))
-        {
-            restore_shell_process_group();
-        }
+        drop(process_group_guard);
         last.stderr.splice(0..0, stderr);
+        append_process_group_diagnostic(&mut last.stderr, process_group_diagnostic.as_deref());
         self.set_pipeline_statuses(&statuses);
         if self.shell_options.contains("pipefail")
             && let Some(status) = statuses.iter().rev().find(|status| **status != 0)
@@ -996,6 +1046,19 @@ impl Shell {
         negated: bool,
     ) -> ExecResult {
         let interactive = self.terminal_io;
+        let owns_process_group = interactive
+            && self.pipeline_process_group.is_none()
+            && self.process_group_guard_executable.is_some();
+        let process_group = self
+            .pipeline_process_group
+            .clone()
+            .or_else(|| owns_process_group.then(|| Arc::new(AtomicU32::new(0))));
+        let _terminal_guard = TerminalProcessGroupGuard::new(owns_process_group);
+        let (mut process_group_guard, process_group_diagnostic) = initialize_pipeline_process_group(
+            process_group.as_ref(),
+            owns_process_group,
+            self.process_group_guard_executable.as_deref(),
+        );
         let pipeline_output = self.pipeline_output.clone();
         let pipeline_closed = self.pipeline_closed.clone();
         let mut children: Vec<std::process::Child> = Vec::new();
@@ -1005,7 +1068,26 @@ impl Shell {
             let last = index + 1 == commands.len();
             let resolved_name = self.resolve_external_name(&prepared.name);
             let mut process = platform_command(&resolved_name, &prepared.arguments);
-            configure_process_group(&mut process, children.first().map(std::process::Child::id));
+            let mut process_group_leader = false;
+            if let Some(group) = &process_group {
+                loop {
+                    match group.load(Ordering::Acquire) {
+                        0 if group
+                            .compare_exchange(0, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok() =>
+                        {
+                            process_group_leader = true;
+                            configure_process_group(&mut process, None);
+                            break;
+                        }
+                        u32::MAX => std::thread::yield_now(),
+                        id => {
+                            configure_process_group(&mut process, Some(id));
+                            break;
+                        }
+                    }
+                }
+            }
             process.current_dir(&self.cwd).env_clear();
             for (name, variable) in &self.variables {
                 if variable.exported {
@@ -1039,18 +1121,32 @@ impl Shell {
             let mut child = match process.spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    if process_group_leader && let Some(group) = &process_group {
+                        group.store(0, Ordering::Release);
+                    }
                     for mut child in children {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
+                    drop(process_group_guard.take());
                     let status = if error.kind() == std::io::ErrorKind::NotFound {
                         127
                     } else {
                         126
                     };
-                    return ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                    let mut result =
+                        ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                    append_process_group_diagnostic(
+                        &mut result.stderr,
+                        process_group_diagnostic.as_deref(),
+                    );
+                    return result;
                 }
             };
+            if process_group_leader && let Some(group) = &process_group {
+                group.store(child.id(), Ordering::Release);
+                set_foreground_process_group(child.id());
+            }
             previous_stdout = child.stdout.take();
             if let Some(mut stderr) = child.stderr.take() {
                 stderr_readers.push(std::thread::spawn(move || {
@@ -1060,10 +1156,6 @@ impl Shell {
                 }));
             }
             children.push(child);
-        }
-        let foreground_group = children.first().map(std::process::Child::id);
-        if interactive && let Some(group) = foreground_group {
-            set_foreground_process_group(group);
         }
         let stdin_writer = children
             .first_mut()
@@ -1100,9 +1192,7 @@ impl Shell {
         for mut child in children {
             statuses.push(pipeline_wait_status(child.wait()));
         }
-        if interactive && foreground_group.is_some() {
-            restore_shell_process_group();
-        }
+        drop(process_group_guard.take());
         if let Some(writer) = stdin_writer {
             let _ = writer.join();
         }
@@ -1115,6 +1205,7 @@ impl Shell {
                 stderr.append(&mut output);
             }
         }
+        append_process_group_diagnostic(&mut stderr, process_group_diagnostic.as_deref());
         self.set_pipeline_statuses(&statuses);
         let mut status = statuses.last().copied().unwrap_or_default();
         if self.shell_options.contains("pipefail")
@@ -1730,6 +1821,7 @@ impl Shell {
             }
         }
         if terminal_io {
+            let _terminal_guard = TerminalProcessGroupGuard::new(true);
             process
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
@@ -1744,7 +1836,6 @@ impl Shell {
             };
             set_foreground_process_group(child.id());
             let status = child.wait();
-            restore_shell_process_group();
             return finish_external_status(name, status);
         }
         process
@@ -6187,6 +6278,196 @@ fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
     command
 }
 
+/// guard起動ごとに推測困難なnonceを生成する。
+#[cfg(unix)]
+fn process_group_guard_nonce() -> Result<String, String> {
+    let mut random = [0_u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(io_error_string)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// 専用引数と環境変数のnonceが一致する場合だけguardとして標準入力を読み切る。
+///
+/// 戻り値が`None`なら通常起動である。`Some`の場合はguard起動要求であり、呼び出し元は
+/// 成否にかかわらず通常のCLI処理を続行してはならない。
+#[doc(hidden)]
+pub fn run_process_group_guard(arguments: &[String]) -> Option<std::io::Result<()>> {
+    let environment_nonce = std::env::var(PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT).ok();
+    run_process_group_guard_with_environment(
+        arguments,
+        environment_nonce.as_deref(),
+        &mut std::io::stdin(),
+    )
+}
+
+/// 指定されたnonceと入力を使ってguard handshakeと入力破棄を実行する。
+fn run_process_group_guard_with_environment(
+    arguments: &[String],
+    environment_nonce: Option<&str>,
+    input: &mut dyn Read,
+) -> Option<std::io::Result<()>> {
+    let argument_nonce = arguments
+        .first()
+        .and_then(|argument| argument.strip_prefix(PROCESS_GROUP_GUARD_ARGUMENT_PREFIX));
+    if environment_nonce.is_none() && argument_nonce.is_none() {
+        return None;
+    }
+    if arguments.len() != 1
+        || argument_nonce.is_none_or(str::is_empty)
+        || environment_nonce != argument_nonce
+    {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            localize("invalid process group guard handshake"),
+        )));
+    }
+    Some(std::io::copy(input, &mut std::io::sink()).map(|_| ()))
+}
+
+#[cfg(unix)]
+/// 指定した絶対パスの実行ファイルをプロセスグループ保持用として起動する。
+fn spawn_pipeline_process_group_guard(
+    executable: &Path,
+    group: &Arc<AtomicU32>,
+) -> Result<Option<PipelineProcessGroupGuard>, String> {
+    use std::os::unix::process::CommandExt;
+    let nonce = process_group_guard_nonce()?;
+    let mut command = ProcessCommand::new(executable);
+    command
+        .arg(format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}{nonce}"))
+        .env(PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT, nonce)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: 登録する処理はfork後exec前にsignal dispositionを変更するだけである。
+    unsafe {
+        command.pre_exec(configure_pipeline_process_group_guard_child);
+    }
+    configure_process_group(&mut command, None);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let input = child.stdin.take();
+    group.store(child.id(), Ordering::Release);
+    set_foreground_process_group(child.id());
+    Ok(Some(PipelineProcessGroupGuard { child, input }))
+}
+
+#[cfg(unix)]
+/// guard子プロセスで対話signalを無視し、pipeline本体だけへ配送できるようにする。
+fn configure_pipeline_process_group_guard_child() -> std::io::Result<()> {
+    use nix::libc;
+    // SAFETY: fork後exec前の子プロセスでsignal dispositionを無視へ変更する。
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+/// Unix以外では各外部プロセスが既存の方法で前景状態を管理する。
+fn spawn_pipeline_process_group_guard(
+    _executable: &Path,
+    _group: &Arc<AtomicU32>,
+) -> Result<Option<PipelineProcessGroupGuard>, String> {
+    Ok(None)
+}
+
+/// guard初期化失敗を診断へ変換し、既存の子プロセスleader方式へfallbackする。
+fn initialize_pipeline_process_group(
+    group: Option<&Arc<AtomicU32>>,
+    owns_process_group: bool,
+    executable: Option<&Path>,
+) -> (Option<PipelineProcessGroupGuard>, Option<String>) {
+    if !owns_process_group {
+        return (None, None);
+    }
+    let Some(group) = group else {
+        return (None, None);
+    };
+    let Some(executable) = executable else {
+        return (None, None);
+    };
+    match spawn_pipeline_process_group_guard(executable, group) {
+        Ok(guard) => (guard, None),
+        Err(error) => (
+            None,
+            Some(localize(format!(
+                "process group guard failed: {error}; using child process fallback"
+            ))),
+        ),
+    }
+}
+
+/// guard初期化診断を標準エラー用バイト列へ追記する。
+fn append_process_group_diagnostic(output: &mut Vec<u8>, diagnostic: Option<&str>) {
+    if let Some(diagnostic) = diagnostic {
+        output.extend_from_slice(diagnostic.as_bytes());
+        output.push(b'\n');
+    }
+}
+
+#[cfg(unix)]
+impl TerminalProcessGroupGuard {
+    /// 必要な場合にsignal変更を直列化し、復元対象のSIGTTOU設定を保存する。
+    fn new(active: bool) -> Self {
+        if !active {
+            return Self {
+                active,
+                previous_sigttou: None,
+                _signal_lock: None,
+            };
+        }
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        let signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: ロック保持中に設定を保存し、Dropで同じ設定へ戻す。
+        let previous_sigttou = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.ok();
+        Self {
+            active,
+            previous_sigttou,
+            _signal_lock: Some(signal_lock),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalProcessGroupGuard {
+    /// panicを含むすべてのスコープ終了時に端末所有権とSIGTTOU設定を復元する。
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        restore_shell_process_group();
+        if let Some(previous) = self.previous_sigttou {
+            use nix::sys::signal::{Signal, signal};
+            // SAFETY: newで保存した同じprocess-global設定へロック保持中に戻す。
+            let _ = unsafe { signal(Signal::SIGTTOU, previous) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl TerminalProcessGroupGuard {
+    /// 端末復元が必要かを保持するguardを生成する。
+    fn new(active: bool) -> Self {
+        Self { active }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for TerminalProcessGroupGuard {
+    /// スコープ終了時にplatform固有の前景状態を復元する。
+    fn drop(&mut self) {
+        if self.active {
+            restore_shell_process_group();
+        }
+    }
+}
+
 #[cfg(unix)]
 /// `configure_process_group`に対応する処理を行う。
 fn configure_process_group(command: &mut ProcessCommand, group: Option<u32>) {
@@ -6201,10 +6482,7 @@ fn configure_process_group(_command: &mut ProcessCommand, _group: Option<u32>) {
 #[cfg(unix)]
 /// `set_foreground_process_group`に対応する処理を行う。
 fn set_foreground_process_group(group: u32) {
-    use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{Pid, tcsetpgrp};
-    // SAFETY: シェルが端末の所有権を移す間だけSIGTTOUを無視する。
-    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) };
     let _ = tcsetpgrp(std::io::stdin(), Pid::from_raw(group as i32));
 }
 
@@ -6221,11 +6499,8 @@ fn set_foreground_process_group(_group: u32) {}
 #[cfg(unix)]
 /// `restore_shell_process_group`に対応する処理を行う。
 fn restore_shell_process_group() {
-    use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{getpgrp, tcsetpgrp};
     let _ = tcsetpgrp(std::io::stdin(), getpgrp());
-    // SAFETY: 端末の所有権を回収した後に標準の既定動作へ戻す。
-    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigDfl) };
 }
 
 #[cfg(windows)]
@@ -8240,6 +8515,18 @@ mod tests {
         );
         shell.set_interactive(true);
         assert_eq!(shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]).status, 0);
+        assert_eq!(
+            shell
+                .run("missing-isksh-command | sh -c 'exit 0'", &[])
+                .status,
+            127
+        );
+        assert_eq!(
+            shell
+                .run("sh -c 'exit 0' | missing-isksh-command", &[])
+                .status,
+            127
+        );
     }
 
     #[test]
@@ -8366,6 +8653,280 @@ mod tests {
             0
         );
         shell.set_interactive(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    /// 入れ子の外部パイプラインを対話パイプラインと同じプロセスグループで実行する。
+    fn shares_process_group_with_nested_external_pipeline() {
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: process-global設定をロック中だけ変更し、直後に保存値へ戻す。
+            let previous_int = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同上。
+            let previous_term = unsafe { signal(Signal::SIGTERM, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同上。
+            let previous_hup = unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }.unwrap();
+            configure_pipeline_process_group_guard_child().unwrap();
+            // SAFETY: 保存したsignal設定をロック保持中に元へ戻す。
+            unsafe {
+                signal(Signal::SIGINT, previous_int).unwrap();
+                signal(Signal::SIGTERM, previous_term).unwrap();
+                signal(Signal::SIGHUP, previous_hup).unwrap();
+            }
+        }
+        let signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(TerminalProcessGroupGuard {
+            active: true,
+            previous_sigttou: None,
+            _signal_lock: Some(signal_lock),
+        });
+        let nonce = process_group_guard_nonce().unwrap();
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(run_process_group_guard(&[]).is_none());
+        assert!(
+            run_process_group_guard(&[format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}invalid")])
+                .unwrap()
+                .is_err()
+        );
+        let mut guard_input = Cursor::new(b"guard".to_vec());
+        assert!(
+            run_process_group_guard_with_environment(
+                &[format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}nonce")],
+                Some("nonce"),
+                &mut guard_input,
+            )
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(guard_input.position(), 5);
+        let mut invalid_input = Cursor::new(Vec::new());
+        for (arguments, environment_nonce) in [
+            (
+                vec![format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}")],
+                Some(""),
+            ),
+            (
+                vec![
+                    format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}nonce"),
+                    "extra".into(),
+                ],
+                Some("nonce"),
+            ),
+            (vec!["--help".into()], Some("nonce")),
+        ] {
+            assert!(
+                run_process_group_guard_with_environment(
+                    &arguments,
+                    environment_nonce,
+                    &mut invalid_input,
+                )
+                .unwrap()
+                .is_err()
+            );
+        }
+
+        let helper_directory = tempfile::tempdir().unwrap();
+        let helper = helper_directory.path().join("process-group-guard");
+        fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+
+        let fallback_group = Arc::new(AtomicU32::new(0));
+        let (fallback_guard, fallback_diagnostic) = initialize_pipeline_process_group(
+            Some(&fallback_group),
+            true,
+            Some(Path::new("/missing-isksh-process-group-guard")),
+        );
+        assert!(fallback_guard.is_none());
+        let fallback_diagnostic = fallback_diagnostic.unwrap();
+        assert!(fallback_diagnostic.contains("using child process fallback"));
+        let mut diagnostic_output = Vec::new();
+        append_process_group_diagnostic(&mut diagnostic_output, Some(&fallback_diagnostic));
+        assert!(diagnostic_output.ends_with(b"fallback\n"));
+
+        let (missing_group_guard, missing_group_diagnostic) =
+            initialize_pipeline_process_group(None, true, Some(&helper));
+        assert!(missing_group_guard.is_none());
+        assert!(missing_group_diagnostic.is_none());
+        let (disabled_guard, disabled_diagnostic) =
+            initialize_pipeline_process_group(Some(&fallback_group), false, Some(&helper));
+        assert!(disabled_guard.is_none());
+        assert!(disabled_diagnostic.is_none());
+        let (uninjected_guard, uninjected_diagnostic) =
+            initialize_pipeline_process_group(Some(&fallback_group), true, None);
+        assert!(uninjected_guard.is_none());
+        assert!(uninjected_diagnostic.is_none());
+
+        let unwind_group = Arc::new(AtomicU32::new(0));
+        let (unwind_guard, diagnostic) =
+            initialize_pipeline_process_group(Some(&unwind_group), true, Some(&helper));
+        assert!(diagnostic.is_none());
+        let guard_pid =
+            nix::unistd::Pid::from_raw(unwind_guard.as_ref().unwrap().child.id() as i32);
+        let original_sigttou = {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: 現在値を取得するため一時変更し、直後に保存値へ戻す。
+            let previous = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同じロックを保持したまま元の設定へ戻す。
+            unsafe { signal(Signal::SIGTTOU, previous) }.unwrap();
+            previous
+        };
+        let terminal_guard = TerminalProcessGroupGuard::new(true);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = unwind_guard;
+            let _terminal_guard = terminal_guard;
+            panic!("guard cleanup test");
+        }));
+        assert!(unwind.is_err());
+        let restored_sigttou = {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: 復元結果を取得するため一時変更し、直後に同じ値へ戻す。
+            let restored = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同じロックを保持したまま観測した設定へ戻す。
+            unsafe { signal(Signal::SIGTTOU, restored) }.unwrap();
+            restored
+        };
+        assert_eq!(
+            std::mem::discriminant(&restored_sigttou),
+            std::mem::discriminant(&original_sigttou)
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(guard_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+
+        let reaped_group = Arc::new(AtomicU32::new(0));
+        let (reaped_guard, diagnostic) =
+            initialize_pipeline_process_group(Some(&reaped_group), true, Some(&helper));
+        assert!(diagnostic.is_none());
+        let mut reaped_guard = reaped_guard.unwrap();
+        let reaped_pid = nix::unistd::Pid::from_raw(reaped_guard.child.id() as i32);
+        drop(reaped_guard.input.take());
+        nix::sys::wait::waitpid(reaped_pid, None).unwrap();
+        drop(reaped_guard);
+
+        let missing_group = Arc::new(AtomicU32::new(0));
+        let mut missing_shell = Shell {
+            pipeline_process_group: Some(missing_group),
+            ..Shell::default()
+        };
+        assert_eq!(
+            missing_shell
+                .run("missing-isksh-command | sh -c 'exit 0'", &[])
+                .status,
+            127
+        );
+
+        let streaming_group = Arc::new(AtomicU32::new(u32::MAX));
+        let release_streaming_group = streaming_group.clone();
+        let release_streaming = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            release_streaming_group.store(0, Ordering::Release);
+        });
+        let streaming_shell = Shell {
+            pipeline_process_group: Some(streaming_group.clone()),
+            ..Shell::default()
+        };
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "sh".into(),
+                        arguments: vec!["-c".into(), "exit 0".into()],
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            0
+        );
+        release_streaming.join().unwrap();
+        streaming_group.store(0, Ordering::Release);
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "missing-isksh-command".into(),
+                        arguments: Vec::new(),
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            127
+        );
+        streaming_group.store(0, Ordering::Release);
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "/".into(),
+                        arguments: Vec::new(),
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            126
+        );
+
+        let reserved_group = Arc::new(AtomicU32::new(u32::MAX));
+        let release_group = reserved_group.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            release_group.store(0, Ordering::Release);
+        });
+        let mut waiting_shell = Shell {
+            pipeline_process_group: Some(reserved_group.clone()),
+            ..Shell::default()
+        };
+        assert_eq!(
+            waiting_shell
+                .run("sh -c 'exit 0' | sh -c 'exit 0'", &[])
+                .status,
+            0
+        );
+        release.join().unwrap();
+        assert!(!matches!(
+            reserved_group.load(Ordering::Acquire),
+            0 | u32::MAX
+        ));
+
+        let mut shell = Shell::default();
+        shell.set_process_group_guard_executable(Some(helper));
+        shell.set_interactive(true);
+        let external = shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]);
+        assert_eq!(external.status, 0);
+        let result = shell.run(
+            concat!(
+                "nested() { ",
+                "sh -c 'read pid comm state ppid pgid rest < /proc/self/stat; printf \"%s\\n\" \"$pgid\"' | ",
+                "sh -c 'read first; read pid comm state ppid pgid rest < /proc/self/stat; ",
+                "printf \"%s %s\" \"$first\" \"$pgid\"'; ",
+                "}; nested | cat",
+            ),
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        let groups = String::from_utf8(result.stdout).unwrap();
+        let groups = groups.split_ascii_whitespace().collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], groups[1]);
     }
 
     #[test]
