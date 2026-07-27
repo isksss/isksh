@@ -50,4 +50,5 @@ run = "bash scripts/verify-static.sh"
 
 [tasks.check-all]
 description = "Run Rust and Markdown formatting, lint, tests, target checks and static verification"
-depends = ["fmt-check", "lint", "lint-markdown", "test", "coverage", "check-targets", "verify-static"]
+depends = ["fmt-check", "lint", "lint-markdown", "check-targets", "verify-static"]
+run = "mise run test && mise run coverage"

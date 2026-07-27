@@ -6,18 +6,24 @@ use glob::{MatchOptions, Pattern, glob_with};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(windows)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
 /// `BACKGROUND_JOB_ID`で使用する値を保持する定数。
 static BACKGROUND_JOB_ID: AtomicU32 = AtomicU32::new(1);
+#[cfg(unix)]
+/// プロセス全体のsignal disposition変更を直列化するためのロック。
+static PROCESS_GROUP_SIGNAL_LOCK: Mutex<()> = Mutex::new(());
+/// guard起動nonceを渡す環境変数名。
+const PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT: &str = "__ISKSH_PROCESS_GROUP_GUARD_NONCE";
+/// guard起動を識別する専用引数の接頭辞。
+const PROCESS_GROUP_GUARD_ARGUMENT_PREFIX: &str = "--__isksh-process-group-guard=";
 #[cfg(windows)]
 /// `WINDOWS_CHILD_FOREGROUND`で使用する値を保持する定数。
 static WINDOWS_CHILD_FOREGROUND: AtomicBool = AtomicBool::new(false);
@@ -64,6 +70,68 @@ struct PreparedExternal {
     name: String,
     arguments: Vec<String>,
     assignments: Vec<(String, String)>,
+}
+
+/// 対話パイプラインのプロセスグループを全段の起動完了まで保持する。
+struct PipelineProcessGroupGuard {
+    child: std::process::Child,
+    input: Option<std::process::ChildStdin>,
+}
+
+#[cfg(unix)]
+/// 端末の前景プロセスグループとSIGTTOU設定をスコープ終了時に復元する。
+struct TerminalProcessGroupGuard {
+    active: bool,
+    previous_sigttou: Option<nix::sys::signal::SigHandler>,
+    _signal_lock: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+#[cfg(not(unix))]
+/// 端末の前景プロセスグループ状態をスコープ終了時に復元する。
+struct TerminalProcessGroupGuard {
+    active: bool,
+}
+
+impl Drop for PipelineProcessGroupGuard {
+    /// 保持用プロセスへEOFを通知し、panic時を含めて必ず終了回収する。
+    fn drop(&mut self) {
+        drop(self.input.take());
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// 混在パイプラインから届くバイト列を読み取る入力ストリーム。
+#[derive(Debug)]
+struct PipelineInput {
+    receiver: Receiver<Vec<u8>>,
+    current: Cursor<Vec<u8>>,
+}
+
+impl PipelineInput {
+    /// パイプライン入力ストリームを生成する。
+    fn new(receiver: Receiver<Vec<u8>>) -> Self {
+        Self {
+            receiver,
+            current: Cursor::new(Vec::new()),
+        }
+    }
+}
+
+impl Read for PipelineInput {
+    /// 受信済みの断片を読み、必要なら次の断片を待つ。
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let read = self.current.read(buffer)?;
+            if read != 0 {
+                return Ok(read);
+            }
+            let Ok(next) = self.receiver.recv() else {
+                return Ok(0);
+            };
+            self.current = Cursor::new(next);
+        }
+    }
 }
 
 type BackgroundJobs = Arc<Mutex<BTreeMap<u32, std::thread::JoinHandle<ExecResult>>>>;
@@ -216,6 +284,12 @@ pub struct Shell {
     completion_definitions: BTreeMap<String, String>,
     completion_candidates: Vec<String>,
     zsh_hook_depth: usize,
+    pipeline_input: Option<Arc<Mutex<PipelineInput>>>,
+    pipeline_output: Option<SyncSender<Vec<u8>>>,
+    pipeline_process_group: Option<Arc<AtomicU32>>,
+    process_group_guard_executable: Option<PathBuf>,
+    pipeline_subshell: bool,
+    pipeline_closed: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Shell {
@@ -315,6 +389,12 @@ impl Shell {
             completion_definitions: BTreeMap::new(),
             completion_candidates: Vec::new(),
             zsh_hook_depth: 0,
+            pipeline_input: None,
+            pipeline_output: None,
+            pipeline_process_group: None,
+            process_group_guard_executable: None,
+            pipeline_subshell: false,
+            pipeline_closed: None,
         }
     }
 
@@ -517,6 +597,15 @@ impl Shell {
         }
     }
 
+    /// 対話パイプラインのプロセスグループを保持する補助実行ファイルを設定する。
+    ///
+    /// 実行ファイルは起動直後に[`run_process_group_guard`]を呼び出す必要がある。
+    /// `None`では対話パイプラインのプロセスグループ管理を無効化する。
+    /// これは埋め込み先を誤って再起動しないための既定値である。
+    pub fn set_process_group_guard_executable(&mut self, executable: Option<PathBuf>) {
+        self.process_group_guard_executable = executable;
+    }
+
     /// ソース文字列を完結、不完全、無効のいずれかに分類する。
     pub fn check_input(source: &str) -> InputState {
         match parse(source) {
@@ -662,14 +751,36 @@ impl Shell {
     fn execute_script(&mut self, script: &Script, input: &[u8]) -> ExecResult {
         let mut combined = ExecResult::status(0);
         for list in &script.lists {
-            let result = self.execute_and_or(list, input);
+            let mut result = self.execute_and_or(list, input);
+            self.forward_pipeline_output(&mut result);
             combined.append(result);
             self.last_status = combined.status;
-            if combined.flow != Flow::None {
+            if combined.flow != Flow::None || self.pipeline_is_closed() {
                 break;
             }
         }
         combined
+    }
+
+    /// 非最終パイプライン段の出力を次段へ逐次転送する。
+    fn forward_pipeline_output(&self, result: &mut ExecResult) {
+        let Some(output) = &self.pipeline_output else {
+            return;
+        };
+        let bytes = std::mem::take(&mut result.stdout);
+        if !bytes.is_empty()
+            && output.send(bytes).is_err()
+            && let Some(closed) = &self.pipeline_closed
+        {
+            closed.store(true, Ordering::Release);
+        }
+    }
+
+    /// 下流がパイプを閉じたかどうかを返す。
+    fn pipeline_is_closed(&self) -> bool {
+        self.pipeline_closed
+            .as_ref()
+            .is_some_and(|closed| closed.load(Ordering::Acquire))
     }
 
     /// `execute_and_or`に対応する処理を行う。
@@ -717,28 +828,98 @@ impl Shell {
                 Err(message) => ExecResult::error(1, message),
             };
         }
-        let mut pipe_input = input.to_vec();
-        let mut all_stderr = Vec::new();
-        let mut last = ExecResult::status(0);
-        let mut statuses = Vec::new();
-        for (index, command) in pipeline.commands.iter().enumerate() {
-            let is_last = index + 1 == pipeline.commands.len();
-            let mut result = if pipeline.commands.len() == 1 {
-                self.execute_command(command, &pipe_input)
+        if pipeline.commands.len() > 1 {
+            return self.execute_mixed_pipeline(pipeline, input);
+        }
+        let command = pipeline
+            .commands
+            .first()
+            .expect("パイプラインには一つ以上のコマンドが含まれる");
+        let mut last = self.execute_command(command, input);
+        let statuses = [last.status];
+        self.set_pipeline_statuses(&statuses);
+        if pipeline.negated {
+            last.status = i32::from(last.status == 0);
+        }
+        last
+    }
+
+    /// 組み込みコマンドや関数を含むパイプラインを並行実行する。
+    fn execute_mixed_pipeline(&mut self, pipeline: &Pipeline, input: &[u8]) -> ExecResult {
+        let count = pipeline.commands.len();
+        let mut senders = Vec::with_capacity(count.saturating_sub(1));
+        let mut receivers = Vec::with_capacity(count.saturating_sub(1));
+        for _ in 1..count {
+            let (sender, receiver) = sync_channel(1);
+            senders.push(Some(sender));
+            receivers.push(Some(receiver));
+        }
+
+        let owns_process_group = self.terminal_io
+            && self.pipeline_process_group.is_none()
+            && self.process_group_guard_executable.is_some();
+        let process_group = self
+            .pipeline_process_group
+            .clone()
+            .or_else(|| owns_process_group.then(|| Arc::new(AtomicU32::new(0))));
+        let _terminal_guard = TerminalProcessGroupGuard::new(owns_process_group);
+        let (process_group_guard, process_group_diagnostic) = initialize_pipeline_process_group(
+            process_group.as_ref(),
+            owns_process_group,
+            self.process_group_guard_executable.as_deref(),
+        );
+        let pipeline_closed = self
+            .pipeline_closed
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let mut handles = Vec::with_capacity(count);
+        for (index, command) in pipeline.commands.iter().cloned().enumerate() {
+            let mut child = self.clone();
+            child.terminal_io = self.terminal_io && index == 0 && input.is_empty();
+            child.pipeline_subshell = true;
+            child.background_jobs = Arc::new(Mutex::new(BTreeMap::new()));
+            child.last_background_job = None;
+            child.pipeline_process_group = process_group.clone();
+            child.pipeline_closed = Some(pipeline_closed.clone());
+            child.pipeline_input = if index == 0 {
+                None
             } else {
-                let mut child = self.clone();
-                child.terminal_io = false;
-                child.execute_command(command, &pipe_input)
+                Some(Arc::new(Mutex::new(PipelineInput::new(
+                    receivers[index - 1]
+                        .take()
+                        .expect("パイプライン入力は一度だけ取得される"),
+                ))))
             };
-            statuses.push(result.status);
-            all_stderr.append(&mut result.stderr);
-            if is_last {
-                last = result;
+            let sender = if index + 1 == count {
+                self.pipeline_output.clone()
             } else {
-                pipe_input = result.stdout;
+                senders[index].take()
+            };
+            child.pipeline_output = sender.clone();
+            let initial_input = if index == 0 {
+                input.to_vec()
+            } else {
+                Vec::new()
+            };
+            handles.push(std::thread::spawn(move || {
+                child.execute_pipeline_stage(&command, &initial_input, sender)
+            }));
+        }
+
+        let mut statuses = Vec::with_capacity(count);
+        let mut stderr = Vec::new();
+        let mut last = ExecResult::status(0);
+        for (index, handle) in handles.into_iter().enumerate() {
+            let mut result = handle.join().expect("パイプラインの各段が正常に終了する");
+            statuses.push(result.status);
+            stderr.append(&mut result.stderr);
+            if index + 1 == count {
+                last = result;
             }
         }
-        last.stderr.splice(0..0, all_stderr);
+        drop(process_group_guard);
+        last.stderr.splice(0..0, stderr);
+        append_process_group_diagnostic(&mut last.stderr, process_group_diagnostic.as_deref());
         self.set_pipeline_statuses(&statuses);
         if self.shell_options.contains("pipefail")
             && let Some(status) = statuses.iter().rev().find(|status| **status != 0)
@@ -749,6 +930,65 @@ impl Shell {
             last.status = i32::from(last.status == 0);
         }
         last
+    }
+
+    /// 混在パイプラインの一段を実行し、出力を次段へ渡す。
+    fn execute_pipeline_stage(
+        &mut self,
+        command: &Command,
+        input: &[u8],
+        output: Option<SyncSender<Vec<u8>>>,
+    ) -> ExecResult {
+        if let Some(prepared) = self.prepare_external_command(command) {
+            return match prepared {
+                Ok(prepared) => self.execute_streaming_external(prepared, input, output),
+                Err(message) => ExecResult::error(1, message),
+            };
+        }
+        let mut result = self.execute_command(command, input);
+        self.forward_pipeline_output(&mut result);
+        result.status = match result.flow {
+            Flow::Exit(status) | Flow::Return(status) => status,
+            _ => result.status,
+        };
+        result.flow = Flow::None;
+        result
+    }
+
+    /// 単純コマンドがリダイレクトのない外部コマンドなら実行情報を準備する。
+    fn prepare_external_command(
+        &mut self,
+        command: &Command,
+    ) -> Option<Result<PreparedExternal, String>> {
+        let Command::Simple(command) = command else {
+            return None;
+        };
+        if !command.redirections.is_empty()
+            || !command.array_assignments.is_empty()
+            || command.words.is_empty()
+        {
+            return None;
+        }
+        let name = command.words[0].as_plain_literal()?;
+        if is_builtin(name) || self.functions.contains_key(name) || self.aliases.contains_key(name)
+        {
+            return None;
+        }
+        Some((|| {
+            let mut assignments = Vec::new();
+            for (name, word) in &command.assignments {
+                assignments.push((name.clone(), self.expand_scalar(word)?));
+            }
+            let mut words = Vec::new();
+            for word in &command.words {
+                words.extend(self.expand_word(word)?);
+            }
+            Ok(PreparedExternal {
+                name: words.remove(0),
+                arguments: words,
+                assignments,
+            })
+        })())
     }
 
     /// `prepare_external_pipeline`に対応する処理を行う。
@@ -806,6 +1046,21 @@ impl Shell {
         negated: bool,
     ) -> ExecResult {
         let interactive = self.terminal_io;
+        let owns_process_group = interactive
+            && self.pipeline_process_group.is_none()
+            && self.process_group_guard_executable.is_some();
+        let process_group = self
+            .pipeline_process_group
+            .clone()
+            .or_else(|| owns_process_group.then(|| Arc::new(AtomicU32::new(0))));
+        let _terminal_guard = TerminalProcessGroupGuard::new(owns_process_group);
+        let (mut process_group_guard, process_group_diagnostic) = initialize_pipeline_process_group(
+            process_group.as_ref(),
+            owns_process_group,
+            self.process_group_guard_executable.as_deref(),
+        );
+        let pipeline_output = self.pipeline_output.clone();
+        let pipeline_closed = self.pipeline_closed.clone();
         let mut children: Vec<std::process::Child> = Vec::new();
         let mut previous_stdout = None;
         let mut stderr_readers = Vec::new();
@@ -813,7 +1068,26 @@ impl Shell {
             let last = index + 1 == commands.len();
             let resolved_name = self.resolve_external_name(&prepared.name);
             let mut process = platform_command(&resolved_name, &prepared.arguments);
-            configure_process_group(&mut process, children.first().map(std::process::Child::id));
+            let mut process_group_leader = false;
+            if let Some(group) = &process_group {
+                loop {
+                    match group.load(Ordering::Acquire) {
+                        0 if group
+                            .compare_exchange(0, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+                            .is_ok() =>
+                        {
+                            process_group_leader = true;
+                            configure_process_group(&mut process, None);
+                            break;
+                        }
+                        u32::MAX => std::thread::yield_now(),
+                        id => {
+                            configure_process_group(&mut process, Some(id));
+                            break;
+                        }
+                    }
+                }
+            }
             process.current_dir(&self.cwd).env_clear();
             for (name, variable) in &self.variables {
                 if variable.exported {
@@ -834,7 +1108,7 @@ impl Shell {
                         .expect("previous pipeline command has stdout"),
                 ));
             }
-            process.stdout(if last && interactive {
+            process.stdout(if last && interactive && pipeline_output.is_none() {
                 Stdio::inherit()
             } else {
                 Stdio::piped()
@@ -847,18 +1121,32 @@ impl Shell {
             let mut child = match process.spawn() {
                 Ok(child) => child,
                 Err(error) => {
+                    if process_group_leader && let Some(group) = &process_group {
+                        group.store(0, Ordering::Release);
+                    }
                     for mut child in children {
                         let _ = child.kill();
                         let _ = child.wait();
                     }
+                    drop(process_group_guard.take());
                     let status = if error.kind() == std::io::ErrorKind::NotFound {
                         127
                     } else {
                         126
                     };
-                    return ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                    let mut result =
+                        ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                    append_process_group_diagnostic(
+                        &mut result.stderr,
+                        process_group_diagnostic.as_deref(),
+                    );
+                    return result;
                 }
             };
+            if process_group_leader && let Some(group) = &process_group {
+                group.store(child.id(), Ordering::Release);
+                set_foreground_process_group(child.id());
+            }
             previous_stdout = child.stdout.take();
             if let Some(mut stderr) = child.stderr.take() {
                 stderr_readers.push(std::thread::spawn(move || {
@@ -869,10 +1157,6 @@ impl Shell {
             }
             children.push(child);
         }
-        let foreground_group = children.first().map(std::process::Child::id);
-        if interactive && let Some(group) = foreground_group {
-            set_foreground_process_group(group);
-        }
         let stdin_writer = children
             .first_mut()
             .and_then(|child| child.stdin.take())
@@ -881,9 +1165,26 @@ impl Shell {
                 std::thread::spawn(move || stdin.write_all(&input))
             });
         let stdout_reader = previous_stdout.map(|mut stdout| {
+            let pipeline_output = pipeline_output.clone();
             std::thread::spawn(move || {
                 let mut output = Vec::new();
-                let _ = stdout.read_to_end(&mut output);
+                let mut buffer = vec![0; 8192];
+                loop {
+                    let read = match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if let Some(sender) = &pipeline_output {
+                        if sender.send(buffer[..read].to_vec()).is_err() {
+                            if let Some(closed) = &pipeline_closed {
+                                closed.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                    } else {
+                        output.extend_from_slice(&buffer[..read]);
+                    }
+                }
                 output
             })
         });
@@ -891,9 +1192,7 @@ impl Shell {
         for mut child in children {
             statuses.push(pipeline_wait_status(child.wait()));
         }
-        if interactive && foreground_group.is_some() {
-            restore_shell_process_group();
-        }
+        drop(process_group_guard.take());
         if let Some(writer) = stdin_writer {
             let _ = writer.join();
         }
@@ -906,6 +1205,7 @@ impl Shell {
                 stderr.append(&mut output);
             }
         }
+        append_process_group_diagnostic(&mut stderr, process_group_diagnostic.as_deref());
         self.set_pipeline_statuses(&statuses);
         let mut status = statuses.last().copied().unwrap_or_default();
         if self.shell_options.contains("pipefail")
@@ -1015,13 +1315,16 @@ impl Shell {
             let condition_result = self.execute_script(condition, input);
             let run = (condition_result.status == 0) != until;
             output.append(condition_result);
-            if !run || output.flow != Flow::None {
+            if !run || output.flow != Flow::None || self.pipeline_is_closed() {
                 break;
             }
             let mut iteration = self.execute_script(body, input);
             output.stdout.append(&mut iteration.stdout);
             output.stderr.append(&mut iteration.stderr);
             output.status = iteration.status;
+            if self.pipeline_is_closed() {
+                break;
+            }
             match iteration.flow {
                 Flow::Break(level) if level <= 1 => break,
                 Flow::Break(level) => {
@@ -1498,6 +1801,17 @@ impl Shell {
         input: &[u8],
         terminal_io: bool,
     ) -> ExecResult {
+        if let Some(output) = self.pipeline_output.clone() {
+            return self.execute_streaming_external(
+                PreparedExternal {
+                    name: name.to_string(),
+                    arguments: arguments.to_vec(),
+                    assignments: Vec::new(),
+                },
+                input,
+                Some(output),
+            );
+        }
         let resolved_name = self.resolve_external_name(name);
         let mut process = platform_command(&resolved_name, arguments);
         process.current_dir(&self.cwd).env_clear();
@@ -1507,6 +1821,7 @@ impl Shell {
             }
         }
         if terminal_io {
+            let _terminal_guard = TerminalProcessGroupGuard::new(true);
             process
                 .stdin(Stdio::inherit())
                 .stdout(Stdio::inherit())
@@ -1521,7 +1836,6 @@ impl Shell {
             };
             set_foreground_process_group(child.id());
             let status = child.wait();
-            restore_shell_process_group();
             return finish_external_status(name, status);
         }
         process
@@ -1535,15 +1849,155 @@ impl Shell {
             }
             Err(error) => return ExecResult::error(126, format!("isksh: {name}: {error}")),
         };
+        let pipeline_input = self.pipeline_input.clone();
         let stdin_writer = child.stdin.take().map(|mut stdin| {
             let input = input.to_vec();
-            std::thread::spawn(move || stdin.write_all(&input))
+            std::thread::spawn(move || {
+                if let Some(pipeline_input) = pipeline_input {
+                    let mut pipeline_input = pipeline_input
+                        .lock()
+                        .expect("パイプライン入力をロックできる");
+                    std::io::copy(&mut *pipeline_input, &mut stdin).map(|_| ())
+                } else {
+                    stdin.write_all(&input)
+                }
+            })
         });
         let output = child.wait_with_output();
         if let Some(writer) = stdin_writer {
             let _ = writer.join();
         }
         finish_external(name, output)
+    }
+
+    /// 外部コマンドの出力を混在パイプラインの次段へ逐次転送する。
+    fn execute_streaming_external(
+        &self,
+        prepared: PreparedExternal,
+        input: &[u8],
+        output: Option<SyncSender<Vec<u8>>>,
+    ) -> ExecResult {
+        let resolved_name = self.resolve_external_name(&prepared.name);
+        let mut process = platform_command(&resolved_name, &prepared.arguments);
+        let inherit_stdin = self.terminal_io && self.pipeline_input.is_none() && input.is_empty();
+        process
+            .current_dir(&self.cwd)
+            .env_clear()
+            .stdin(if inherit_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for (name, variable) in &self.variables {
+            if variable.exported {
+                process.env(name, &variable.value);
+            }
+        }
+        process.envs(prepared.assignments);
+        let mut process_group_leader = false;
+        if let Some(group) = &self.pipeline_process_group {
+            loop {
+                match group.load(Ordering::Acquire) {
+                    0 if group
+                        .compare_exchange(0, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok() =>
+                    {
+                        process_group_leader = true;
+                        configure_process_group(&mut process, None);
+                        break;
+                    }
+                    u32::MAX => std::thread::yield_now(),
+                    id => {
+                        configure_process_group(&mut process, Some(id));
+                        break;
+                    }
+                }
+            }
+        }
+        let mut child = match process.spawn() {
+            Ok(child) => child,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if process_group_leader && let Some(group) = &self.pipeline_process_group {
+                    group.store(0, Ordering::Release);
+                }
+                return ExecResult::error(
+                    127,
+                    format!("isksh: {}: command not found", prepared.name),
+                );
+            }
+            Err(error) => {
+                if process_group_leader && let Some(group) = &self.pipeline_process_group {
+                    group.store(0, Ordering::Release);
+                }
+                return ExecResult::error(126, format!("isksh: {}: {error}", prepared.name));
+            }
+        };
+        if process_group_leader && let Some(group) = &self.pipeline_process_group {
+            group.store(child.id(), Ordering::Release);
+            set_foreground_process_group(child.id());
+        }
+
+        let pipeline_input = self.pipeline_input.clone();
+        let initial_input = input.to_vec();
+        let stdin_writer = child.stdin.take().map(|mut stdin| {
+            std::thread::spawn(move || {
+                if let Some(input) = pipeline_input {
+                    let mut input = input.lock().expect("パイプライン入力をロックできる");
+                    std::io::copy(&mut *input, &mut stdin).map(|_| ())
+                } else {
+                    stdin.write_all(&initial_input)
+                }
+            })
+        });
+        let pipeline_closed = self.pipeline_closed.clone();
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let mut buffer = vec![0; 8192];
+                loop {
+                    let read = match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if let Some(output) = &output {
+                        if output.send(buffer[..read].to_vec()).is_err() {
+                            if let Some(closed) = &pipeline_closed {
+                                closed.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                    } else {
+                        captured.extend_from_slice(&buffer[..read]);
+                    }
+                }
+                captured
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let _ = stderr.read_to_end(&mut captured);
+                captured
+            })
+        });
+        let status = child.wait();
+        if let Some(writer) = stdin_writer {
+            let _ = writer.join();
+        }
+        let stdout = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        ExecResult {
+            status: pipeline_wait_status(status),
+            stdout,
+            stderr,
+            flow: Flow::None,
+        }
     }
 
     /// `execute_builtin`に対応する処理を行う。
@@ -2421,7 +2875,8 @@ impl Shell {
         let Some(name) = args.iter().find(|argument| !argument.starts_with('-')) else {
             return ExecResult::error(2, "isksh: vared: variable name required");
         };
-        let value = String::from_utf8_lossy(input)
+        let input = self.read_pipeline_line(input);
+        let value = String::from_utf8_lossy(&input)
             .lines()
             .next()
             .map(ToOwned::to_owned)
@@ -2783,7 +3238,9 @@ impl Shell {
             _ => return ExecResult::error(2, format!("isksh: umask: {}: invalid mask", args[0])),
         };
         self.creation_mask = mask;
-        set_process_umask(mask);
+        if !self.pipeline_subshell {
+            set_process_umask(mask);
+        }
         ExecResult::status(0)
     }
 
@@ -3078,7 +3535,8 @@ impl Shell {
         if !valid_variable_name(name) {
             return ExecResult::error(1, "isksh: mapfile: invalid array name");
         }
-        let text = match std::str::from_utf8(input) {
+        let input = self.read_pipeline_all(input);
+        let text = match std::str::from_utf8(&input) {
             Ok(value) => value,
             Err(_) => return ExecResult::error(1, "isksh: mapfile: input is not valid UTF-8"),
         };
@@ -3426,7 +3884,8 @@ impl Shell {
 
     /// `builtin_read`に対応する処理を行う。
     fn builtin_read(&mut self, args: &[String], input: &[u8]) -> ExecResult {
-        let input = match std::str::from_utf8(input) {
+        let input = self.read_pipeline_line(input);
+        let input = match std::str::from_utf8(&input) {
             Ok(input) => input,
             Err(error) => {
                 return ExecResult::error(
@@ -3510,6 +3969,37 @@ impl Shell {
             }
         }
         ExecResult::status(i32::from(input.is_empty()))
+    }
+
+    /// パイプライン入力から一行だけ読み取る。
+    fn read_pipeline_line(&self, fallback: &[u8]) -> Vec<u8> {
+        let Some(input) = &self.pipeline_input else {
+            return fallback.to_vec();
+        };
+        let mut input = input.lock().expect("パイプライン入力をロックできる");
+        let mut line = Vec::new();
+        let mut byte = [0];
+        loop {
+            if input.read(&mut byte).unwrap_or(0) == 0 {
+                break;
+            }
+            line.push(byte[0]);
+            if byte[0] == b'\n' {
+                break;
+            }
+        }
+        line
+    }
+
+    /// パイプライン入力を終端まで読み取る。
+    fn read_pipeline_all(&self, fallback: &[u8]) -> Vec<u8> {
+        let Some(input) = &self.pipeline_input else {
+            return fallback.to_vec();
+        };
+        let mut input = input.lock().expect("パイプライン入力をロックできる");
+        let mut bytes = Vec::new();
+        let _ = input.read_to_end(&mut bytes);
+        bytes
     }
 
     /// `builtin_builtin`に対応する処理を行う。
@@ -5788,6 +6278,196 @@ fn platform_command(name: &str, arguments: &[String]) -> ProcessCommand {
     command
 }
 
+/// guard起動ごとに推測困難なnonceを生成する。
+#[cfg(unix)]
+fn process_group_guard_nonce() -> Result<String, String> {
+    let mut random = [0_u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut random))
+        .map_err(io_error_string)?;
+    Ok(random.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+/// 専用引数と環境変数のnonceが一致する場合だけguardとして標準入力を読み切る。
+///
+/// 戻り値が`None`なら通常起動である。`Some`の場合はguard起動要求であり、呼び出し元は
+/// 成否にかかわらず通常のCLI処理を続行してはならない。
+#[doc(hidden)]
+pub fn run_process_group_guard(arguments: &[String]) -> Option<std::io::Result<()>> {
+    let environment_nonce = std::env::var(PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT).ok();
+    run_process_group_guard_with_environment(
+        arguments,
+        environment_nonce.as_deref(),
+        &mut std::io::stdin(),
+    )
+}
+
+/// 指定されたnonceと入力を使ってguard handshakeと入力破棄を実行する。
+fn run_process_group_guard_with_environment(
+    arguments: &[String],
+    environment_nonce: Option<&str>,
+    input: &mut dyn Read,
+) -> Option<std::io::Result<()>> {
+    let argument_nonce = arguments
+        .first()
+        .and_then(|argument| argument.strip_prefix(PROCESS_GROUP_GUARD_ARGUMENT_PREFIX));
+    if environment_nonce.is_none() && argument_nonce.is_none() {
+        return None;
+    }
+    if arguments.len() != 1
+        || argument_nonce.is_none_or(str::is_empty)
+        || environment_nonce != argument_nonce
+    {
+        return Some(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            localize("invalid process group guard handshake"),
+        )));
+    }
+    Some(std::io::copy(input, &mut std::io::sink()).map(|_| ()))
+}
+
+#[cfg(unix)]
+/// 指定した絶対パスの実行ファイルをプロセスグループ保持用として起動する。
+fn spawn_pipeline_process_group_guard(
+    executable: &Path,
+    group: &Arc<AtomicU32>,
+) -> Result<Option<PipelineProcessGroupGuard>, String> {
+    use std::os::unix::process::CommandExt;
+    let nonce = process_group_guard_nonce()?;
+    let mut command = ProcessCommand::new(executable);
+    command
+        .arg(format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}{nonce}"))
+        .env(PROCESS_GROUP_GUARD_NONCE_ENVIRONMENT, nonce)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // SAFETY: 登録する処理はfork後exec前にsignal dispositionを変更するだけである。
+    unsafe {
+        command.pre_exec(configure_pipeline_process_group_guard_child);
+    }
+    configure_process_group(&mut command, None);
+    let mut child = command.spawn().map_err(|error| error.to_string())?;
+    let input = child.stdin.take();
+    group.store(child.id(), Ordering::Release);
+    set_foreground_process_group(child.id());
+    Ok(Some(PipelineProcessGroupGuard { child, input }))
+}
+
+#[cfg(unix)]
+/// guard子プロセスで対話signalを無視し、pipeline本体だけへ配送できるようにする。
+fn configure_pipeline_process_group_guard_child() -> std::io::Result<()> {
+    use nix::libc;
+    // SAFETY: fork後exec前の子プロセスでsignal dispositionを無視へ変更する。
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_IGN);
+        libc::signal(libc::SIGTERM, libc::SIG_IGN);
+        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+/// Unix以外では各外部プロセスが既存の方法で前景状態を管理する。
+fn spawn_pipeline_process_group_guard(
+    _executable: &Path,
+    _group: &Arc<AtomicU32>,
+) -> Result<Option<PipelineProcessGroupGuard>, String> {
+    Ok(None)
+}
+
+/// guard初期化失敗を診断へ変換し、既存の子プロセスleader方式へfallbackする。
+fn initialize_pipeline_process_group(
+    group: Option<&Arc<AtomicU32>>,
+    owns_process_group: bool,
+    executable: Option<&Path>,
+) -> (Option<PipelineProcessGroupGuard>, Option<String>) {
+    if !owns_process_group {
+        return (None, None);
+    }
+    let Some(group) = group else {
+        return (None, None);
+    };
+    let Some(executable) = executable else {
+        return (None, None);
+    };
+    match spawn_pipeline_process_group_guard(executable, group) {
+        Ok(guard) => (guard, None),
+        Err(error) => (
+            None,
+            Some(localize(format!(
+                "process group guard failed: {error}; using child process fallback"
+            ))),
+        ),
+    }
+}
+
+/// guard初期化診断を標準エラー用バイト列へ追記する。
+fn append_process_group_diagnostic(output: &mut Vec<u8>, diagnostic: Option<&str>) {
+    if let Some(diagnostic) = diagnostic {
+        output.extend_from_slice(diagnostic.as_bytes());
+        output.push(b'\n');
+    }
+}
+
+#[cfg(unix)]
+impl TerminalProcessGroupGuard {
+    /// 必要な場合にsignal変更を直列化し、復元対象のSIGTTOU設定を保存する。
+    fn new(active: bool) -> Self {
+        if !active {
+            return Self {
+                active,
+                previous_sigttou: None,
+                _signal_lock: None,
+            };
+        }
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        let signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: ロック保持中に設定を保存し、Dropで同じ設定へ戻す。
+        let previous_sigttou = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.ok();
+        Self {
+            active,
+            previous_sigttou,
+            _signal_lock: Some(signal_lock),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TerminalProcessGroupGuard {
+    /// panicを含むすべてのスコープ終了時に端末所有権とSIGTTOU設定を復元する。
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        restore_shell_process_group();
+        if let Some(previous) = self.previous_sigttou {
+            use nix::sys::signal::{Signal, signal};
+            // SAFETY: newで保存した同じprocess-global設定へロック保持中に戻す。
+            let _ = unsafe { signal(Signal::SIGTTOU, previous) };
+        }
+    }
+}
+
+#[cfg(not(unix))]
+impl TerminalProcessGroupGuard {
+    /// 端末復元が必要かを保持するguardを生成する。
+    fn new(active: bool) -> Self {
+        Self { active }
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for TerminalProcessGroupGuard {
+    /// スコープ終了時にplatform固有の前景状態を復元する。
+    fn drop(&mut self) {
+        if self.active {
+            restore_shell_process_group();
+        }
+    }
+}
+
 #[cfg(unix)]
 /// `configure_process_group`に対応する処理を行う。
 fn configure_process_group(command: &mut ProcessCommand, group: Option<u32>) {
@@ -5802,10 +6482,7 @@ fn configure_process_group(_command: &mut ProcessCommand, _group: Option<u32>) {
 #[cfg(unix)]
 /// `set_foreground_process_group`に対応する処理を行う。
 fn set_foreground_process_group(group: u32) {
-    use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{Pid, tcsetpgrp};
-    // SAFETY: シェルが端末の所有権を移す間だけSIGTTOUを無視する。
-    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) };
     let _ = tcsetpgrp(std::io::stdin(), Pid::from_raw(group as i32));
 }
 
@@ -5822,11 +6499,8 @@ fn set_foreground_process_group(_group: u32) {}
 #[cfg(unix)]
 /// `restore_shell_process_group`に対応する処理を行う。
 fn restore_shell_process_group() {
-    use nix::sys::signal::{SigHandler, Signal, signal};
     use nix::unistd::{getpgrp, tcsetpgrp};
     let _ = tcsetpgrp(std::io::stdin(), getpgrp());
-    // SAFETY: 端末の所有権を回収した後に標準の既定動作へ戻す。
-    let _ = unsafe { signal(Signal::SIGTTOU, SigHandler::SigDfl) };
 }
 
 #[cfg(windows)]
@@ -7841,6 +8515,418 @@ mod tests {
         );
         shell.set_interactive(true);
         assert_eq!(shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]).status, 0);
+        assert_eq!(
+            shell
+                .run("missing-isksh-command | sh -c 'exit 0'", &[])
+                .status,
+            127
+        );
+        assert_eq!(
+            shell
+                .run("sh -c 'exit 0' | missing-isksh-command", &[])
+                .status,
+            127
+        );
+    }
+
+    #[test]
+    /// `runs_mixed_pipelines_concurrently`に対応する処理を行う。
+    fn runs_mixed_pipelines_concurrently() {
+        let mut shell = Shell::default();
+        let result = shell.run("yes | read value; printf 'reached:%s\\n' \"$value\"", &[]);
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"reached:\n");
+
+        let result = shell.run(
+            "consume() { read value; printf 'function:%s\\n' \"$value\"; }; yes | consume",
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        assert_eq!(result.stdout, b"function:y\n");
+        assert_eq!(shell.run("{ yes; } | head -n 1", &[]).stdout, b"y\n");
+        assert_eq!(
+            shell
+                .run("produce() { yes; }; produce | head -n 1", &[])
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_loop() { while true; do printf x; done; }; produce_loop | head -c 1",
+                    &[],
+                )
+                .stdout,
+            b"x"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_pipe() { yes | cat; }; produce_pipe | head -n 1",
+                    &[]
+                )
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(shell.run("{ yes | cat; } | head -n 1", &[]).stdout, b"y\n");
+        assert_eq!(
+            shell
+                .run(
+                    "catfn() { cat; }; produce_mixed() { yes | catfn; }; produce_mixed | head -n 1",
+                    &[],
+                )
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_group() { yes | { cat; }; }; produce_group | head -n 1",
+                    &[]
+                )
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(
+            shell
+                .run("forward() { cat; }; printf forwarded | forward", &[])
+                .stdout,
+            b"forwarded"
+        );
+
+        assert_eq!(
+            shell
+                .run("printf 'one\\ntwo\\n' | mapfile -t values", &[])
+                .status,
+            0
+        );
+        shell.mode = ShellMode::Zsh;
+        assert_eq!(shell.run("printf 'edited\\n' | vared value", &[]).status, 0);
+        shell.mode = ShellMode::Bash;
+        assert_eq!(shell.run("printf x | false | cat", &[]).status, 0);
+        assert_eq!(
+            shell.run("missing-isksh-command | read value", &[]).status,
+            1
+        );
+        assert_eq!(shell.run("/ | read value", &[]).status, 1);
+        assert_eq!(
+            shell
+                .run("BAD=$((1/0)) sh -c 'printf ignored' | read value", &[])
+                .status,
+            1
+        );
+        assert_eq!(shell.run("! printf x | read value", &[]).status, 1);
+        assert_eq!(
+            shell.run("true | exit 7; printf survived", &[]).stdout,
+            b"survived"
+        );
+        shell.run("set -o pipefail", &[]);
+        assert_ne!(shell.run("yes | read value", &[]).status, 0);
+
+        let job_id = BACKGROUND_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        shell
+            .background_jobs
+            .lock()
+            .unwrap()
+            .insert(job_id, std::thread::spawn(|| ExecResult::status(0)));
+        assert_eq!(shell.run("wait | cat", &[]).status, 0);
+        assert!(shell.background_jobs.lock().unwrap().contains_key(&job_id));
+        assert_eq!(shell.builtin_wait(&[job_id.to_string()]).status, 0);
+
+        #[cfg(unix)]
+        {
+            shell.run("umask 022", &[]);
+            assert_eq!(shell.run("umask 077 | true; umask", &[]).stdout, b"0022\n");
+            assert_eq!(shell.run("sh -c umask", &[]).stdout, b"0022\n");
+        }
+
+        shell.set_interactive(true);
+        assert_eq!(
+            shell.run("missing-isksh-command | read value", &[]).status,
+            1
+        );
+        assert_eq!(shell.run("/ | read value", &[]).status, 1);
+        assert_eq!(
+            shell
+                .run("sh -c 'printf interactive' | cat | read value", &[])
+                .status,
+            0
+        );
+        shell.set_interactive(false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    /// 入れ子の外部パイプラインを対話パイプラインと同じプロセスグループで実行する。
+    fn shares_process_group_with_nested_external_pipeline() {
+        use nix::sys::signal::{SigHandler, Signal, signal};
+        {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: process-global設定をロック中だけ変更し、直後に保存値へ戻す。
+            let previous_int = unsafe { signal(Signal::SIGINT, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同上。
+            let previous_term = unsafe { signal(Signal::SIGTERM, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同上。
+            let previous_hup = unsafe { signal(Signal::SIGHUP, SigHandler::SigIgn) }.unwrap();
+            configure_pipeline_process_group_guard_child().unwrap();
+            // SAFETY: 保存したsignal設定をロック保持中に元へ戻す。
+            unsafe {
+                signal(Signal::SIGINT, previous_int).unwrap();
+                signal(Signal::SIGTERM, previous_term).unwrap();
+                signal(Signal::SIGHUP, previous_hup).unwrap();
+            }
+        }
+        let signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        drop(TerminalProcessGroupGuard {
+            active: true,
+            previous_sigttou: None,
+            _signal_lock: Some(signal_lock),
+        });
+        let nonce = process_group_guard_nonce().unwrap();
+        assert_eq!(nonce.len(), 64);
+        assert!(nonce.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert!(run_process_group_guard(&[]).is_none());
+        assert!(
+            run_process_group_guard(&[format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}invalid")])
+                .unwrap()
+                .is_err()
+        );
+        let mut guard_input = Cursor::new(b"guard".to_vec());
+        assert!(
+            run_process_group_guard_with_environment(
+                &[format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}nonce")],
+                Some("nonce"),
+                &mut guard_input,
+            )
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(guard_input.position(), 5);
+        let mut invalid_input = Cursor::new(Vec::new());
+        for (arguments, environment_nonce) in [
+            (
+                vec![format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}")],
+                Some(""),
+            ),
+            (
+                vec![
+                    format!("{PROCESS_GROUP_GUARD_ARGUMENT_PREFIX}nonce"),
+                    "extra".into(),
+                ],
+                Some("nonce"),
+            ),
+            (vec!["--help".into()], Some("nonce")),
+        ] {
+            assert!(
+                run_process_group_guard_with_environment(
+                    &arguments,
+                    environment_nonce,
+                    &mut invalid_input,
+                )
+                .unwrap()
+                .is_err()
+            );
+        }
+
+        let helper_directory = tempfile::tempdir().unwrap();
+        let helper = helper_directory.path().join("process-group-guard");
+        fs::write(&helper, "#!/bin/sh\ncat >/dev/null\n").unwrap();
+        let mut permissions = fs::metadata(&helper).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&helper, permissions).unwrap();
+
+        let fallback_group = Arc::new(AtomicU32::new(0));
+        let (fallback_guard, fallback_diagnostic) = initialize_pipeline_process_group(
+            Some(&fallback_group),
+            true,
+            Some(Path::new("/missing-isksh-process-group-guard")),
+        );
+        assert!(fallback_guard.is_none());
+        let fallback_diagnostic = fallback_diagnostic.unwrap();
+        assert!(fallback_diagnostic.contains("using child process fallback"));
+        let mut diagnostic_output = Vec::new();
+        append_process_group_diagnostic(&mut diagnostic_output, Some(&fallback_diagnostic));
+        assert!(diagnostic_output.ends_with(b"fallback\n"));
+
+        let (missing_group_guard, missing_group_diagnostic) =
+            initialize_pipeline_process_group(None, true, Some(&helper));
+        assert!(missing_group_guard.is_none());
+        assert!(missing_group_diagnostic.is_none());
+        let (disabled_guard, disabled_diagnostic) =
+            initialize_pipeline_process_group(Some(&fallback_group), false, Some(&helper));
+        assert!(disabled_guard.is_none());
+        assert!(disabled_diagnostic.is_none());
+        let (uninjected_guard, uninjected_diagnostic) =
+            initialize_pipeline_process_group(Some(&fallback_group), true, None);
+        assert!(uninjected_guard.is_none());
+        assert!(uninjected_diagnostic.is_none());
+
+        let unwind_group = Arc::new(AtomicU32::new(0));
+        let (unwind_guard, diagnostic) =
+            initialize_pipeline_process_group(Some(&unwind_group), true, Some(&helper));
+        assert!(diagnostic.is_none());
+        let guard_pid =
+            nix::unistd::Pid::from_raw(unwind_guard.as_ref().unwrap().child.id() as i32);
+        let original_sigttou = {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: 現在値を取得するため一時変更し、直後に保存値へ戻す。
+            let previous = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同じロックを保持したまま元の設定へ戻す。
+            unsafe { signal(Signal::SIGTTOU, previous) }.unwrap();
+            previous
+        };
+        let terminal_guard = TerminalProcessGroupGuard::new(true);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _guard = unwind_guard;
+            let _terminal_guard = terminal_guard;
+            panic!("guard cleanup test");
+        }));
+        assert!(unwind.is_err());
+        let restored_sigttou = {
+            let _signal_lock = PROCESS_GROUP_SIGNAL_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // SAFETY: 復元結果を取得するため一時変更し、直後に同じ値へ戻す。
+            let restored = unsafe { signal(Signal::SIGTTOU, SigHandler::SigIgn) }.unwrap();
+            // SAFETY: 同じロックを保持したまま観測した設定へ戻す。
+            unsafe { signal(Signal::SIGTTOU, restored) }.unwrap();
+            restored
+        };
+        assert_eq!(
+            std::mem::discriminant(&restored_sigttou),
+            std::mem::discriminant(&original_sigttou)
+        );
+        assert_eq!(
+            nix::sys::wait::waitpid(guard_pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG)),
+            Err(nix::errno::Errno::ECHILD)
+        );
+
+        let reaped_group = Arc::new(AtomicU32::new(0));
+        let (reaped_guard, diagnostic) =
+            initialize_pipeline_process_group(Some(&reaped_group), true, Some(&helper));
+        assert!(diagnostic.is_none());
+        let mut reaped_guard = reaped_guard.unwrap();
+        let reaped_pid = nix::unistd::Pid::from_raw(reaped_guard.child.id() as i32);
+        drop(reaped_guard.input.take());
+        nix::sys::wait::waitpid(reaped_pid, None).unwrap();
+        drop(reaped_guard);
+
+        let missing_group = Arc::new(AtomicU32::new(0));
+        let mut missing_shell = Shell {
+            pipeline_process_group: Some(missing_group),
+            ..Shell::default()
+        };
+        assert_eq!(
+            missing_shell
+                .run("missing-isksh-command | sh -c 'exit 0'", &[])
+                .status,
+            127
+        );
+
+        let streaming_group = Arc::new(AtomicU32::new(u32::MAX));
+        let release_streaming_group = streaming_group.clone();
+        let release_streaming = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            release_streaming_group.store(0, Ordering::Release);
+        });
+        let streaming_shell = Shell {
+            pipeline_process_group: Some(streaming_group.clone()),
+            ..Shell::default()
+        };
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "sh".into(),
+                        arguments: vec!["-c".into(), "exit 0".into()],
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            0
+        );
+        release_streaming.join().unwrap();
+        streaming_group.store(0, Ordering::Release);
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "missing-isksh-command".into(),
+                        arguments: Vec::new(),
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            127
+        );
+        streaming_group.store(0, Ordering::Release);
+        assert_eq!(
+            streaming_shell
+                .execute_streaming_external(
+                    PreparedExternal {
+                        name: "/".into(),
+                        arguments: Vec::new(),
+                        assignments: Vec::new(),
+                    },
+                    &[],
+                    None,
+                )
+                .status,
+            126
+        );
+
+        let reserved_group = Arc::new(AtomicU32::new(u32::MAX));
+        let release_group = reserved_group.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            release_group.store(0, Ordering::Release);
+        });
+        let mut waiting_shell = Shell {
+            pipeline_process_group: Some(reserved_group.clone()),
+            ..Shell::default()
+        };
+        assert_eq!(
+            waiting_shell
+                .run("sh -c 'exit 0' | sh -c 'exit 0'", &[])
+                .status,
+            0
+        );
+        release.join().unwrap();
+        assert!(!matches!(
+            reserved_group.load(Ordering::Acquire),
+            0 | u32::MAX
+        ));
+
+        let mut shell = Shell::default();
+        shell.set_process_group_guard_executable(Some(helper));
+        shell.set_interactive(true);
+        let external = shell.run("sh -c 'exit 0' | sh -c 'exit 0'", &[]);
+        assert_eq!(external.status, 0);
+        let result = shell.run(
+            concat!(
+                "nested() { ",
+                "sh -c 'read pid comm state ppid pgid rest < /proc/self/stat; printf \"%s\\n\" \"$pgid\"' | ",
+                "sh -c 'read first; read pid comm state ppid pgid rest < /proc/self/stat; ",
+                "printf \"%s %s\" \"$first\" \"$pgid\"'; ",
+                "}; nested | cat",
+            ),
+            &[],
+        );
+        assert_eq!(result.status, 0);
+        let groups = String::from_utf8(result.stdout).unwrap();
+        let groups = groups.split_ascii_whitespace().collect::<Vec<_>>();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0], groups[1]);
     }
 
     #[test]
