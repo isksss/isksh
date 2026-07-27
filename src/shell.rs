@@ -11,9 +11,7 @@ use std::io::{Cursor, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
-#[cfg(windows)]
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 
@@ -254,6 +252,7 @@ pub struct Shell {
     pipeline_output: Option<SyncSender<Vec<u8>>>,
     pipeline_process_group: Option<Arc<AtomicU32>>,
     pipeline_subshell: bool,
+    pipeline_closed: Option<Arc<AtomicBool>>,
 }
 
 impl Default for Shell {
@@ -357,6 +356,7 @@ impl Shell {
             pipeline_output: None,
             pipeline_process_group: None,
             pipeline_subshell: false,
+            pipeline_closed: None,
         }
     }
 
@@ -708,7 +708,7 @@ impl Shell {
             self.forward_pipeline_output(&mut result);
             combined.append(result);
             self.last_status = combined.status;
-            if combined.flow != Flow::None {
+            if combined.flow != Flow::None || self.pipeline_is_closed() {
                 break;
             }
         }
@@ -721,9 +721,19 @@ impl Shell {
             return;
         };
         let bytes = std::mem::take(&mut result.stdout);
-        if !bytes.is_empty() {
-            let _ = output.send(bytes);
+        if !bytes.is_empty()
+            && output.send(bytes).is_err()
+            && let Some(closed) = &self.pipeline_closed
+        {
+            closed.store(true, Ordering::Release);
         }
+    }
+
+    /// 下流がパイプを閉じたかどうかを返す。
+    fn pipeline_is_closed(&self) -> bool {
+        self.pipeline_closed
+            .as_ref()
+            .is_some_and(|closed| closed.load(Ordering::Acquire))
     }
 
     /// `execute_and_or`に対応する処理を行う。
@@ -799,6 +809,7 @@ impl Shell {
         }
 
         let process_group = self.terminal_io.then(|| Arc::new(AtomicU32::new(0)));
+        let pipeline_closed = Arc::new(AtomicBool::new(false));
         let mut handles = Vec::with_capacity(count);
         for (index, command) in pipeline.commands.iter().cloned().enumerate() {
             let mut child = self.clone();
@@ -807,6 +818,7 @@ impl Shell {
             child.background_jobs = Arc::new(Mutex::new(BTreeMap::new()));
             child.last_background_job = None;
             child.pipeline_process_group = process_group.clone();
+            child.pipeline_closed = Some(pipeline_closed.clone());
             child.pipeline_input = if index == 0 {
                 None
             } else {
@@ -877,10 +889,7 @@ impl Shell {
             };
         }
         let mut result = self.execute_command(command, input);
-        if let Some(output) = output {
-            let bytes = std::mem::take(&mut result.stdout);
-            let _ = output.send(bytes);
-        }
+        self.forward_pipeline_output(&mut result);
         result.status = match result.flow {
             Flow::Exit(status) | Flow::Return(status) => status,
             _ => result.status,
@@ -980,6 +989,8 @@ impl Shell {
         negated: bool,
     ) -> ExecResult {
         let interactive = self.terminal_io;
+        let pipeline_output = self.pipeline_output.clone();
+        let pipeline_closed = self.pipeline_closed.clone();
         let mut children: Vec<std::process::Child> = Vec::new();
         let mut previous_stdout = None;
         let mut stderr_readers = Vec::new();
@@ -1008,7 +1019,7 @@ impl Shell {
                         .expect("previous pipeline command has stdout"),
                 ));
             }
-            process.stdout(if last && interactive {
+            process.stdout(if last && interactive && pipeline_output.is_none() {
                 Stdio::inherit()
             } else {
                 Stdio::piped()
@@ -1055,9 +1066,26 @@ impl Shell {
                 std::thread::spawn(move || stdin.write_all(&input))
             });
         let stdout_reader = previous_stdout.map(|mut stdout| {
+            let pipeline_output = pipeline_output.clone();
             std::thread::spawn(move || {
                 let mut output = Vec::new();
-                let _ = stdout.read_to_end(&mut output);
+                let mut buffer = vec![0; 8192];
+                loop {
+                    let read = match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if let Some(sender) = &pipeline_output {
+                        if sender.send(buffer[..read].to_vec()).is_err() {
+                            if let Some(closed) = &pipeline_closed {
+                                closed.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                    } else {
+                        output.extend_from_slice(&buffer[..read]);
+                    }
+                }
                 output
             })
         });
@@ -1189,13 +1217,16 @@ impl Shell {
             let condition_result = self.execute_script(condition, input);
             let run = (condition_result.status == 0) != until;
             output.append(condition_result);
-            if !run || output.flow != Flow::None {
+            if !run || output.flow != Flow::None || self.pipeline_is_closed() {
                 break;
             }
             let mut iteration = self.execute_script(body, input);
             output.stdout.append(&mut iteration.stdout);
             output.stderr.append(&mut iteration.stderr);
             output.status = iteration.status;
+            if self.pipeline_is_closed() {
+                break;
+            }
             match iteration.flow {
                 Flow::Break(level) if level <= 1 => break,
                 Flow::Break(level) => {
@@ -1822,6 +1853,7 @@ impl Shell {
                 }
             })
         });
+        let pipeline_closed = self.pipeline_closed.clone();
         let stdout_reader = child.stdout.take().map(|mut stdout| {
             std::thread::spawn(move || {
                 let mut captured = Vec::new();
@@ -1833,6 +1865,9 @@ impl Shell {
                     };
                     if let Some(output) = &output {
                         if output.send(buffer[..read].to_vec()).is_err() {
+                            if let Some(closed) = &pipeline_closed {
+                                closed.store(true, Ordering::Release);
+                            }
                             break;
                         }
                     } else {
@@ -8221,6 +8256,25 @@ mod tests {
                 .stdout,
             b"y\n"
         );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_loop() { while true; do printf x; done; }; produce_loop | head -c 1",
+                    &[],
+                )
+                .stdout,
+            b"x"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_pipe() { yes | cat; }; produce_pipe | head -n 1",
+                    &[]
+                )
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(shell.run("{ yes | cat; } | head -n 1", &[]).stdout, b"y\n");
         assert_eq!(
             shell
                 .run("forward() { cat; }; printf forwarded | forward", &[])
