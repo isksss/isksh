@@ -23,6 +23,24 @@ fn and_or_lists_follow_exit_status() {
 }
 
 #[test]
+/// 引数を消費しない`printf`書式が1回だけ出力されることを確認する。
+fn printf_non_consuming_format_is_not_repeated() {
+    assert_script("printf '%%' unused", "%", 0);
+}
+
+#[test]
+/// 不完全な`printf`書式が診断と終了状態2を返すことを確認する。
+fn printf_incomplete_format_returns_error() {
+    let result = Shell::default().run("printf '%' unused", &[]);
+    assert_eq!(result.status, 2);
+    assert!(result.stdout.is_empty());
+    assert_eq!(
+        result.stderr,
+        b"isksh: printf: incomplete format specifier\n"
+    );
+}
+
+#[test]
 /// `if_without_matching_branch_returns_success`に対応する処理を行う。
 fn if_without_matching_branch_returns_success() {
     assert_script("if false; then printf unexpected; fi", "", 0);

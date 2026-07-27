@@ -137,6 +137,7 @@ const ENGLISH_TO_JAPANESE: &[(&str, &str)] = &[
     ("invalid signal", "シグナルが無効です"),
     ("invalid mask", "マスクが無効です"),
     ("invalid option", "オプションが無効です"),
+    ("incomplete format specifier", "書式指定が不完全です"),
     ("invalid name", "名前が無効です"),
     ("invalid pattern", "パターンが無効です"),
     (
@@ -279,6 +280,7 @@ const ENGLISH_TO_CHINESE: &[(&str, &str)] = &[
     ("invalid signal", "信号无效"),
     ("invalid mask", "掩码无效"),
     ("invalid option", "选项无效"),
+    ("incomplete format specifier", "格式说明符不完整"),
     ("invalid name", "名称无效"),
     ("invalid pattern", "模式无效"),
     ("missing here-document body", "缺少 here-document 内容"),
@@ -491,6 +493,20 @@ mod tests {
         assert_eq!(
             localize_for(MessageLanguage::Chinese, message),
             "isksh: demo: 找不到命令"
+        );
+        assert_eq!(
+            localize_for(
+                MessageLanguage::Japanese,
+                "isksh: printf: incomplete format specifier"
+            ),
+            "isksh: printf: 書式指定が不完全です"
+        );
+        assert_eq!(
+            localize_for(
+                MessageLanguage::Chinese,
+                "isksh: printf: incomplete format specifier"
+            ),
+            "isksh: printf: 格式说明符不完整"
         );
         assert_eq!(
             localize_for(
