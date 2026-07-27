@@ -111,13 +111,14 @@ fn reports_help_version_and_cli_errors() {
 /// 英語・日本語・中国語でヘルプ、通常メッセージ、診断を出力できることを確認する。
 #[test]
 fn localizes_cli_and_shell_messages() {
-    for (language, help_heading, usage_heading, builtin_text, missing_text) in [
+    for (language, help_heading, usage_heading, builtin_text, missing_text, integer_text) in [
         (
             "en",
             "Usage:",
             "usage:",
             "shell builtin",
             "command not found",
+            "integer expression expected",
         ),
         (
             "ja",
@@ -125,8 +126,16 @@ fn localizes_cli_and_shell_messages() {
             "使用方法:",
             "シェル組み込みコマンド",
             "コマンドが見つかりません",
+            "整数式が必要です",
         ),
-        ("zh-CN", "用法:", "用法:", "shell 内置命令", "找不到命令"),
+        (
+            "zh-CN",
+            "用法:",
+            "用法:",
+            "shell 内置命令",
+            "找不到命令",
+            "需要整数表达式",
+        ),
     ] {
         let help = isksh()
             .arg("--help")
@@ -158,6 +167,18 @@ fn localizes_cli_and_shell_messages() {
         assert_eq!(missing.status.code(), Some(127));
         let missing = String::from_utf8(missing.stderr).unwrap();
         assert!(missing.contains(missing_text), "{language}: {missing}");
+
+        let invalid_integer = isksh()
+            .args(["-c", "test invalid -eq 1"])
+            .env("ISKSH_LANG", language)
+            .output()
+            .unwrap();
+        assert_eq!(invalid_integer.status.code(), Some(2));
+        let invalid_integer = String::from_utf8(invalid_integer.stderr).unwrap();
+        assert!(
+            invalid_integer.contains(integer_text),
+            "{language}: {invalid_integer}"
+        );
     }
 }
 

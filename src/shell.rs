@@ -1646,12 +1646,12 @@ impl Shell {
             "help" => self.builtin_help(args),
             "let" => self.builtin_let(args),
             "read" => self.builtin_read(args, input),
-            "test" => builtin_test(args),
+            "test" => builtin_test("test", args),
             "[" => {
                 if args.last().map(String::as_str) != Some("]") {
                     ExecResult::error(2, "isksh: [: missing ]")
                 } else {
-                    builtin_test(&args[..args.len() - 1])
+                    builtin_test("[", &args[..args.len() - 1])
                 }
             }
             "alias" => self.builtin_alias(args),
@@ -5716,8 +5716,23 @@ fn builtin_printf(args: &[String]) -> ExecResult {
     }
 }
 
-/// `builtin_test`に対応する処理を行う。
-fn builtin_test(args: &[String]) -> ExecResult {
+/// `test`と`[`の整数比較を評価し、不正な整数を特定する。
+fn test_integer_comparison<'a>(
+    left: &'a str,
+    operator: &str,
+    right: &'a str,
+) -> Result<bool, &'a str> {
+    let left = left.parse::<i64>().map_err(|_| left)?;
+    let right = right.parse::<i64>().map_err(|_| right)?;
+    Ok(if operator == "-eq" {
+        left == right
+    } else {
+        left != right
+    })
+}
+
+/// `test`または`[`の条件式を評価する。
+fn builtin_test(command: &str, args: &[String]) -> ExecResult {
     let success = match args {
         [] => false,
         [value] => !value.is_empty(),
@@ -5729,11 +5744,16 @@ fn builtin_test(args: &[String]) -> ExecResult {
         [operator, value] if operator == "-r" => fs::File::open(value).is_ok(),
         [left, operator, right] if operator == "=" => left == right,
         [left, operator, right] if operator == "!=" => left != right,
-        [left, operator, right] if operator == "-eq" => {
-            left.parse::<i64>().ok() == right.parse::<i64>().ok()
-        }
-        [left, operator, right] if operator == "-ne" => {
-            left.parse::<i64>().ok() != right.parse::<i64>().ok()
+        [left, operator, right] if operator == "-eq" || operator == "-ne" => {
+            match test_integer_comparison(left, operator, right) {
+                Ok(success) => success,
+                Err(value) => {
+                    return ExecResult::error(
+                        2,
+                        format!("isksh: {command}: {value}: integer expression expected"),
+                    );
+                }
+            }
         }
         _ => false,
     };
@@ -6475,14 +6495,38 @@ mod tests {
             (vec!["a", "!=", "b"], 0),
             (vec!["1", "-eq", "1"], 0),
             (vec!["1", "-ne", "2"], 0),
-            (vec!["bad", "-eq", "bad"], 0),
+            (vec!["bad", "-eq", "bad"], 2),
             (vec!["-r", "Cargo.toml"], 0),
             (vec!["-r", "missing-isksh-file"], 1),
             (vec!["too", "many", "values", "here"], 1),
         ] {
             let args = args.into_iter().map(str::to_string).collect::<Vec<_>>();
-            assert_eq!(builtin_test(&args).status, expected);
+            assert_eq!(builtin_test("test", &args).status, expected);
         }
+        let invalid_left = builtin_test("test", &["invalid".into(), "-eq".into(), "1".into()]);
+        assert_eq!(invalid_left.status, 2);
+        assert_eq!(
+            invalid_left.stderr,
+            b"isksh: test: invalid: integer expression expected\n"
+        );
+        let invalid_right = builtin_test("[", &["1".into(), "-ne".into(), "invalid".into()]);
+        assert_eq!(invalid_right.status, 2);
+        assert_eq!(
+            invalid_right.stderr,
+            b"isksh: [: invalid: integer expression expected\n"
+        );
+        assert_eq!(
+            builtin_test(
+                "test",
+                &[i64::MIN.to_string(), "-ne".into(), i64::MAX.to_string()]
+            )
+            .status,
+            0
+        );
+        assert_eq!(
+            builtin_test("test", &["+1".into(), "-eq".into(), "1".into()]).status,
+            0
+        );
 
         let mut shell = Shell::default();
         assert_ne!(shell.builtin_getopts(&[]).status, 0);
@@ -6949,7 +6993,11 @@ mod tests {
             vec!["-d", directory.path().to_str().unwrap()],
         ] {
             assert_eq!(
-                builtin_test(&args.into_iter().map(str::to_string).collect::<Vec<_>>()).status,
+                builtin_test(
+                    "test",
+                    &args.into_iter().map(str::to_string).collect::<Vec<_>>()
+                )
+                .status,
                 0
             );
         }

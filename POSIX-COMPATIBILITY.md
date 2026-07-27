@@ -13,7 +13,7 @@
 | パイプライン・AND-ORリスト | 部分対応 | 外部コマンド間は並列OSパイプ。組み込みコマンド・関数を含む場合は内部バッファを使用 |
 | 複合コマンド | 部分対応 | if、for、while、until、group、subshellを優先 |
 | 関数 | 部分対応 | 基本的な定義・呼び出しに対応 |
-| 組み込みユーティリティ | 部分対応 | trap、umask、hash、exec永続リダイレクト、read、printfを含むMVP対象を実装 |
+| 組み込みユーティリティ | 部分対応 | trap、umask、hash、exec永続リダイレクト、read、printfを含むMVP対象を実装。`test`と`[`の整数比較は不正な整数を診断 |
 | ジョブ制御 | 部分対応 | 非同期`&`、ジョブID、jobs、waitに対応。停止・再開・fg・bgは未対応 |
 | 対話シェル | 部分対応 | PS1、PS2、PROMPT_COMMAND、履歴、補完、Ctrl+R、継続入力、外部コマンドのTTY・基本シグナル制御に対応 |
 | 起動設定 | 部分対応 | `.config/isksh`配下の`.iskenv`、`.iskprofile`、`.iskrc`を起動種別に応じて読込 |
