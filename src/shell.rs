@@ -13,11 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 #[cfg(windows)]
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// `PROCESS_SUBSTITUTION_ID`で使用する値を保持する定数。
-static PROCESS_SUBSTITUTION_ID: AtomicU64 = AtomicU64::new(0);
 /// `BACKGROUND_JOB_ID`で使用する値を保持する定数。
 static BACKGROUND_JOB_ID: AtomicU32 = AtomicU32::new(1);
 #[cfg(windows)]
@@ -3979,27 +3977,33 @@ impl Shell {
                     split |= !quoted;
                 }
                 WordPart::ProcessSubstitution { source, input } => {
-                    let id = PROCESS_SUBSTITUTION_ID.fetch_add(1, Ordering::Relaxed);
-                    let path =
-                        std::env::temp_dir().join(format!("isksh-{}-{id}.tmp", std::process::id()));
-                    if *input {
+                    let mut temporary = tempfile::Builder::new()
+                        .prefix("isksh-")
+                        .suffix(".tmp")
+                        .tempfile()
+                        .map_err(io_error_string)?;
+                    let pending_source = if *input {
                         let mut child = self.clone();
                         child.terminal_io = false;
                         let result = child.run(source, &[]);
-                        fs::write(&path, result.stdout).map_err(io_error_string)?;
-                        self.pending_process_substitutions
-                            .push(PendingProcessSubstitution {
-                                path: path.clone(),
-                                source: None,
-                            });
+                        temporary
+                            .as_file_mut()
+                            .write_all(&result.stdout)
+                            .map_err(io_error_string)?;
+                        temporary.as_file_mut().flush().map_err(io_error_string)?;
+                        None
                     } else {
-                        fs::write(&path, []).map_err(io_error_string)?;
-                        self.pending_process_substitutions
-                            .push(PendingProcessSubstitution {
-                                path: path.clone(),
-                                source: Some(source.clone()),
-                            });
-                    }
+                        Some(source.clone())
+                    };
+                    let (_, path) = temporary
+                        .keep()
+                        .map_err(Into::<std::io::Error>::into)
+                        .map_err(io_error_string)?;
+                    self.pending_process_substitutions
+                        .push(PendingProcessSubstitution {
+                            path: path.clone(),
+                            source: pending_source,
+                        });
                     value.push_str(&path.to_string_lossy());
                 }
             }
@@ -7092,6 +7096,26 @@ mod tests {
         let result = shell.run("cat <(printf input); printf output > >(cat)", &[]);
         assert_eq!(result.status, 0);
         assert_eq!(result.stdout, b"inputoutput");
+
+        let process_word = Word {
+            parts: vec![WordPart::ProcessSubstitution {
+                source: "printf secure".into(),
+                input: true,
+            }],
+        };
+        let first = shell.expand_word(&process_word).unwrap().remove(0);
+        assert!(Path::new(&first).is_file(), "{first}");
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&first).unwrap().permissions().mode() & 0o077,
+            0
+        );
+        let second = shell.expand_word(&process_word).unwrap().remove(0);
+        assert_ne!(first, second);
+        assert!(Path::new(&second).is_file(), "{second}");
+        assert_eq!(shell.finish_process_substitutions().status, 0);
+        assert!(!Path::new(&first).exists());
+        assert!(!Path::new(&second).exists());
 
         assert_eq!(
             shell
