@@ -251,6 +251,9 @@ pub struct Shell {
     completion_candidates: Vec<String>,
     zsh_hook_depth: usize,
     pipeline_input: Option<Arc<Mutex<PipelineInput>>>,
+    pipeline_output: Option<SyncSender<Vec<u8>>>,
+    pipeline_process_group: Option<Arc<AtomicU32>>,
+    pipeline_subshell: bool,
 }
 
 impl Default for Shell {
@@ -351,6 +354,9 @@ impl Shell {
             completion_candidates: Vec::new(),
             zsh_hook_depth: 0,
             pipeline_input: None,
+            pipeline_output: None,
+            pipeline_process_group: None,
+            pipeline_subshell: false,
         }
     }
 
@@ -698,7 +704,8 @@ impl Shell {
     fn execute_script(&mut self, script: &Script, input: &[u8]) -> ExecResult {
         let mut combined = ExecResult::status(0);
         for list in &script.lists {
-            let result = self.execute_and_or(list, input);
+            let mut result = self.execute_and_or(list, input);
+            self.forward_pipeline_output(&mut result);
             combined.append(result);
             self.last_status = combined.status;
             if combined.flow != Flow::None {
@@ -706,6 +713,17 @@ impl Shell {
             }
         }
         combined
+    }
+
+    /// 非最終パイプライン段の出力を次段へ逐次転送する。
+    fn forward_pipeline_output(&self, result: &mut ExecResult) {
+        let Some(output) = &self.pipeline_output else {
+            return;
+        };
+        let bytes = std::mem::take(&mut result.stdout);
+        if !bytes.is_empty() {
+            let _ = output.send(bytes);
+        }
     }
 
     /// `execute_and_or`に対応する処理を行う。
@@ -780,10 +798,15 @@ impl Shell {
             receivers.push(Some(receiver));
         }
 
+        let process_group = self.terminal_io.then(|| Arc::new(AtomicU32::new(0)));
         let mut handles = Vec::with_capacity(count);
         for (index, command) in pipeline.commands.iter().cloned().enumerate() {
             let mut child = self.clone();
-            child.terminal_io = false;
+            child.terminal_io = self.terminal_io && index == 0 && input.is_empty();
+            child.pipeline_subshell = true;
+            child.background_jobs = Arc::new(Mutex::new(BTreeMap::new()));
+            child.last_background_job = None;
+            child.pipeline_process_group = process_group.clone();
             child.pipeline_input = if index == 0 {
                 None
             } else {
@@ -798,6 +821,7 @@ impl Shell {
             } else {
                 senders[index].take()
             };
+            child.pipeline_output = sender.clone();
             let initial_input = if index == 0 {
                 input.to_vec()
             } else {
@@ -818,6 +842,13 @@ impl Shell {
             if index + 1 == count {
                 last = result;
             }
+        }
+        if self.terminal_io
+            && process_group
+                .as_ref()
+                .is_some_and(|group| !matches!(group.load(Ordering::Acquire), 0 | u32::MAX))
+        {
+            restore_shell_process_group();
         }
         last.stderr.splice(0..0, stderr);
         self.set_pipeline_statuses(&statuses);
@@ -850,6 +881,11 @@ impl Shell {
             let bytes = std::mem::take(&mut result.stdout);
             let _ = output.send(bytes);
         }
+        result.status = match result.flow {
+            Flow::Exit(status) | Flow::Return(status) => status,
+            _ => result.status,
+        };
+        result.flow = Flow::None;
         result
     }
 
@@ -1636,6 +1672,17 @@ impl Shell {
         input: &[u8],
         terminal_io: bool,
     ) -> ExecResult {
+        if let Some(output) = self.pipeline_output.clone() {
+            return self.execute_streaming_external(
+                PreparedExternal {
+                    name: name.to_string(),
+                    arguments: arguments.to_vec(),
+                    assignments: Vec::new(),
+                },
+                input,
+                Some(output),
+            );
+        }
         let resolved_name = self.resolve_external_name(name);
         let mut process = platform_command(&resolved_name, arguments);
         process.current_dir(&self.cwd).env_clear();
@@ -1703,10 +1750,15 @@ impl Shell {
     ) -> ExecResult {
         let resolved_name = self.resolve_external_name(&prepared.name);
         let mut process = platform_command(&resolved_name, &prepared.arguments);
+        let inherit_stdin = self.terminal_io && self.pipeline_input.is_none() && input.is_empty();
         process
             .current_dir(&self.cwd)
             .env_clear()
-            .stdin(Stdio::piped())
+            .stdin(if inherit_stdin {
+                Stdio::inherit()
+            } else {
+                Stdio::piped()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         for (name, variable) in &self.variables {
@@ -1715,18 +1767,48 @@ impl Shell {
             }
         }
         process.envs(prepared.assignments);
+        let mut process_group_leader = false;
+        if let Some(group) = &self.pipeline_process_group {
+            loop {
+                match group.load(Ordering::Acquire) {
+                    0 if group
+                        .compare_exchange(0, u32::MAX, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok() =>
+                    {
+                        process_group_leader = true;
+                        configure_process_group(&mut process, None);
+                        break;
+                    }
+                    u32::MAX => std::thread::yield_now(),
+                    id => {
+                        configure_process_group(&mut process, Some(id));
+                        break;
+                    }
+                }
+            }
+        }
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if process_group_leader && let Some(group) = &self.pipeline_process_group {
+                    group.store(0, Ordering::Release);
+                }
                 return ExecResult::error(
                     127,
                     format!("isksh: {}: command not found", prepared.name),
                 );
             }
             Err(error) => {
+                if process_group_leader && let Some(group) = &self.pipeline_process_group {
+                    group.store(0, Ordering::Release);
+                }
                 return ExecResult::error(126, format!("isksh: {}: {error}", prepared.name));
             }
         };
+        if process_group_leader && let Some(group) = &self.pipeline_process_group {
+            group.store(child.id(), Ordering::Release);
+            set_foreground_process_group(child.id());
+        }
 
         let pipeline_input = self.pipeline_input.clone();
         let initial_input = input.to_vec();
@@ -3023,7 +3105,9 @@ impl Shell {
             _ => return ExecResult::error(2, format!("isksh: umask: {}: invalid mask", args[0])),
         };
         self.creation_mask = mask;
-        set_process_umask(mask);
+        if !self.pipeline_subshell {
+            set_process_umask(mask);
+        }
         ExecResult::status(0)
     }
 
@@ -8130,6 +8214,13 @@ mod tests {
         );
         assert_eq!(result.status, 0);
         assert_eq!(result.stdout, b"function:y\n");
+        assert_eq!(shell.run("{ yes; } | head -n 1", &[]).stdout, b"y\n");
+        assert_eq!(
+            shell
+                .run("produce() { yes; }; produce | head -n 1", &[])
+                .stdout,
+            b"y\n"
+        );
         assert_eq!(
             shell
                 .run("forward() { cat; }; printf forwarded | forward", &[])
@@ -8159,8 +8250,43 @@ mod tests {
             1
         );
         assert_eq!(shell.run("! printf x | read value", &[]).status, 1);
+        assert_eq!(
+            shell.run("true | exit 7; printf survived", &[]).stdout,
+            b"survived"
+        );
         shell.run("set -o pipefail", &[]);
         assert_ne!(shell.run("yes | read value", &[]).status, 0);
+
+        let job_id = BACKGROUND_JOB_ID.fetch_add(1, Ordering::Relaxed);
+        shell
+            .background_jobs
+            .lock()
+            .unwrap()
+            .insert(job_id, std::thread::spawn(|| ExecResult::status(0)));
+        assert_eq!(shell.run("wait | cat", &[]).status, 0);
+        assert!(shell.background_jobs.lock().unwrap().contains_key(&job_id));
+        assert_eq!(shell.builtin_wait(&[job_id.to_string()]).status, 0);
+
+        #[cfg(unix)]
+        {
+            shell.run("umask 022", &[]);
+            assert_eq!(shell.run("umask 077 | true; umask", &[]).stdout, b"0022\n");
+            assert_eq!(shell.run("sh -c umask", &[]).stdout, b"0022\n");
+        }
+
+        shell.set_interactive(true);
+        assert_eq!(
+            shell.run("missing-isksh-command | read value", &[]).status,
+            1
+        );
+        assert_eq!(shell.run("/ | read value", &[]).status, 1);
+        assert_eq!(
+            shell
+                .run("sh -c 'printf interactive' | cat | read value", &[])
+                .status,
+            0
+        );
+        shell.set_interactive(false);
     }
 
     #[test]
