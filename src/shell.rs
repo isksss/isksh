@@ -808,8 +808,15 @@ impl Shell {
             receivers.push(Some(receiver));
         }
 
-        let process_group = self.terminal_io.then(|| Arc::new(AtomicU32::new(0)));
-        let pipeline_closed = Arc::new(AtomicBool::new(false));
+        let owns_process_group = self.terminal_io && self.pipeline_process_group.is_none();
+        let process_group = self
+            .pipeline_process_group
+            .clone()
+            .or_else(|| self.terminal_io.then(|| Arc::new(AtomicU32::new(0))));
+        let pipeline_closed = self
+            .pipeline_closed
+            .clone()
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let mut handles = Vec::with_capacity(count);
         for (index, command) in pipeline.commands.iter().cloned().enumerate() {
             let mut child = self.clone();
@@ -829,7 +836,7 @@ impl Shell {
                 ))))
             };
             let sender = if index + 1 == count {
-                None
+                self.pipeline_output.clone()
             } else {
                 senders[index].take()
             };
@@ -855,7 +862,7 @@ impl Shell {
                 last = result;
             }
         }
-        if self.terminal_io
+        if owns_process_group
             && process_group
                 .as_ref()
                 .is_some_and(|group| !matches!(group.load(Ordering::Acquire), 0 | u32::MAX))
@@ -8275,6 +8282,24 @@ mod tests {
             b"y\n"
         );
         assert_eq!(shell.run("{ yes | cat; } | head -n 1", &[]).stdout, b"y\n");
+        assert_eq!(
+            shell
+                .run(
+                    "catfn() { cat; }; produce_mixed() { yes | catfn; }; produce_mixed | head -n 1",
+                    &[],
+                )
+                .stdout,
+            b"y\n"
+        );
+        assert_eq!(
+            shell
+                .run(
+                    "produce_group() { yes | { cat; }; }; produce_group | head -n 1",
+                    &[]
+                )
+                .stdout,
+            b"y\n"
+        );
         assert_eq!(
             shell
                 .run("forward() { cat; }; printf forwarded | forward", &[])
