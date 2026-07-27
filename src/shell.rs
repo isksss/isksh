@@ -5652,61 +5652,61 @@ fn builtin_printf(args: &[String]) -> ExecResult {
         return ExecResult::status(0);
     };
     let mut output = String::new();
-    let mut arguments = args[1..].iter().cycle();
-    let rounds = if args.len() <= 1 {
-        1
-    } else {
-        (args.len() - 1).max(1)
-    };
-    let mut consumed = 0usize;
+    let arguments = &args[1..];
+    let mut argument_index = 0usize;
     let chars: Vec<_> = format.chars().collect();
-    let mut index = 0;
-    while index < chars.len() || consumed < rounds {
-        if index >= chars.len() {
-            index = 0;
-            if !format.contains('%') {
-                break;
-            }
-        }
-        let ch = chars[index];
-        index += 1;
-        if ch == '\\' && index < chars.len() {
-            let escaped = chars[index];
+    loop {
+        let pass_start = argument_index;
+        let mut index = 0;
+        while index < chars.len() {
+            let ch = chars[index];
             index += 1;
-            output.push(match escaped {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '\\' => '\\',
-                other => other,
-            });
-        } else if ch == '%' && index < chars.len() {
-            let specifier = chars[index];
-            index += 1;
-            if specifier == '%' {
-                output.push('%');
-                continue;
-            }
-            let value = arguments.next().map(String::as_str).unwrap_or("");
-            consumed += 1;
-            match specifier {
-                's' => output.push_str(value),
-                'd' | 'i' => output.push_str(&value.parse::<i64>().unwrap_or(0).to_string()),
-                'b' => output.push_str(
-                    &value
-                        .replace("\\n", "\n")
-                        .replace("\\t", "\t")
-                        .replace("\\r", "\r"),
-                ),
-                other => {
+            if ch == '\\' && index < chars.len() {
+                let escaped = chars[index];
+                index += 1;
+                output.push(match escaped {
+                    'n' => '\n',
+                    'r' => '\r',
+                    't' => '\t',
+                    '\\' => '\\',
+                    other => other,
+                });
+            } else if ch == '%' && index < chars.len() {
+                let specifier = chars[index];
+                index += 1;
+                if specifier == '%' {
                     output.push('%');
-                    output.push(other);
+                    continue;
                 }
+                let value = arguments.get(argument_index).map_or("", String::as_str);
+                if argument_index < arguments.len() {
+                    argument_index += 1;
+                }
+                match specifier {
+                    's' => output.push_str(value),
+                    'd' | 'i' => output.push_str(&value.parse::<i64>().unwrap_or(0).to_string()),
+                    'b' => output.push_str(
+                        &value
+                            .replace("\\n", "\n")
+                            .replace("\\t", "\t")
+                            .replace("\\r", "\r"),
+                    ),
+                    other => {
+                        output.push('%');
+                        output.push(other);
+                    }
+                }
+            } else if ch == '%' {
+                let mut result = ExecResult::error(2, "isksh: printf: incomplete format specifier");
+                result.stdout = output.into_bytes();
+                return result;
+            } else {
+                output.push(ch);
             }
-        } else {
-            output.push(ch);
         }
-        if index >= chars.len() && consumed >= rounds {
+
+        if arguments.is_empty() || argument_index >= arguments.len() || argument_index == pass_start
+        {
             break;
         }
     }
@@ -6475,6 +6475,18 @@ mod tests {
     /// `exercises_printf_test_getopts_and_external_commands`に対応する処理を行う。
     fn exercises_printf_test_getopts_and_external_commands() {
         assert_eq!(builtin_printf(&[]).status, 0);
+        assert_eq!(builtin_printf(&["%%".into(), "unused".into()]).stdout, b"%");
+        let incomplete = builtin_printf(&["%".into(), "unused".into()]);
+        assert_eq!(incomplete.status, 2);
+        assert!(incomplete.stdout.is_empty());
+        assert_eq!(
+            incomplete.stderr,
+            b"isksh: printf: incomplete format specifier\n"
+        );
+        assert_eq!(
+            builtin_printf(&["<%s,%s>".into(), "a".into(), "b".into(), "c".into()]).stdout,
+            b"<a,b><c,>"
+        );
         assert_eq!(
             builtin_printf(&[
                 "%%:%d:%i:%b:%q\\n".into(),
