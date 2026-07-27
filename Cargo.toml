@@ -43,4 +43,10 @@ strip = "symbols"
 nix = { version = "0.31.3", default-features = false, features = ["fs", "process", "signal", "term"] }
 
 [target."cfg(windows)".dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_System_Console"] }
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+] }

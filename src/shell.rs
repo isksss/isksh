@@ -5,7 +5,7 @@ use chrono::Local;
 use glob::{MatchOptions, Pattern, glob_with};
 use regex::Regex;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::fs::{self, OpenOptions};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Cursor, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
@@ -63,7 +63,32 @@ enum OutputSink {
 #[derive(Debug, Clone)]
 struct PendingProcessSubstitution {
     path: PathBuf,
-    source: Option<String>,
+    input: bool,
+    task: Arc<Mutex<Option<std::thread::JoinHandle<ExecResult>>>>,
+    cancel: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+    directory: Option<Arc<tempfile::TempDir>>,
+}
+
+/// プロセス置換用ストリームへ接続する処理。
+type ProcessSubstitutionConnector = Box<dyn FnOnce() -> std::io::Result<File> + Send + 'static>;
+
+/// 作成済みプロセス置換ストリームと後始末用資源。
+struct CreatedProcessSubstitution {
+    path: PathBuf,
+    connector: ProcessSubstitutionConnector,
+    cancel: Arc<AtomicBool>,
+    connected: Arc<AtomicBool>,
+    directory: Option<Arc<tempfile::TempDir>>,
+}
+
+/// 外部コマンドへ直接接続するプロセス置換リダイレクト。
+#[derive(Default)]
+struct ExternalProcessSubstitutionRedirections {
+    stdin: Option<File>,
+    stdout: Option<File>,
+    stderr: Option<File>,
+    handled: HashSet<usize>,
 }
 
 struct PreparedExternal {
@@ -335,11 +360,7 @@ impl Shell {
                 readonly: false,
             },
         );
-        let shell_options = if mode == ShellMode::Zsh {
-            HashSet::from(["nomatch".to_string()])
-        } else {
-            HashSet::new()
-        };
+        let shell_options = initial_shell_options(mode);
         Self {
             variables,
             positional: Vec::new(),
@@ -823,10 +844,11 @@ impl Shell {
         if pipeline.commands.len() > 1
             && let Some(prepared) = self.prepare_external_pipeline(pipeline)
         {
-            return match prepared {
+            let result = match prepared {
                 Ok(commands) => self.execute_external_pipeline(commands, input, pipeline.negated),
                 Err(message) => ExecResult::error(1, message),
             };
+            return self.merge_process_substitution_result(result);
         }
         if pipeline.commands.len() > 1 {
             return self.execute_mixed_pipeline(pipeline, input);
@@ -940,10 +962,13 @@ impl Shell {
         output: Option<SyncSender<Vec<u8>>>,
     ) -> ExecResult {
         if let Some(prepared) = self.prepare_external_command(command) {
-            return match prepared {
+            let result = match prepared {
                 Ok(prepared) => self.execute_streaming_external(prepared, input, output),
                 Err(message) => ExecResult::error(1, message),
             };
+            let mut result = self.merge_process_substitution_result(result);
+            self.forward_pipeline_output(&mut result);
+            return result;
         }
         let mut result = self.execute_command(command, input);
         self.forward_pipeline_output(&mut result);
@@ -974,7 +999,8 @@ impl Shell {
         {
             return None;
         }
-        Some((|| {
+        let pending_start = self.pending_process_substitutions.len();
+        let prepared = (|| {
             let mut assignments = Vec::new();
             for (name, word) in &command.assignments {
                 assignments.push((name.clone(), self.expand_scalar(word)?));
@@ -988,7 +1014,11 @@ impl Shell {
                 arguments: words,
                 assignments,
             })
-        })())
+        })();
+        if prepared.is_err() {
+            self.cancel_process_substitutions(pending_start);
+        }
+        Some(prepared)
     }
 
     /// `prepare_external_pipeline`に対応する処理を行う。
@@ -1016,26 +1046,29 @@ impl Shell {
                 return None;
             }
         }
-        Some(
-            simple_commands
-                .iter()
-                .map(|command| {
-                    let mut assignments = Vec::new();
-                    for (name, word) in &command.assignments {
-                        assignments.push((name.clone(), self.expand_scalar(word)?));
-                    }
-                    let mut words = Vec::new();
-                    for word in &command.words {
-                        words.extend(self.expand_word(word)?);
-                    }
-                    Ok(PreparedExternal {
-                        name: words.remove(0),
-                        arguments: words,
-                        assignments,
-                    })
+        let pending_start = self.pending_process_substitutions.len();
+        let prepared: Result<Vec<PreparedExternal>, String> = simple_commands
+            .iter()
+            .map(|command| {
+                let mut assignments = Vec::new();
+                for (name, word) in &command.assignments {
+                    assignments.push((name.clone(), self.expand_scalar(word)?));
+                }
+                let mut words = Vec::new();
+                for word in &command.words {
+                    words.extend(self.expand_word(word)?);
+                }
+                Ok(PreparedExternal {
+                    name: words.remove(0),
+                    arguments: words,
+                    assignments,
                 })
-                .collect(),
-        )
+            })
+            .collect();
+        if prepared.is_err() {
+            self.cancel_process_substitutions(pending_start);
+        }
+        Some(prepared)
     }
 
     /// `execute_external_pipeline`に対応する処理を行う。
@@ -1422,6 +1455,16 @@ impl Shell {
 
     /// `execute_simple`に対応する処理を行う。
     fn execute_simple(&mut self, command: &SimpleCommand, input: &[u8]) -> ExecResult {
+        let pending_start = self.pending_process_substitutions.len();
+        let result = self.execute_simple_inner(command, input);
+        if self.pending_process_substitutions.len() > pending_start {
+            self.cancel_process_substitutions(pending_start);
+        }
+        result
+    }
+
+    /// 単純コマンド本体を実行し、途中終了時のプロセス置換回収は呼び出し元へ委ねる。
+    fn execute_simple_inner(&mut self, command: &SimpleCommand, input: &[u8]) -> ExecResult {
         for (name, words) in &command.array_assignments {
             let mut values = BTreeMap::new();
             for (index, word) in words.iter().enumerate() {
@@ -1469,9 +1512,10 @@ impl Shell {
         if words.is_empty() {
             return ExecResult::status(0);
         }
+        let direct_external = self.is_direct_external_command(&words[0], assignments.is_empty());
 
         let mut command_input = input.to_vec();
-        for redirection in &command.redirections {
+        for (index, redirection) in command.redirections.iter().enumerate() {
             if matches!(
                 redirection.kind,
                 RedirectionKind::HereDocument | RedirectionKind::HereDocumentStrip
@@ -1492,6 +1536,9 @@ impl Shell {
                 RedirectionKind::Input | RedirectionKind::ReadWrite
             ) && redirection.fd.unwrap_or(0) == 0
             {
+                if direct_external && process_substitution_redirection_is_direct(command, index) {
+                    continue;
+                }
                 let path = match self.redirection_path(&redirection.target) {
                     Ok(path) => path,
                     Err(message) => return ExecResult::error(1, message),
@@ -1608,13 +1655,37 @@ impl Shell {
         }
         let previous_terminal_io = self.terminal_io;
         self.terminal_io &= command.redirections.is_empty() && command_input.is_empty();
-        let mut result = if let Some(function) = self.functions.get(&name).cloned() {
-            self.execute_function(&name, &function, words, &command_input)
-        } else if is_builtin(&name) {
-            self.execute_builtin(&name, &words, &command_input)
-        } else {
-            self.execute_external(&name, &words, &command_input, self.terminal_io)
-        };
+        let (mut result, handled_redirections) =
+            if let Some(function) = self.functions.get(&name).cloned() {
+                (
+                    self.execute_function(&name, &function, words, &command_input),
+                    HashSet::new(),
+                )
+            } else if is_builtin(&name) {
+                (
+                    self.execute_builtin(&name, &words, &command_input),
+                    HashSet::new(),
+                )
+            } else {
+                match self.prepare_external_process_substitution_redirections(command) {
+                    Ok(redirections) => {
+                        let handled = redirections.handled.clone();
+                        let result = if handled.is_empty() {
+                            self.execute_external(&name, &words, &command_input, self.terminal_io)
+                        } else {
+                            self.execute_external_redirected(
+                                &name,
+                                &words,
+                                &command_input,
+                                self.terminal_io,
+                                redirections,
+                            )
+                        };
+                        (result, handled)
+                    }
+                    Err(message) => (ExecResult::error(1, message), HashSet::new()),
+                }
+            };
         self.terminal_io = previous_terminal_io;
         for (name, previous) in saved_variables {
             if let Some(previous) = previous {
@@ -1623,27 +1694,40 @@ impl Shell {
                 self.variables.remove(&name);
             }
         }
-        result = self.apply_redirections(command, &command_input, result);
-        let mut substitutions = self.finish_process_substitutions();
-        result.stdout.append(&mut substitutions.stdout);
-        result.stderr.append(&mut substitutions.stderr);
-        if substitutions.status != 0 && result.status == 0 {
-            result.status = substitutions.status;
-        }
-        result
+        result = self.apply_redirections_skipping(
+            command,
+            &command_input,
+            result,
+            &handled_redirections,
+        );
+        self.merge_process_substitution_result(result)
     }
 
     /// `apply_redirections`に対応する処理を行う。
     fn apply_redirections(
         &mut self,
         command: &SimpleCommand,
+        input: &[u8],
+        result: ExecResult,
+    ) -> ExecResult {
+        self.apply_redirections_skipping(command, input, result, &HashSet::new())
+    }
+
+    /// 外部コマンドへ直接渡したリダイレクトを除いて出力先を適用する。
+    fn apply_redirections_skipping(
+        &mut self,
+        command: &SimpleCommand,
         _input: &[u8],
         mut result: ExecResult,
+        skipped: &HashSet<usize>,
     ) -> ExecResult {
         let mut descriptors = self.open_descriptors.clone();
         descriptors.entry(1).or_insert(OutputSink::Stdout);
         descriptors.entry(2).or_insert(OutputSink::Stderr);
-        for redirection in &command.redirections {
+        for (index, redirection) in command.redirections.iter().enumerate() {
+            if skipped.contains(&index) {
+                continue;
+            }
             let fd = redirection.fd.unwrap_or(match redirection.kind {
                 RedirectionKind::Input
                 | RedirectionKind::DuplicateInput
@@ -1793,6 +1877,60 @@ impl Shell {
         result
     }
 
+    /// 指定名が別名や組み込みではなく外部コマンドとして直接実行されるか判定する。
+    fn is_direct_external_command(&self, name: &str, assignments_empty: bool) -> bool {
+        if is_builtin(name)
+            || self.functions.contains_key(name)
+            || self.autoload_functions.contains(name)
+            || (assignments_empty && self.aliases.contains_key(name))
+        {
+            return false;
+        }
+        if self.mode == ShellMode::Zsh && assignments_empty {
+            if name
+                .rsplit_once('.')
+                .is_some_and(|(_, suffix)| self.suffix_aliases.contains_key(suffix))
+            {
+                return false;
+            }
+            if self.shell_options.contains("autocd") && self.resolve_path(name).is_dir() {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// 外部コマンドへ直接渡せるプロセス置換リダイレクトを開く。
+    fn prepare_external_process_substitution_redirections(
+        &mut self,
+        command: &SimpleCommand,
+    ) -> Result<ExternalProcessSubstitutionRedirections, String> {
+        let mut prepared = ExternalProcessSubstitutionRedirections::default();
+        for (index, redirection) in command.redirections.iter().enumerate() {
+            if !process_substitution_redirection_is_direct(command, index) {
+                continue;
+            }
+            let fd = redirection_fd(redirection);
+            let path = self.redirection_path(&redirection.target)?;
+            let file = if redirection.kind == RedirectionKind::Input {
+                OpenOptions::new().read(true).open(path)
+            } else {
+                OpenOptions::new().write(true).open(path)
+            }
+            .map_err(io_error_string)?;
+            if fd == 0 {
+                prepared.stdin = Some(file);
+            } else if fd == 1 {
+                prepared.stdout = Some(file);
+            } else {
+                debug_assert_eq!(fd, 2);
+                prepared.stderr = Some(file);
+            }
+            prepared.handled.insert(index);
+        }
+        Ok(prepared)
+    }
+
     /// `execute_external`に対応する処理を行う。
     fn execute_external(
         &self,
@@ -1812,6 +1950,24 @@ impl Shell {
                 Some(output),
             );
         }
+        self.execute_external_redirected(
+            name,
+            arguments,
+            input,
+            terminal_io,
+            ExternalProcessSubstitutionRedirections::default(),
+        )
+    }
+
+    /// プロセス置換の端点を標準入出力へ直接接続して外部コマンドを実行する。
+    fn execute_external_redirected(
+        &self,
+        name: &str,
+        arguments: &[String],
+        input: &[u8],
+        terminal_io: bool,
+        mut redirections: ExternalProcessSubstitutionRedirections,
+    ) -> ExecResult {
         let resolved_name = self.resolve_external_name(name);
         let mut process = platform_command(&resolved_name, arguments);
         process.current_dir(&self.cwd).env_clear();
@@ -1838,10 +1994,29 @@ impl Shell {
             let status = child.wait();
             return finish_external_status(name, status);
         }
-        process
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        process.stdin(
+            redirections
+                .stdin
+                .take()
+                .map_or_else(Stdio::piped, Stdio::from),
+        );
+        let pipeline_output = redirections
+            .stdout
+            .is_none()
+            .then(|| self.pipeline_output.clone())
+            .flatten();
+        process.stdout(
+            redirections
+                .stdout
+                .take()
+                .map_or_else(Stdio::piped, Stdio::from),
+        );
+        process.stderr(
+            redirections
+                .stderr
+                .take()
+                .map_or_else(Stdio::piped, Stdio::from),
+        );
         let mut child = match process.spawn() {
             Ok(child) => child,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -1863,11 +2038,48 @@ impl Shell {
                 }
             })
         });
-        let output = child.wait_with_output();
+        let pipeline_closed = self.pipeline_closed.clone();
+        let stdout_reader = child.stdout.take().map(|mut stdout| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let mut buffer = vec![0; 8192];
+                loop {
+                    let read = match stdout.read(&mut buffer) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => read,
+                    };
+                    if let Some(output) = &pipeline_output {
+                        if output.send(buffer[..read].to_vec()).is_err() {
+                            if let Some(closed) = &pipeline_closed {
+                                closed.store(true, Ordering::Release);
+                            }
+                            break;
+                        }
+                    } else {
+                        captured.extend_from_slice(&buffer[..read]);
+                    }
+                }
+                captured
+            })
+        });
+        let stderr_reader = child.stderr.take().map(|mut stderr| {
+            std::thread::spawn(move || {
+                let mut captured = Vec::new();
+                let _ = stderr.read_to_end(&mut captured);
+                captured
+            })
+        });
+        let status = child.wait();
         if let Some(writer) = stdin_writer {
             let _ = writer.join();
         }
-        finish_external(name, output)
+        let stdout = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        finish_external_output(name, status, stdout, stderr)
     }
 
     /// 外部コマンドの出力を混在パイプラインの次段へ逐次転送する。
@@ -4390,6 +4602,21 @@ impl Shell {
         allow_split: bool,
         allow_glob: bool,
     ) -> Result<Vec<String>, String> {
+        let pending_start = self.pending_process_substitutions.len();
+        let result = self.expand_word_context_inner(word, allow_split, allow_glob);
+        if result.is_err() {
+            self.cancel_process_substitutions(pending_start);
+        }
+        result
+    }
+
+    /// 単語展開本体を実行し、プロセス置換の後始末は呼び出し元へ委ねる。
+    fn expand_word_context_inner(
+        &mut self,
+        word: &Word,
+        allow_split: bool,
+        allow_glob: bool,
+    ) -> Result<Vec<String>, String> {
         if let [
             WordPart::Parameter {
                 expression,
@@ -4467,33 +4694,7 @@ impl Shell {
                     split |= !quoted;
                 }
                 WordPart::ProcessSubstitution { source, input } => {
-                    let mut temporary = tempfile::Builder::new()
-                        .prefix("isksh-")
-                        .suffix(".tmp")
-                        .tempfile()
-                        .map_err(io_error_string)?;
-                    let pending_source = if *input {
-                        let mut child = self.clone();
-                        child.terminal_io = false;
-                        let result = child.run(source, &[]);
-                        temporary
-                            .as_file_mut()
-                            .write_all(&result.stdout)
-                            .map_err(io_error_string)?;
-                        temporary.as_file_mut().flush().map_err(io_error_string)?;
-                        None
-                    } else {
-                        Some(source.clone())
-                    };
-                    let (_, path) = temporary
-                        .keep()
-                        .map_err(Into::<std::io::Error>::into)
-                        .map_err(io_error_string)?;
-                    self.pending_process_substitutions
-                        .push(PendingProcessSubstitution {
-                            path: path.clone(),
-                            source: pending_source,
-                        });
+                    let path = self.start_process_substitution(source, *input)?;
                     value.push_str(&path.to_string_lossy());
                 }
             }
@@ -5486,30 +5687,508 @@ impl Shell {
         names
     }
 
-    /// `finish_process_substitutions`に対応する処理を行う。
-    fn finish_process_substitutions(&mut self) -> ExecResult {
-        let mut result = ExecResult::status(0);
-        for pending in std::mem::take(&mut self.pending_process_substitutions) {
-            if let Some(source) = pending.source {
-                match fs::read(&pending.path) {
-                    Ok(input) => {
-                        let child = self.clone().run(&source, &input);
-                        result.stdout.extend(child.stdout);
-                        result.stderr.extend(child.stderr);
-                        if child.status != 0 {
-                            result.status = child.status;
-                        }
-                    }
-                    Err(error) => result
-                        .stderr
-                        .extend_from_slice(format!("isksh: {error}\n").as_bytes()),
+    /// プロセス置換用ストリームを作成し、置換コマンドを並行起動する。
+    fn start_process_substitution(&mut self, source: &str, input: bool) -> Result<PathBuf, String> {
+        let created = create_process_substitution_channel(input).map_err(io_error_string)?;
+        let path = created.path.clone();
+        let mut child = self.clone();
+        child.terminal_io = false;
+        child.pending_process_substitutions.clear();
+        child.pipeline_input = None;
+        child.pipeline_output = None;
+        child.pipeline_process_group = None;
+        child.pipeline_closed = None;
+        child.pipeline_subshell = true;
+        let source = source.to_string();
+        let task_cancel = created.cancel.clone();
+        let task = std::thread::spawn(move || {
+            execute_process_substitution_task(child, source, input, created.connector, task_cancel)
+        });
+        self.pending_process_substitutions
+            .push(PendingProcessSubstitution {
+                path: path.clone(),
+                input,
+                task: Arc::new(Mutex::new(Some(task))),
+                cancel: created.cancel,
+                connected: created.connected,
+                directory: created.directory,
+            });
+        Ok(path)
+    }
+
+    /// プロセス置換ソースをストリーム端点へ接続して実行する。
+    fn execute_process_substitution_source(
+        &mut self,
+        source: &str,
+        input: bool,
+        endpoint: File,
+    ) -> ExecResult {
+        if let Ok(script) = parse(source)
+            && let [list] = script.lists.as_slice()
+            && list.rest.is_empty()
+            && !list.background
+            && let Some(prepared) = self.prepare_external_pipeline(&list.first)
+        {
+            let result = match prepared {
+                Ok(commands) => self.execute_process_substitution_pipeline(
+                    commands,
+                    endpoint,
+                    input,
+                    list.first.negated,
+                ),
+                Err(message) => ExecResult::error(1, message),
+            };
+            return self.merge_process_substitution_result(result);
+        }
+        if input {
+            let (sender, receiver) = sync_channel(1);
+            let closed = Arc::new(AtomicBool::new(false));
+            let writer_closed = closed.clone();
+            let writer = std::thread::spawn(move || {
+                stream_process_substitution_output(receiver, endpoint, writer_closed)
+            });
+            self.pipeline_output = Some(sender);
+            self.pipeline_closed = Some(closed);
+            let result = self.run(source, &[]);
+            self.pipeline_output = None;
+            self.pipeline_closed = None;
+            let mut result = ExecResult {
+                status: result.status,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                flow: Flow::None,
+            };
+            if let Err(error) = writer
+                .join()
+                .expect("プロセス置換の出力転送スレッドが正常に終了する")
+            {
+                result.stderr.extend_from_slice(
+                    localize(format!("isksh: process substitution: {error}\n")).as_bytes(),
+                );
+                if result.status == 0 {
+                    result.status = 1;
                 }
             }
-            let _ = fs::remove_file(pending.path);
+            result
+        } else {
+            let (sender, receiver) = sync_channel(1);
+            let reader =
+                std::thread::spawn(move || stream_process_substitution_input(endpoint, sender));
+            self.pipeline_input = Some(Arc::new(Mutex::new(PipelineInput::new(receiver))));
+            let result = self.run(source, &[]);
+            self.pipeline_input = None;
+            let mut result = ExecResult {
+                status: result.status,
+                stdout: result.stdout,
+                stderr: result.stderr,
+                flow: Flow::None,
+            };
+            if let Err(error) = reader
+                .join()
+                .expect("プロセス置換の入力転送スレッドが正常に終了する")
+            {
+                result.stderr.extend_from_slice(
+                    localize(format!("isksh: process substitution: {error}\n")).as_bytes(),
+                );
+                if result.status == 0 {
+                    result.status = 1;
+                }
+            }
+            result
+        }
+    }
+
+    /// 外部コマンドだけのプロセス置換をOSパイプで直結して実行する。
+    fn execute_process_substitution_pipeline(
+        &self,
+        commands: Vec<PreparedExternal>,
+        endpoint: File,
+        input: bool,
+        negated: bool,
+    ) -> ExecResult {
+        let mut children: Vec<std::process::Child> = Vec::new();
+        let mut previous_stdout = None;
+        let mut stderr_readers = Vec::new();
+        let mut endpoint = Some(endpoint);
+        for (index, prepared) in commands.iter().enumerate() {
+            let last = index + 1 == commands.len();
+            let resolved_name = self.resolve_external_name(&prepared.name);
+            let mut process = platform_command(&resolved_name, &prepared.arguments);
+            process.current_dir(&self.cwd).env_clear();
+            for (name, variable) in &self.variables {
+                if variable.exported {
+                    process.env(name, &variable.value);
+                }
+            }
+            process.envs(prepared.assignments.iter().cloned());
+            if index == 0 {
+                process.stdin(if input {
+                    Stdio::null()
+                } else {
+                    Stdio::from(
+                        endpoint
+                            .take()
+                            .expect("出力プロセス置換の入力端点が存在する"),
+                    )
+                });
+            } else {
+                process.stdin(Stdio::from(
+                    previous_stdout.take().expect("前段の標準出力が存在する"),
+                ));
+            }
+            process.stdout(if last && input {
+                Stdio::from(
+                    endpoint
+                        .take()
+                        .expect("入力プロセス置換の出力端点が存在する"),
+                )
+            } else {
+                Stdio::piped()
+            });
+            process.stderr(Stdio::piped());
+            let mut child = match process.spawn() {
+                Ok(child) => child,
+                Err(error) => {
+                    for mut child in children {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
+                    let status = if error.kind() == std::io::ErrorKind::NotFound {
+                        127
+                    } else {
+                        126
+                    };
+                    return ExecResult::error(status, format!("isksh: {}: {error}", prepared.name));
+                }
+            };
+            previous_stdout = child.stdout.take();
+            let mut stderr = child
+                .stderr
+                .take()
+                .expect("プロセス置換コマンドの標準エラーが存在する");
+            stderr_readers.push(std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stderr.read_to_end(&mut bytes);
+                bytes
+            }));
+            children.push(child);
+        }
+        let stdout_reader = (!input).then(|| {
+            let mut stdout = previous_stdout.expect("出力プロセス置換の標準出力が存在する");
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = stdout.read_to_end(&mut bytes);
+                bytes
+            })
+        });
+        let mut statuses = Vec::new();
+        for mut child in children {
+            statuses.push(pipeline_wait_status(child.wait()));
+        }
+        let stdout = stdout_reader
+            .and_then(|reader| reader.join().ok())
+            .unwrap_or_default();
+        let mut stderr = Vec::new();
+        for reader in stderr_readers {
+            if let Ok(mut bytes) = reader.join() {
+                stderr.append(&mut bytes);
+            }
+        }
+        let mut status = statuses.last().copied().unwrap_or_default();
+        if self.shell_options.contains("pipefail")
+            && let Some(failed) = statuses.iter().rev().find(|status| **status != 0)
+        {
+            status = *failed;
+        }
+        if negated {
+            status = i32::from(status == 0);
+        }
+        ExecResult {
+            status,
+            stdout,
+            stderr,
+            flow: Flow::None,
+        }
+    }
+
+    /// 指定位置以降のプロセス置換を中止して資源を回収する。
+    fn cancel_process_substitutions(&mut self, start: usize) {
+        let pending = self.pending_process_substitutions.split_off(start);
+        let _ = Self::join_process_substitutions(pending, true);
+    }
+
+    /// `finish_process_substitutions`に対応する処理を行う。
+    fn finish_process_substitutions(&mut self) -> ExecResult {
+        let pending = std::mem::take(&mut self.pending_process_substitutions);
+        Self::join_process_substitutions(pending, false)
+    }
+
+    /// 本体の実行結果へプロセス置換の出力、診断、終了状態を統合する。
+    fn merge_process_substitution_result(&mut self, mut result: ExecResult) -> ExecResult {
+        let mut substitutions = self.finish_process_substitutions();
+        result.stdout.append(&mut substitutions.stdout);
+        result.stderr.append(&mut substitutions.stderr);
+        if substitutions.status != 0 && result.status == 0 {
+            result.status = substitutions.status;
+        }
+        result
+    }
+
+    /// プロセス置換タスクを終了させ、診断と終了状態を統合する。
+    fn join_process_substitutions(
+        pending: Vec<PendingProcessSubstitution>,
+        cancel_unconnected: bool,
+    ) -> ExecResult {
+        let mut result = ExecResult::status(0);
+        for pending in pending {
+            if !pending.connected.load(Ordering::Acquire) {
+                if cancel_unconnected {
+                    pending.cancel.store(true, Ordering::Release);
+                }
+                unblock_process_substitution(&pending.path, pending.input);
+            }
+            let task = pending
+                .task
+                .lock()
+                .expect("プロセス置換タスクをロックできる")
+                .take();
+            if let Some(task) = task
+                && let Ok(child) = task.join()
+            {
+                result.stdout.extend(child.stdout);
+                result.stderr.extend(child.stderr);
+                // 入力プロセス置換の終了状態は本体コマンドの終了状態へ影響させない。
+                if !pending.input && child.status != 0 {
+                    result.status = child.status;
+                }
+            }
+            drop(pending.directory);
         }
         result
     }
 }
+
+/// 互換モードに応じた初期シェルオプションを返す。
+fn initial_shell_options(mode: ShellMode) -> HashSet<String> {
+    if mode == ShellMode::Zsh {
+        HashSet::from(["nomatch".to_string()])
+    } else {
+        HashSet::new()
+    }
+}
+
+/// プロセス置換ソースの出力を端点へ逐次転送する。
+fn stream_process_substitution_output(
+    receiver: Receiver<Vec<u8>>,
+    mut endpoint: File,
+    closed: Arc<AtomicBool>,
+) -> std::io::Result<()> {
+    while let Ok(bytes) = receiver.recv() {
+        if let Err(error) = endpoint.write_all(&bytes) {
+            if error.kind() == std::io::ErrorKind::BrokenPipe {
+                closed.store(true, Ordering::Release);
+                return Ok(());
+            }
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// プロセス置換端点の入力をソースへ逐次転送する。
+fn stream_process_substitution_input(
+    mut endpoint: File,
+    sender: SyncSender<Vec<u8>>,
+) -> std::io::Result<()> {
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = endpoint.read(&mut buffer)?;
+        if read == 0 || sender.send(buffer[..read].to_vec()).is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// 指定したプロセス置換リダイレクトを外部コマンドへ直接渡せるか判定する。
+fn process_substitution_redirection_is_direct(command: &SimpleCommand, index: usize) -> bool {
+    let Some(redirection) = command.redirections.get(index) else {
+        return false;
+    };
+    if !redirection
+        .target
+        .parts
+        .iter()
+        .any(|part| matches!(part, WordPart::ProcessSubstitution { .. }))
+        || !matches!(
+            redirection.kind,
+            RedirectionKind::Input
+                | RedirectionKind::Output
+                | RedirectionKind::Clobber
+                | RedirectionKind::Append
+        )
+    {
+        return false;
+    }
+    let fd = redirection_fd(redirection);
+    fd <= 2
+        && !command.redirections[index + 1..]
+            .iter()
+            .any(|later| redirection_fd(later) == fd)
+}
+
+/// リダイレクト種別に応じた対象ファイル記述子を返す。
+fn redirection_fd(redirection: &Redirection) -> u32 {
+    redirection.fd.unwrap_or(match redirection.kind {
+        RedirectionKind::Input
+        | RedirectionKind::DuplicateInput
+        | RedirectionKind::ReadWrite
+        | RedirectionKind::HereDocument
+        | RedirectionKind::HereDocumentStrip => 0,
+        _ => 1,
+    })
+}
+
+/// プロセス置換端点へ接続し、中止状態を確認して置換コマンドを実行する。
+fn execute_process_substitution_task(
+    mut shell: Shell,
+    source: String,
+    input: bool,
+    connector: ProcessSubstitutionConnector,
+    cancel: Arc<AtomicBool>,
+) -> ExecResult {
+    match connector() {
+        Ok(_endpoint) if cancel.load(Ordering::Acquire) => ExecResult::status(0),
+        Ok(endpoint) => shell.execute_process_substitution_source(&source, input, endpoint),
+        Err(error) => ExecResult::error(1, format!("isksh: process substitution: {error}")),
+    }
+}
+
+#[cfg(unix)]
+/// Unix用の安全なFIFOと接続処理を作成する。
+fn create_process_substitution_channel(input: bool) -> std::io::Result<CreatedProcessSubstitution> {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let directory = Arc::new(tempfile::Builder::new().prefix("isksh-").tempdir()?);
+    let path = directory.path().join("stream");
+    mkfifo(&path, Mode::S_IRUSR | Mode::S_IWUSR).map_err(std::io::Error::other)?;
+    let connector_path = path.clone();
+    let connected = Arc::new(AtomicBool::new(false));
+    let connector_connected = connected.clone();
+    let connector: ProcessSubstitutionConnector = Box::new(move || {
+        let endpoint = if input {
+            OpenOptions::new().write(true).open(connector_path)?
+        } else {
+            OpenOptions::new().read(true).open(connector_path)?
+        };
+        connector_connected.store(true, Ordering::Release);
+        Ok(endpoint)
+    });
+    Ok(CreatedProcessSubstitution {
+        path,
+        connector,
+        cancel: Arc::new(AtomicBool::new(false)),
+        connected,
+        directory: Some(directory),
+    })
+}
+
+#[cfg(windows)]
+/// Windows用の名前付きパイプと接続処理を作成する。
+fn create_process_substitution_channel(
+    _input: bool,
+) -> std::io::Result<CreatedProcessSubstitution> {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::{
+        ERROR_NO_DATA, ERROR_PIPE_CONNECTED, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::{
+        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_TYPE_BYTE,
+        PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+    };
+
+    let unique = tempfile::Builder::new().prefix("isksh-pipe-").tempdir()?;
+    let name = unique
+        .path()
+        .file_name()
+        .expect("一時ディレクトリ名が存在する")
+        .to_string_lossy()
+        .into_owned();
+    drop(unique);
+    let server_path = PathBuf::from(format!(r"\\.\pipe\{name}"));
+    let path = server_path.clone();
+    let mut wide = server_path.as_os_str().encode_wide().collect::<Vec<_>>();
+    wide.push(0);
+    // SAFETY: 名前はNUL終端済みで、セキュリティ属性とOVERLAPPEDを使用しない。
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+            PIPE_UNLIMITED_INSTANCES,
+            8192,
+            8192,
+            0,
+            std::ptr::null(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: CreateNamedPipeWが返した所有済みHANDLEを一度だけOwnedHandleへ移す。
+    let handle = unsafe { OwnedHandle::from_raw_handle(handle) };
+    let cancel = Arc::new(AtomicBool::new(false));
+    let connected = Arc::new(AtomicBool::new(false));
+    let connector_connected = connected.clone();
+    let connector: ProcessSubstitutionConnector = Box::new(move || {
+        // SAFETY: handleは接続完了までこのクロージャが所有し、OVERLAPPEDを使用しない。
+        let connected_now =
+            unsafe { ConnectNamedPipe(handle.as_raw_handle(), std::ptr::null_mut()) != 0 };
+        let error = std::io::Error::last_os_error();
+        let error_code = error.raw_os_error().map(|code| code as u32);
+        if !connected_now
+            && error_code != Some(ERROR_PIPE_CONNECTED)
+            && error_code != Some(ERROR_NO_DATA)
+        {
+            return Err(error);
+        }
+        connector_connected.store(true, Ordering::Release);
+        Ok(File::from(handle))
+    });
+    Ok(CreatedProcessSubstitution {
+        path,
+        connector,
+        cancel,
+        connected,
+        directory: None,
+    })
+}
+
+#[cfg(unix)]
+/// 接続待ちのUnix FIFOを反対側から開き、中止処理を完了可能にする。
+fn unblock_process_substitution(path: &Path, input: bool) {
+    let _ = if input {
+        OpenOptions::new().read(true).open(path)
+    } else {
+        OpenOptions::new().write(true).open(path)
+    };
+}
+
+#[cfg(windows)]
+/// 接続待ちのWindows名前付きパイプをクライアント側から開いて中止可能にする。
+fn unblock_process_substitution(path: &Path, input: bool) {
+    let _ = if input {
+        OpenOptions::new().read(true).open(path)
+    } else {
+        OpenOptions::new().write(true).open(path)
+    };
+}
+
+#[cfg(not(any(unix, windows)))]
+/// 対応するストリーム実装がないOSでは中止用の接続処理を行わない。
+fn unblock_process_substitution(_path: &Path, _input: bool) {}
 
 /// `parse_array_reference`に対応する処理を行う。
 fn parse_array_reference(value: &str) -> Option<(&str, &str)> {
@@ -5754,13 +6433,18 @@ fn path_has_unix_type(_: &Path, _: bool) -> bool {
     false
 }
 
-/// `finish_external`に対応する処理を行う。
-fn finish_external(name: &str, output: std::io::Result<std::process::Output>) -> ExecResult {
-    match output {
-        Ok(output) => ExecResult {
-            status: exit_status(&output.status),
-            stdout: output.stdout,
-            stderr: output.stderr,
+/// 収集済みの標準出力と標準エラーを外部コマンドの終了状態へ統合する。
+fn finish_external_output(
+    name: &str,
+    status: std::io::Result<std::process::ExitStatus>,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+) -> ExecResult {
+    match status {
+        Ok(status) => ExecResult {
+            status: exit_status(&status),
+            stdout,
+            stderr,
             flow: Flow::None,
         },
         Err(error) => ExecResult::error(126, format!("isksh: {name}: {error}")),
@@ -7697,9 +8381,11 @@ mod tests {
         assert!(shell.set_variable("RO", "y".into(), None, false).is_err());
         assert_eq!(shell.execute_external("/", &[], &[], false).status, 126);
         assert_eq!(
-            finish_external(
+            finish_external_output(
                 "broken",
-                Err(std::io::Error::other("simulated wait failure"))
+                Err(std::io::Error::other("simulated wait failure")),
+                Vec::new(),
+                Vec::new(),
             )
             .status,
             126
@@ -7830,6 +8516,77 @@ mod tests {
         let result = shell.run("cat <(printf input); printf output > >(cat)", &[]);
         assert_eq!(result.status, 0);
         assert_eq!(result.stdout, b"inputoutput");
+        #[cfg(unix)]
+        {
+            let streaming_input = shell.run("head -n 1 <(yes)", &[]);
+            assert_eq!(streaming_input.status, 0);
+            assert_eq!(streaming_input.stdout, b"y\n");
+            let compound_input = shell.run(
+                "head -n 1 <(while true; do printf 'y\\n'; sleep 0.01; done)",
+                &[],
+            );
+            assert_eq!(compound_input.status, 0);
+            assert_eq!(compound_input.stdout, b"y\n");
+            assert_eq!(
+                shell
+                    .run(
+                        "producer() { while true; do printf 'f\\n'; sleep 0.01; done; }; head -n 1 <(producer)",
+                        &[],
+                    )
+                    .stdout,
+                b"f\n"
+            );
+            assert_eq!(
+                shell.run("cat <({ printf grouped; })", &[]).stdout,
+                b"grouped"
+            );
+            let redirected_input = shell.run("head -1 < <(yes)", &[]);
+            assert_eq!(redirected_input.status, 0);
+            assert_eq!(redirected_input.stdout, b"y\n");
+            assert_eq!(shell.run("yes > >(head -n 1)", &[]).stdout, b"y\n");
+            let external_pipeline = shell.run("cat <(printf pipeline) | cat", &[]);
+            assert_eq!(external_pipeline.stdout, b"pipeline");
+            assert!(shell.pending_process_substitutions.is_empty());
+            assert_eq!(shell.run("cat <(yes) | read value", &[]).status, 0);
+            assert_eq!(
+                shell.run("yes < <(printf input) | head -n1", &[]).stdout,
+                b"y\n"
+            );
+            assert_eq!(shell.run("yes 2> >(cat) | head -n1", &[]).stdout, b"y\n");
+            assert_eq!(
+                shell
+                    .run("cat <(sh -c 'sleep 0.02; printf delayed')", &[])
+                    .stdout,
+                b"delayed"
+            );
+            assert_eq!(
+                shell
+                    .run("printf streamed > >(sh -c 'sleep 0.02; cat')", &[])
+                    .stdout,
+                b"streamed"
+            );
+            assert_eq!(
+                shell.run("cat <(printf one) <(printf two)", &[]).stdout,
+                b"onetwo"
+            );
+            assert_eq!(
+                shell
+                    .run(
+                        "consumer() { read value; printf '%s' \"$value\"; }; printf function > >(consumer)",
+                        &[],
+                    )
+                    .stdout,
+                b"function"
+            );
+            let directory = tempfile::tempdir().unwrap();
+            let marker = directory.path().join("consumed");
+            let marker = shell_quote(&marker.to_string_lossy());
+            let source = format!(
+                "sh -c 'echo ready; while [ ! -e {marker} ]; do sleep 0.01; done' > >(read value; touch {marker})"
+            );
+            assert_eq!(shell.run(&source, &[]).status, 0);
+            assert!(directory.path().join("consumed").exists());
+        }
 
         let process_word = Word {
             parts: vec![WordPart::ProcessSubstitution {
@@ -7838,18 +8595,198 @@ mod tests {
             }],
         };
         let first = shell.expand_word(&process_word).unwrap().remove(0);
-        assert!(Path::new(&first).is_file(), "{first}");
+        assert!(Path::new(&first).exists(), "{first}");
         #[cfg(unix)]
-        assert_eq!(
-            fs::metadata(&first).unwrap().permissions().mode() & 0o077,
-            0
-        );
+        {
+            use std::os::unix::fs::FileTypeExt;
+            let metadata = fs::metadata(&first).unwrap();
+            assert!(metadata.file_type().is_fifo());
+            assert_eq!(metadata.permissions().mode() & 0o077, 0);
+        }
         let second = shell.expand_word(&process_word).unwrap().remove(0);
         assert_ne!(first, second);
-        assert!(Path::new(&second).is_file(), "{second}");
+        assert!(Path::new(&second).exists(), "{second}");
         assert_eq!(shell.finish_process_substitutions().status, 0);
         assert!(!Path::new(&first).exists());
         assert!(!Path::new(&second).exists());
+        #[cfg(unix)]
+        {
+            for (source, input) in [
+                ("while true; do printf 'unused\\n'; done", true),
+                ("read value || :", false),
+            ] {
+                let unused = Word {
+                    parts: vec![WordPart::ProcessSubstitution {
+                        source: source.into(),
+                        input,
+                    }],
+                };
+                shell.expand_word(&unused).unwrap();
+                assert_eq!(shell.finish_process_substitutions().status, 0);
+            }
+        }
+
+        assert_ne!(shell.run("printf <(printf x) $((1/0))", &[]).status, 0);
+        assert!(shell.pending_process_substitutions.is_empty());
+        assert_ne!(shell.run("printf >(cat) $((1/0))", &[]).status, 0);
+        assert!(shell.pending_process_substitutions.is_empty());
+        assert!(!shell.run("cat <(sh $((1/0)))", &[]).stderr.is_empty());
+
+        #[cfg(unix)]
+        {
+            assert_eq!(shell.run("cat <(printf first | cat)", &[]).stdout, b"first");
+            assert_eq!(
+                shell.run("sh -c 'printf error >&2' 2> >(cat)", &[]).stdout,
+                b"error"
+            );
+            assert_eq!(
+                shell.run("sh -c 'printf append' >> >(cat)", &[]).stdout,
+                b"append"
+            );
+            assert_ne!(
+                shell.run("printf x > >(missing-isksh-command)", &[]).status,
+                0
+            );
+            assert_ne!(
+                shell
+                    .run("printf x > >(cat | missing-isksh-command)", &[])
+                    .status,
+                0
+            );
+            assert_ne!(shell.run("printf x > >(cat | /)", &[]).status, 0);
+            shell.shell_options.insert("pipefail".into());
+            assert_ne!(
+                shell
+                    .run("printf x > >(sh -c 'exit 7' | sh -c 'exit 0')", &[])
+                    .status,
+                0
+            );
+            assert_eq!(shell.run("printf x > >(! sh -c 'exit 7')", &[]).status, 0);
+
+            let read_only = tempfile::NamedTempFile::new().unwrap();
+            let endpoint = File::open(read_only.path()).unwrap();
+            assert_ne!(
+                shell
+                    .execute_process_substitution_source("printf value", true, endpoint)
+                    .status,
+                0
+            );
+            let write_only = OpenOptions::new()
+                .write(true)
+                .open(read_only.path())
+                .unwrap();
+            assert_ne!(
+                shell
+                    .execute_process_substitution_source(":", false, write_only)
+                    .status,
+                0
+            );
+        }
+
+        let connector_error: ProcessSubstitutionConnector =
+            Box::new(|| Err(std::io::Error::other("expected connector error")));
+        assert_ne!(
+            execute_process_substitution_task(
+                Shell::default(),
+                ":".into(),
+                true,
+                connector_error,
+                Arc::new(AtomicBool::new(false)),
+            )
+            .status,
+            0
+        );
+
+        let process_target = Word {
+            parts: vec![WordPart::ProcessSubstitution {
+                source: "cat".into(),
+                input: false,
+            }],
+        };
+        let mut direct_command = SimpleCommand {
+            redirections: vec![Redirection {
+                fd: None,
+                kind: RedirectionKind::Output,
+                target: process_target.clone(),
+                here_document: None,
+            }],
+            ..SimpleCommand::default()
+        };
+        assert!(!process_substitution_redirection_is_direct(
+            &direct_command,
+            1
+        ));
+        direct_command.redirections[0].kind = RedirectionKind::DuplicateOutput;
+        assert!(!process_substitution_redirection_is_direct(
+            &direct_command,
+            0
+        ));
+        direct_command.redirections[0].kind = RedirectionKind::Input;
+        direct_command.redirections[0].fd = Some(3);
+        assert!(!process_substitution_redirection_is_direct(
+            &direct_command,
+            0
+        ));
+        direct_command.redirections[0].fd = None;
+        direct_command.redirections.push(Redirection {
+            fd: None,
+            kind: RedirectionKind::HereDocument,
+            target: Word::default(),
+            here_document: Some(HereDocument {
+                body: String::new(),
+                expand: false,
+            }),
+        });
+        assert!(!process_substitution_redirection_is_direct(
+            &direct_command,
+            0
+        ));
+
+        let malformed_direct = SimpleCommand {
+            words: vec![Word {
+                parts: vec![WordPart::Literal {
+                    value: "cat".into(),
+                    quoted: false,
+                }],
+            }],
+            redirections: vec![Redirection {
+                fd: None,
+                kind: RedirectionKind::Output,
+                target: Word {
+                    parts: vec![
+                        WordPart::Literal {
+                            value: "missing/".into(),
+                            quoted: false,
+                        },
+                        WordPart::ProcessSubstitution {
+                            source: "cat".into(),
+                            input: false,
+                        },
+                    ],
+                },
+                here_document: None,
+            }],
+            ..SimpleCommand::default()
+        };
+        assert_ne!(shell.execute_simple(&malformed_direct, &[]).status, 0);
+
+        shell.mode = ShellMode::Zsh;
+        shell.shell_options.insert("autocd".into());
+        assert!(!shell.is_direct_external_command(".", true));
+        assert!(shell.is_direct_external_command("missing-isksh-external-command", true));
+        shell
+            .pending_process_substitutions
+            .push(PendingProcessSubstitution {
+                path: PathBuf::from("already-finished"),
+                input: true,
+                task: Arc::new(Mutex::new(None)),
+                cancel: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(true)),
+                directory: None,
+            });
+        assert_eq!(shell.finish_process_substitutions().status, 0);
+        shell.mode = ShellMode::Bash;
+        shell.shell_options.remove("autocd");
 
         assert_eq!(
             shell
@@ -8030,12 +8967,17 @@ mod tests {
         assert_ne!(shell.execute_simple(&command, &[]).status, 0);
 
         assert_eq!(shell.run("printf x > >(false)", &[]).status, 1);
-        let missing = std::env::temp_dir().join("isksh-deliberately-missing-process-substitution");
         shell
             .pending_process_substitutions
             .push(PendingProcessSubstitution {
-                path: missing,
-                source: Some(":".into()),
+                path: PathBuf::from("missing"),
+                input: true,
+                task: Arc::new(Mutex::new(Some(std::thread::spawn(|| {
+                    ExecResult::error(1, "expected process substitution error")
+                })))),
+                cancel: Arc::new(AtomicBool::new(false)),
+                connected: Arc::new(AtomicBool::new(true)),
+                directory: None,
             });
         assert!(!shell.finish_process_substitutions().stderr.is_empty());
 
@@ -9415,10 +10357,12 @@ mod tests {
     #[test]
     /// `covers_remaining_zsh_compatibility_paths`に対応する処理を行う。
     fn covers_remaining_zsh_compatibility_paths() {
-        // SAFETY: カバレッジタスクはこのモジュールを単一テストスレッドで実行する。
-        unsafe { std::env::set_var("ISKSH_MODE", "zsh") };
+        assert!(initial_shell_options(ShellMode::Zsh).contains("nomatch"));
         let mut shell = Shell::default();
-        unsafe { std::env::remove_var("ISKSH_MODE") };
+        shell
+            .set_variable("ISKSH_MODE", "zsh".into(), Some(true), false)
+            .unwrap();
+        shell.refresh_mode();
         assert_eq!(shell.mode(), ShellMode::Zsh);
         let mut bash = shell.clone();
         bash.mode = ShellMode::Bash;
